@@ -186,6 +186,29 @@ func show_toast(msg: String, kind: int = Kind.INFO) -> void:
 	_drain_queue()
 
 
+# ── Network error helper ───────────────────────────────────────────────
+## Tek noktadan çağrılan genel "bağlantı hatası" toast'ı.
+## HTTPRequest sonucu RESULT_SUCCESS değilse (DNS/timeout/connection refused/
+## 404 route bulunamadı vs.) her yerde aynı, kullanıcı dostu İngilizce mesajı
+## göstermek için kullanılır. `context` opsiyonel — log/debug amaçlı, kullanıcıya
+## gösterilmez.
+static var _last_network_toast_ms : int = 0
+const _NETWORK_TOAST_COOLDOWN_MS := 4000  # aynı anda birden fazla request patlarsa toast spam'ini engelle
+
+static func network_error(context: String = "") -> void:
+	var now := Time.get_ticks_msec()
+	if now - _last_network_toast_ms < _NETWORK_TOAST_COOLDOWN_MS:
+		if context != "":
+			print("[Toast] network_error suppressed (cooldown) ctx=%s" % context)
+		return
+	_last_network_toast_ms = now
+	if context != "":
+		print("[Toast] network_error ctx=%s" % context)
+	var inst := get_instance()
+	if inst != null:
+		inst.show_toast("Failed to connect to server. Please check your connection.", Kind.ERROR)
+
+
 # ── Internal: queue + tek toast yaşam döngüsü ─────────────────────────
 
 func _drain_queue() -> void:

@@ -2898,6 +2898,7 @@ func _send_submit_with_retry(sid: String, body: String) -> void:
 		else:
 			# 0 (network err), 5xx, 429 — transient, retry
 			print("[GM] submit failed (code=%d), staying in queue" % code)
+			Toast.network_error("submit code=%d" % code)
 			_ensure_retry_timer()
 	)
 	var _e := http.request(BACKEND_URL + "/backend/submit", headers, HTTPClient.METHOD_POST, body)

@@ -236,6 +236,7 @@ func _fetch_quests() -> void:
 				_build_quest_list()
 				return
 		_show_error("Could not connect to server. Code: %d" % code)
+		Toast.network_error("quests_fetch code=%d" % code)
 	)
 	var headers : PackedStringArray = []
 	if _auth_token != "":
@@ -269,11 +270,14 @@ func _claim_quest(quest_id: String, claim_btn: Button) -> void:
 		else:
 			claim_btn.text = "Claim Reward"
 			claim_btn.disabled = false
-			var j := JSON.new()
-			var err_msg: String = "Error (%d)" % code
-			if j.parse(body.get_string_from_utf8()) == OK:
-				err_msg = str(j.get_data().get("error", err_msg))
-			Toast.get_instance().show_toast(err_msg, Toast.Kind.ERROR)
+			if result != HTTPRequest.RESULT_SUCCESS:
+				Toast.network_error("quests_claim result=%d" % result)
+			else:
+				var j := JSON.new()
+				var err_msg: String = "Error (%d)" % code
+				if j.parse(body.get_string_from_utf8()) == OK:
+					err_msg = str(j.get_data().get("error", err_msg))
+				Toast.get_instance().show_toast(err_msg, Toast.Kind.ERROR)
 	)
 	var headers : PackedStringArray = ["Content-Type: application/json"]
 	if _auth_token != "":

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -42,7 +43,7 @@ func (s *Store) GetNimiqConfig() models.NimiqConfig {
 		WalletAddress:       getEnv("NIMIQ_WALLET_ADDRESS", ""),
 		TelegramToken:       getEnv("TELEGRAM_BOT_TOKEN", ""),
 		TelegramChatID:      getEnv("TELEGRAM_CHAT_ID", ""),
-		LowBalanceThreshold: 1000.0,
+		LowBalanceThreshold: getEnvFloat("LOW_BALANCE_THRESHOLD", 1000.0),
 	}
 	var dbCfg models.NimiqConfig
 	err := s.db.View(func(txn *badger.Txn) error {
@@ -87,6 +88,17 @@ func (s *Store) SaveNimiqConfig(cfg models.NimiqConfig) error {
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+// getEnvFloat reads a float64 env var, falling back to the given default
+// if unset or unparseable.
+func getEnvFloat(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
 	}
 	return fallback
 }

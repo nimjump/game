@@ -106,6 +106,20 @@ var (
 	_poolOnce sync.Once
 )
 
+// jobDirFromEnv — REPLAY_JOB_DIR env override for the worker job/result file
+// directory. Falls back to os.TempDir() if unset or if the dir can't be created.
+func jobDirFromEnv() string {
+	dir := os.Getenv("REPLAY_JOB_DIR")
+	if dir == "" {
+		return os.TempDir()
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("[WORKER_POOL] REPLAY_JOB_DIR mkdir failed (%s): %v — falling back to os.TempDir()", dir, err)
+		return os.TempDir()
+	}
+	return dir
+}
+
 func workerCount() int {
 	if env := os.Getenv("REPLAY_WORKERS"); env != "" {
 		var n int
@@ -122,7 +136,7 @@ func workerCount() int {
 // GetWorkerPool — singleton, ilk çağrıda başlatılır (main.go'dan warmup çağrısı yapılıyor)
 func GetWorkerPool() *workerPool {
 	_poolOnce.Do(func() {
-		jobDir := os.TempDir()
+		jobDir := jobDirFromEnv()
 		size := workerCount()
 		p := &workerPool{
 			size:   size,

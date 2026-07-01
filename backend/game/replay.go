@@ -83,9 +83,14 @@ func ReplaySemCap() chan struct{} {
 	return replaySem
 }
 
-// servergamesDir — backend exesi'nin yanindaki servergames/ klasoru
-// also checks working directory for go run
+// servergamesDir — replay binary + replay.zip klasoru.
+// Priority: SERVERGAMES_DIR env → working directory/servergames → next to executable/servergames
 func servergamesDir() string {
+	// explicit override — production tuning
+	if env := os.Getenv("SERVERGAMES_DIR"); env != "" {
+		return env
+	}
+
 	// first check working directory (for go run and development)
 	if wd, err := os.Getwd(); err == nil {
 		candidate := filepath.Join(wd, "servergames")

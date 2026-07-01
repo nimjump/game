@@ -194,6 +194,7 @@ func _do_sign_auth() -> void:
 		http.queue_free()
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			push_warning("[NimiqBridge] Challenge fetch failed: %d" % code)
+			Toast.network_error("auth_challenge code=%d" % code)
 			auth_failed.emit("challenge_fetch_failed")
 			return
 		var j := JSON.new()
@@ -248,6 +249,7 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 				auth_verified = false
 				_do_sign_auth()
 				return
+			Toast.network_error("auth_verify code=%d" % code)
 			auth_failed.emit("verify_failed_%d" % code)
 			return
 		var j := JSON.new()

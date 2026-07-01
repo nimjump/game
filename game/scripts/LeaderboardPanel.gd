@@ -289,6 +289,7 @@ func _fetch_lb() -> void:
 				_build_list(j.get_data())
 				return
 		_show_error("Could not connect to server. Code: %d" % code)
+		Toast.network_error("leaderboard code=%d" % code)
 	)
 	http.request(BACKEND_URL + "/backend/leaderboard?period=%s&limit=10" % _cur_period)
 
@@ -330,6 +331,37 @@ static func _warm_ghost_btn(btn: Button, r: float = 8.0) -> void:
 	btn.add_theme_color_override("font_color",         Color(0.220, 0.130, 0.060))
 	btn.add_theme_color_override("font_hover_color",   Color(0.780, 0.380, 0.120))
 	btn.add_theme_color_override("font_pressed_color", Color(0.640, 0.300, 0.080))
+
+
+## Small circular icon button for inline row actions (e.g. "watch replay").
+## Outlined terracotta at rest, fills solid on hover/press — reads as a
+## secondary, in-row action rather than competing with the panel's primary
+## filled buttons (close / tabs). Shared visual language with StatsPanel.
+static func _replay_icon_btn(btn: Button, size: int) -> void:
+	btn.custom_minimum_size = Vector2(size, size)
+	var ri := size / 2
+	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new()
+	for s in [sn, sh, sp]:
+		s.set_corner_radius_all(ri)
+	sn.bg_color = Color(0, 0, 0, 0)
+	sn.border_color = _C_ORANGE; sn.set_border_width_all(2)
+	sh.bg_color = _C_ORANGE
+	sh.border_color = _C_ORANGE; sh.set_border_width_all(2)
+	sp.bg_color = Color(0.640, 0.300, 0.080)
+	sp.border_color = Color(0.640, 0.300, 0.080); sp.set_border_width_all(2)
+	btn.add_theme_stylebox_override("normal",  sn)
+	btn.add_theme_stylebox_override("hover",   sh)
+	btn.add_theme_stylebox_override("pressed", sp)
+	btn.add_theme_stylebox_override("focus",   sn)
+	# Icon flips from terracotta (outline) to cream (filled) on hover/press.
+	btn.add_theme_color_override("icon_normal_color",  _C_ORANGE)
+	btn.add_theme_color_override("icon_hover_color",   _C_BG)
+	btn.add_theme_color_override("icon_pressed_color", _C_BG)
+	btn.add_theme_color_override("font_color",         _C_ORANGE)
+	btn.add_theme_color_override("font_hover_color",   _C_BG)
+	btn.add_theme_color_override("font_pressed_color", _C_BG)
+	btn.tooltip_text = "Watch replay"
+	btn.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
 
 
 func _make_margin(l: int, r: int = -1, t: int = -1, b: int = -1) -> MarginContainer:
@@ -438,6 +470,11 @@ func _build_list(data: Variant) -> void:
 	var dt_h := _make_col_label("Date", ref, 0.10, _C_BROWN, true)
 	dt_h.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 	hdr_row.add_child(dt_h)
+	# Reserve the same trailing width the replay-button column takes in each
+	# data row below, so Score / Prize / Date line up with the numbers.
+	var hdr_spacer := Control.new()
+	hdr_spacer.custom_minimum_size = Vector2(int(ref * 0.056), 0)
+	hdr_row.add_child(hdr_spacer)
 
 	var sep_hdr := HSeparator.new()
 	sep_hdr.add_theme_color_override("color", _C_SEP)
@@ -528,23 +565,24 @@ func _build_list(data: Variant) -> void:
 			var rp_btn := Button.new()
 			rp_btn.text = ""
 			var _rp_ic_path : String = UITheme.get_theme_assets().get("icon_play", "")
+			var rp_size := int(ref * 0.056)
 			if ResourceLoader.exists(_rp_ic_path):
 				rp_btn.icon = load(_rp_ic_path)
 				rp_btn.expand_icon = true
 				rp_btn.icon_alignment          = HORIZONTAL_ALIGNMENT_CENTER
 				rp_btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_CENTER
-				rp_btn.add_theme_constant_override("icon_max_width", int(ref * 0.036))
+				rp_btn.add_theme_constant_override("icon_max_width", int(rp_size * 0.5))
 			else:
 				rp_btn.text = "▶"
-				rp_btn.add_theme_font_size_override("font_size", int(ref * 0.022))
-			rp_btn.custom_minimum_size = Vector2(int(ref * 0.066), int(ref * 0.048))
+				rp_btn.add_theme_font_size_override("font_size", int(ref * 0.020))
 			rp_btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
-			_warm_btn(rp_btn, 6)
+			rp_btn.size_flags_horizontal = Control.SIZE_SHRINK_END
+			_replay_icon_btn(rp_btn, rp_size)
 			rp_btn.pressed.connect(_fetch_and_emit_replay.bind(session_id_e, rp_btn))
 			row.add_child(rp_btn)
 		else:
 			var spacer := Control.new()
-			spacer.custom_minimum_size = Vector2(int(ref * 0.060), 0)
+			spacer.custom_minimum_size = Vector2(int(ref * 0.056), 0)
 			row.add_child(spacer)
 
 
@@ -776,7 +814,9 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 			btn.icon = load(_rp_ic_path2)
 		else:
 			btn.text = "▶"
-		if result != HTTPRequest.RESULT_SUCCESS or code != 200: return
+		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+			Toast.network_error("replay_fetch code=%d" % code)
+			return
 		var j := JSON.new()
 		if j.parse(body.get_string_from_utf8()) != OK: return
 		var d : Dictionary = j.get_data()

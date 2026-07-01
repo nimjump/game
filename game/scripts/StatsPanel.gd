@@ -526,6 +526,36 @@ static func _warm_ghost_btn(btn: Button, r: float = 8.0) -> void:
 	btn.add_theme_color_override("font_pressed_color", Color(0.640, 0.300, 0.080))
 
 
+## Small circular icon button for inline row actions (e.g. "watch replay").
+## Outlined terracotta at rest, fills solid on hover/press — mirrors the
+## replay button in LeaderboardPanel so the same action looks the same
+## everywhere it appears, instead of a plain-modulated ghost button.
+static func _replay_icon_btn(btn: Button, size: int) -> void:
+	btn.custom_minimum_size = Vector2(size, size)
+	var ri := size / 2
+	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new()
+	for s in [sn, sh, sp]:
+		s.set_corner_radius_all(ri)
+	sn.bg_color = Color(0, 0, 0, 0)
+	sn.border_color = _C_ORANGE; sn.set_border_width_all(2)
+	sh.bg_color = _C_ORANGE
+	sh.border_color = _C_ORANGE; sh.set_border_width_all(2)
+	sp.bg_color = Color(0.640, 0.300, 0.080)
+	sp.border_color = Color(0.640, 0.300, 0.080); sp.set_border_width_all(2)
+	btn.add_theme_stylebox_override("normal",  sn)
+	btn.add_theme_stylebox_override("hover",   sh)
+	btn.add_theme_stylebox_override("pressed", sp)
+	btn.add_theme_stylebox_override("focus",   sn)
+	btn.add_theme_color_override("icon_normal_color",  _C_ORANGE)
+	btn.add_theme_color_override("icon_hover_color",   _C_BG)
+	btn.add_theme_color_override("icon_pressed_color", _C_BG)
+	btn.add_theme_color_override("font_color",         _C_ORANGE)
+	btn.add_theme_color_override("font_hover_color",   _C_BG)
+	btn.add_theme_color_override("font_pressed_color", _C_BG)
+	btn.tooltip_text = "Watch replay"
+	btn.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+
+
 func _mpad(m: int) -> MarginContainer:
 	var mc := MarginContainer.new()
 	mc.add_theme_constant_override("margin_left",   m)
@@ -603,6 +633,7 @@ func _on_stats_response(_result: int, response_code: int, _headers: PackedString
 			var n = _stat_labels[k]
 			if n is Label:
 				n.text = "?"
+		Toast.network_error("stats code=%d" % response_code)
 		return
 
 	var json := JSON.new()
@@ -848,25 +879,24 @@ func _build_recent(games: Array) -> void:
 			var watch_btn := Button.new()
 			watch_btn.text = ""
 			var _wic_path : String = UITheme.get_theme_assets().get("icon_play", "")
+			var w_size := int(ref * 0.056)
 			if ResourceLoader.exists(_wic_path):
 				watch_btn.icon = load(_wic_path)
 				watch_btn.expand_icon = true
 				watch_btn.icon_alignment          = HORIZONTAL_ALIGNMENT_CENTER
 				watch_btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_CENTER
-				watch_btn.add_theme_constant_override("icon_max_width", int(ref * 0.036))
+				watch_btn.add_theme_constant_override("icon_max_width", int(w_size * 0.5))
 			else:
-				watch_btn.text = "WATCH"
-				watch_btn.add_theme_font_size_override("font_size", int(ref * 0.022))
-			watch_btn.modulate = UITheme.COL_ORANGE
-			watch_btn.custom_minimum_size = Vector2(int(ref * 0.066), int(ref * 0.048))
+				watch_btn.text = "▶"
+				watch_btn.add_theme_font_size_override("font_size", int(ref * 0.020))
 			watch_btn.size_flags_horizontal = Control.SIZE_SHRINK_END
-			_warm_ghost_btn(watch_btn, 6)
+			_replay_icon_btn(watch_btn, w_size)
 			row.add_child(watch_btn)
 			var sid_cap := session_id
 			watch_btn.pressed.connect(func(): _fetch_and_watch(sid_cap, watch_btn))
 		else:
 			var spacer := Control.new()
-			spacer.custom_minimum_size = Vector2(int(ref * 0.11), 0)
+			spacer.custom_minimum_size = Vector2(int(ref * 0.056), 0)
 			spacer.size_flags_horizontal = Control.SIZE_SHRINK_END
 			row.add_child(spacer)
 
@@ -897,6 +927,7 @@ func _fetch_and_watch(session_id: String, btn: Button) -> void:
 		else: btn.text = "PLAY"
 
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+			Toast.network_error("stats_replay code=%d" % code)
 			return
 
 		var j := JSON.new()

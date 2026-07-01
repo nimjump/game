@@ -340,6 +340,7 @@ func _web_fetch_and_start_replay(session_id: String) -> void:
 		http.queue_free()
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			push_warning("[WEB_REPLAY] fetch failed: result=%d code=%d" % [result, code])
+			Toast.network_error("web_replay code=%d" % code)
 			return
 		var j := JSON.new()
 		if j.parse(body.get_string_from_utf8()) != OK:
@@ -3423,6 +3424,9 @@ func _open_nick_overlay() -> void:
 					msg = "Already taken, try another"
 				elif err == "invalid_nickname":
 					msg = "Only a-z and 0-9, 1-20 chars"
+				elif err == "not_authenticated" or err.begins_with("error_"):
+					msg = "Connection failed, try again"
+					Toast.network_error("set_nickname %s" % err)
 				st_lbl.text = msg
 				UITheme.apply_label(st_lbl, Color(1.0, 0.4, 0.3, 1.0), int(_p(0.026)))
 		)
@@ -3770,7 +3774,11 @@ func _on_vs_timeout() -> void:
 
 func _on_vs_error(msg: String) -> void:
 	if is_instance_valid(_vs_status_lbl):
-		_vs_status_lbl.text = "Error. " + msg
+		if msg.begins_with("join_request_failed") or msg.begins_with("join_failed") or msg.begins_with("ws_connect_failed"):
+			_vs_status_lbl.text = "Connection failed"
+			Toast.network_error("vs %s" % msg)
+		else:
+			_vs_status_lbl.text = "Error. " + msg
 
 
 func _on_vs_opponent_left_menu() -> void:
@@ -4027,6 +4035,7 @@ func _do_claim() -> void:
 			_claim_status.text = "Rejected: cheat"; _claim_btn.visible = false
 		else:
 			_claim_status.text  = "Connection error"; _claim_btn.disabled = false
+			Toast.network_error("claim code=%d" % code)
 	)
 	req.request(url, PackedStringArray(["Content-Type: application/json"]), HTTPClient.METHOD_POST, "{}")
 
