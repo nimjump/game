@@ -1,0 +1,32 @@
+# --- Godot ---
+.godot/
+*.translation
+export.godot
+*.uid
+*.import
+
+# --- Web export output (build artifact, not source) ---
+export/
+
+# --- Node (admin/) ---
+node_modules/
+admin/dist/
+admin/.env
+admin/.env.local
+
+# --- Go (backend/) ---
+backend/replay-verifier/*.exe
+backend/replay-verifier/*.zip
+backend/tmp/
+backend/data/
+
+# --- OS / editor junk ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# --- Env / secrets ---
+.env
+.env.local
+*.pem

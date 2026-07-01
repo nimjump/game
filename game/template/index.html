@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+  <meta http-equiv="Pragma" content="no-cache">
+  <meta http-equiv="Expires" content="0">
+  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, viewport-fit=cover">
+  <title>$GODOT_PROJECT_NAME</title>
+  <style>
+    html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
+    #canvas { display:block; width:100%; height:100%; outline:none; touch-action:none; image-rendering:pixelated; }
+    #status, #status-splash, #status-progress { position:absolute; left:0; right:0; }
+    #status, #status-splash { top:0; bottom:0; }
+    #status {
+      background-color: $GODOT_SPLASH_COLOR;
+      display:flex; flex-direction:column; justify-content:center; align-items:center;
+      visibility:hidden;
+    }
+    #status-splash { max-height:100%; max-width:100%; margin:auto; }
+    #status-splash.show-image--false { display:none; }
+    #status-splash.fullsize--true { height:100%; width:100%; object-fit:contain; }
+    #status-splash.use-filter--false { image-rendering:pixelated; }
+    #status-progress, #status-notice { display:none; }
+    #status-progress { bottom:10%; width:50%; margin:0 auto; }
+    #status-notice {
+      background-color:#5b3943; border-radius:0.5rem; border:1px solid #9b3943;
+      color:#e0e0e0; font-family:'Noto Sans','Droid Sans',Arial,sans-serif;
+      line-height:1.3; margin:0 2rem; overflow:hidden; padding:1rem; text-align:center; z-index:1;
+    }
+  </style>
+  $GODOT_HEAD_INCLUDE
+  <link rel="icon" type="image/png" href="assets/icon/ico.png">
+
+  <!-- ── DEV MODE ──────────────────────────────────────────────────────────────
+       Add ?dev to URL to enable debug overlay, FPS counter, and verbose logs.
+       Example: https://nimjump.io/?dev
+       In production nothing extra is loaded or visible.
+  ─────────────────────────────────────────────────────────────────────────── -->
+  <script data-cfasync="false">
+    window._DEV = (new URLSearchParams(location.search)).has('dev');
+  </script>
+
+  <!-- ── NIMIQ SDK ─────────────────────────────────────────────────────────── -->
+  <script data-cfasync="false" type="module">
+    window._nimiqReady    = undefined;
+    window._nimiqAddress  = '';
+    window._nimiqLabel    = '';
+    window._nimiqAvatar   = '';
+    window._nimiqDeviceId = '';
+    window._nimiqData     = null;
+
+    async function _initNimiq() {
+      try {
+        const sdk = await import('https://unpkg.com/@nimiq/mini-app-sdk@latest/dist/index.js');
+        let nimiq;
+        try {
+          nimiq = await sdk.init({ timeout: 10000 });
+          window.nimiq = nimiq;
+        } catch(e) {
+          if (window._DEV) console.warn('[Nimiq] Provider not found:', e);
+          return;
+        }
+        let address = '';
+        try {
+          const listed = await nimiq.listAccounts();
+          if (Array.isArray(listed) && listed.length > 0 && typeof listed[0] === 'string') address = listed[0];
+        } catch(e) { if (window._DEV) console.warn('[Nimiq] listAccounts:', e); }
+        if (!address) {
+          try {
+            await nimiq.connect();
+            const listed2 = await nimiq.listAccounts();
+            if (Array.isArray(listed2) && listed2.length > 0 && typeof listed2[0] === 'string') address = listed2[0];
+          } catch(e) { if (window._DEV) console.warn('[Nimiq] connect:', e); }
+        }
+        window._nimiqAddress = address ? String(address) : '';
+        window._nimiqLabel   = address ? String(address).slice(0, 9) : '';
+        try { window._nimiqDeviceId = await sdk.requestDeviceIdentifier({ reason: 'NimJump score ranking' }); }
+        catch(e) { window._nimiqDeviceId = ''; }
+        window._nimiqLanguage = (window.nimiqPay && window.nimiqPay.language)
+          || (navigator.language ? navigator.language.split('-')[0] : 'en');
+        window._nimiqData = { address: window._nimiqAddress, label: window._nimiqLabel, deviceId: window._nimiqDeviceId, _provider: nimiq };
+        try {
+          if (window._nimiqAddress && window.getNimiqAvatar)
+            window._nimiqAvatar = await window.getNimiqAvatar(window._nimiqAddress) || '';
+        } catch(e) { window._nimiqAvatar = ''; }
+        window._nimiqReady = true;
+      } catch(e) {
+        if (window._DEV) console.warn('[Nimiq] SDK load failed:', e);
+      }
+    }
+    setTimeout(function() {
+      if (typeof requestIdleCallback !== 'undefined') requestIdleCallback(_initNimiq, { timeout: 2000 });
+      else _initNimiq();
+    }, 3500);
+  </script>
+
+  <!-- ── NIMIQ IDENTICONS ───────────────────────────────────────────────────── -->
+  <script data-cfasync="false">
+    window.getNimiqAvatar = async function() { return ''; };
+    window._nimiqIconsReady = false;
+    (function() {
+      var s = document.createElement('script');
+      s.type = 'module';
+      s.textContent = [
+        'import("https://unpkg.com/@nimiq/identicons@1.6.2/dist/identicons.bundle.min.js").then(function(mod){',
+        '  var I=mod.default||mod;',
+        '  window.getNimiqAvatar=async function(a){try{return await I.toDataUrl(a);}catch(e){return "";}};',
+        '  window._nimiqIconsReady=true;',
+        '}).catch(function(){window._nimiqIconsReady=true;});'
+      ].join('\n');
+      document.head.appendChild(s);
+    })();
+  </script>
+
+  <!-- ── SERVICE WORKER cleanup ────────────────────────────────────────────── -->
+  <script data-cfasync="false">
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function(r){ r.forEach(function(sw){ sw.unregister(); }); });
+    }
+  </script>
+
+  <!-- ── VERSION ───────────────────────────────────────────────────────────── -->
+  <script data-cfasync="false">
+    var APP_VERSION = '2.1.0';
+    var APP_BUILD   = '2026-06-29';
+    if (window._DEV) console.log('🟢 [VERSION] NimJump ' + APP_VERSION + ' build=' + APP_BUILD);
+  </script>
+
+  <!-- ── NATIVE AUDIO ──────────────────────────────────────────────────────── -->
+  <script data-cfasync="false">
+  (function() {
+    var _sounds  = {};
+    var _busVol  = { BGM:0.55, SFX_Jump:0.85, SFX_Damage:0.90, Master:1.0 };
+    var _busMute = { BGM:false, SFX_Jump:false, SFX_Damage:false, Master:false };
+    var _unlocked = false;
+
+    function _effVol(bus) {
+      if (_busMute[bus] || _busMute.Master) return 0;
+      return Math.max(0, Math.min(1, (_busVol[bus]||1) * (_busVol.Master||1)));
+    }
+    function _reg(name, url, bus, loop) {
+      var a = new Audio();
+      a.src=url; a.preload='auto'; a.loop=!!loop;
+      a.addEventListener('error', function(){ if(window._DEV) console.warn('[Audio] load failed: '+name); });
+      _sounds[name] = { audio:a, bus:bus };
+    }
+    _reg('bgm',    'assets/audio/bgm.wav',    'BGM',      true);
+    _reg('jump',   'assets/audio/jump.wav',   'SFX_Jump', false);
+    _reg('damage', 'assets/audio/damage.wav', 'SFX_Damage', false);
+
+    window._gdSound = function(cmd) {
+      if (cmd === 'unlock') { _unlocked=true; return; }
+      if (!_unlocked) return;
+      var s;
+      if (cmd === 'bgm_play') {
+        s=_sounds.bgm; if(s&&s.audio.paused){ s.audio.volume=_effVol('BGM'); s.audio.play().catch(function(){}); }
+      } else if (cmd === 'bgm_stop') {
+        s=_sounds.bgm; if(s){s.audio.pause();s.audio.currentTime=0;}
+      } else if (cmd === 'jump_play') {
+        s=_sounds.jump; if(s){s.audio.currentTime=0;s.audio.volume=_effVol('SFX_Jump');s.audio.play().catch(function(){});}
+      } else if (cmd === 'damage_play') {
+        s=_sounds.damage; if(s){s.audio.currentTime=0;s.audio.volume=_effVol('SFX_Damage');s.audio.play().catch(function(){});}
+      }
+    };
+    window._gdSetBus = function(bus, vol, muted) {
+      _busVol[bus]=parseFloat(vol)||0;
+      _busMute[bus]=(muted===true||muted==='true');
+      Object.keys(_sounds).forEach(function(n){ if(_sounds[n].bus===bus) _sounds[n].audio.volume=_effVol(bus); });
+    };
+    function _unlock(){ _unlocked=true; }
+    ['touchstart','mousedown','keydown','click'].forEach(function(ev){
+      document.addEventListener(ev,_unlock,{once:true,capture:true,passive:true});
+    });
+  })();
+  </script>
+
+  <!-- ── NIMIQ PAY BANNER ───────────────────────────────────────────────────── -->
+  <script data-cfasync="false">
+  (function() {
+    if (window.nimiqPay) return;
+    var DEEP_LINK = 'nimiqpay://miniapp?url=nimjump.io';
+    try { if (sessionStorage.getItem('nq_banner_dismissed')==='1') return; } catch(e) {}
+    var banner=document.createElement('div');
+    banner.id='nq-banner';
+    banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99998;background:linear-gradient(90deg,#1a1a2e,#16213e);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;font-family:sans-serif;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.5);box-sizing:border-box';
+    var txt=document.createElement('span');
+    txt.textContent='🐰 Play in Nimiq Pay & earn NIM rewards!';
+    txt.style.cssText='flex:1;margin-right:10px;line-height:1.3';
+    var open=document.createElement('button');
+    open.textContent='Open ↗';
+    open.style.cssText='background:#f6b221;color:#1a1a2e;border:none;border-radius:8px;padding:7px 14px;font-weight:bold;font-size:13px;cursor:pointer;white-space:nowrap;flex-shrink:0';
+    open.onclick=function(){window.location.href=DEEP_LINK;};
+    var cls=document.createElement('button');
+    cls.textContent='✕';
+    cls.style.cssText='background:transparent;color:#aaa;border:none;font-size:18px;cursor:pointer;margin-left:8px;padding:0 4px;flex-shrink:0';
+    cls.onclick=function(){
+      banner.style.display='none';
+      try{sessionStorage.setItem('nq_banner_dismissed','1');}catch(e){}
+    };
+    banner.appendChild(txt); banner.appendChild(open); banner.appendChild(cls);
+    if (document.body) document.body.appendChild(banner);
+    else document.addEventListener('DOMContentLoaded',function(){document.body.appendChild(banner);});
+  })();
+  </script>
+
+</head>
+<body>
+
+<canvas id="canvas">Your browser does not support the canvas tag.</canvas>
+<noscript>Your browser does not support JavaScript.</noscript>
+
+<div id="status">
+  <img id="status-splash" class="$GODOT_SPLASH_CLASSES" src="$GODOT_SPLASH" alt="">
+  <progress id="status-progress"></progress>
+  <div id="status-notice"></div>
+</div>
+
+<!-- ── ERROR CAPTURE + BACKEND LOG FLUSH ─────────────────────────────────────
+     Always active: catches errors silently and batches them to /backend/client-log.
+     DEV mode adds: visible overlay, copy button, FPS counter.
+─────────────────────────────────────────────────────────────────────────── -->
+<script data-cfasync="false">
+(function(){
+  var DEV = window._DEV;
+
+  // ── Dev overlay (only in ?dev mode) ──────────────────────────────────────
+  var _log = function(){}; // no-op in prod
+  if (DEV) {
+    var box=document.createElement('div');
+    box.style.cssText='position:fixed;bottom:44px;left:0;right:0;max-height:60vh;overflow-y:auto;background:rgba(0,0,0,.95);color:#0f0;font:11px monospace;z-index:99999;padding:4px;display:none';
+    document.body.appendChild(box);
+
+    var btn=document.createElement('button');
+    btn.textContent='🐛';
+    btn.style.cssText='position:fixed;bottom:4px;right:6px;z-index:100000;background:#333;color:#fff;border:none;border-radius:50%;width:36px;height:36px;font-size:18px;cursor:pointer';
+    btn.onclick=function(){box.style.display=box.style.display==='none'?'block':'none';box.scrollTop=box.scrollHeight;};
+    document.body.appendChild(btn);
+
+    var copyBtn=document.createElement('button');
+    copyBtn.textContent='📋';
+    copyBtn.style.cssText='position:fixed;bottom:4px;right:48px;z-index:100000;background:#444;color:#fff;border:none;border-radius:50%;width:36px;height:36px;font-size:16px;cursor:pointer';
+    var _lines=[];
+    copyBtn.onclick=function(){
+      var txt=_lines.join('\n');
+      if(navigator.clipboard){navigator.clipboard.writeText(txt);}
+      else{var ta=document.createElement('textarea');ta.value=txt;document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);}
+      copyBtn.textContent='✓';setTimeout(function(){copyBtn.textContent='📋';},1500);
+    };
+    document.body.appendChild(copyBtn);
+
+    _log = function(msg, color) {
+      var line = new Date().toISOString().slice(11,19)+' '+msg;
+      _lines.push(line);
+      var d=document.createElement('div');
+      d.textContent=line;
+      d.style.cssText='border-bottom:1px solid #111;padding:1px 0;color:'+(color||'#0f0');
+      box.appendChild(d);
+      if(_lines.length>500){_lines.shift();if(box.firstChild)box.removeChild(box.firstChild);}
+      box.scrollTop=box.scrollHeight;
+    };
+
+    // FPS monitor (dev only)
+    var _ff=0,_fl=performance.now(),_fp=0,_fw=0,_fs=0;
+    function _fpsCount(){
+      var now=performance.now(),ft=now-_fp;_fp=now;
+      if(ft>0&&ft<500){_fs+=ft;if(ft>_fw)_fw=ft;}_ff++;
+      if(now-_fl>=5000){
+        _log('FPS='+Math.round(_ff*1000/(now-_fl))+' avgFT='+Math.round(_fs/_ff)+'ms worstFT='+Math.round(_fw)+'ms');
+        _ff=0;_fl=now;_fw=0;_fs=0;
+      }
+      requestAnimationFrame(_fpsCount);
+    }
+    requestAnimationFrame(_fpsCount);
+
+    // Device info on start
+    _log('UA: '+navigator.userAgent.slice(0,100));
+    _log('DPR='+window.devicePixelRatio+' screen='+screen.width+'x'+screen.height);
+    _log('hwConcurrency='+navigator.hardwareConcurrency);
+  }
+
+  // expose for game engine init below
+  window._earlyLog = _log;
+
+  // ── Backend log queue ────────────────────────────────────────────────────
+  var _queue = [];
+  var _timer = null;
+  var _BACKEND = '/backend/client-log';
+
+  function _deviceMeta() {
+    return {
+      user_agent: (navigator.userAgent||'').slice(0,200),
+      screen:     screen.width+'x'+screen.height,
+      platform:   (navigator.userAgentData&&navigator.userAgentData.platform)||navigator.platform||'',
+      dpr:        String(window.devicePixelRatio||1)
+    };
+  }
+
+  function _flush() {
+    if (!_queue.length) return;
+    var batch = _queue.splice(0, 30);
+    var payload = Object.assign({ entries: batch }, _deviceMeta());
+    var headers = { 'Content-Type': 'application/json' };
+    var tok = window._nimiqAuthToken || '';
+    if (tok) headers['Authorization'] = 'Bearer '+tok;
+    fetch(_BACKEND, { method:'POST', headers:headers, body:JSON.stringify(payload), keepalive:true })
+      .catch(function(){});
+  }
+
+  function _enqueue(level, msg) {
+    _queue.push({ level:level, message:msg });
+    if (_queue.length >= 30) { clearTimeout(_timer); _timer=null; _flush(); }
+    else if (!_timer) { _timer=setTimeout(function(){_timer=null;_flush();}, 30000); }
+  }
+
+  document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='hidden') _flush(); });
+  window.addEventListener('pagehide', _flush);
+
+  // ── Error hooks ──────────────────────────────────────────────────────────
+  var _ol=console.log.bind(console), _ow=console.warn.bind(console), _oe=console.error.bind(console);
+
+  window.onerror = function(msg, src, line, col, err) {
+    var m = String(msg).slice(0,300)+' @'+String(src).slice(-60)+':'+line;
+    if (DEV) { _log('❌ '+m, '#f55'); if(err&&err.stack) _log('  '+err.stack.slice(0,200),'#f88'); box.style.display='block'; }
+    _enqueue('error', m);
+    return false;
+  };
+  window.addEventListener('unhandledrejection', function(e) {
+    var r=e.reason, m='REJECT: '+((r&&(r.message||String(r)))||'?').slice(0,300);
+    if (DEV) { _log('❌ '+m,'#f88'); if(r&&r.stack)_log('  '+r.stack.slice(0,200),'#f88'); box.style.display='block'; }
+    _enqueue('error', m);
+  });
+  window.addEventListener('error', function(e) {
+    var t=e.target;
+    if (t && t!==window && t.tagName) {
+      var url=t.src||t.href||'?';
+      var m='RESOURCE_FAIL: <'+t.tagName.toLowerCase()+'> '+String(url).slice(-200);
+      if (DEV) { _log('❌ '+m,'#f55'); box.style.display='block'; }
+      _enqueue('error', m);
+    }
+  }, true);
+  window.addEventListener('securitypolicyviolation', function(e) {
+    var m='CSP: '+e.violatedDirective+' blocked='+String(e.blockedURI).slice(0,150);
+    if (DEV) { _log('⚠ '+m,'#f80'); box.style.display='block'; }
+    _enqueue('warn', m);
+  });
+
+  // Override console only in dev (avoid overhead in prod)
+  if (DEV) {
+    console.log   = function(){ var m=Array.prototype.join.call(arguments,' '); _log(m.slice(0,200)); _ol.apply(console,arguments); };
+    console.warn  = function(){ var m=Array.prototype.join.call(arguments,' '); _log('⚠ '+m.slice(0,200),'#ff0'); _enqueue('warn',m.slice(0,300)); _ow.apply(console,arguments); };
+    console.error = function(){ var m=Array.prototype.join.call(arguments,' '); _log('❌ '+m.slice(0,200),'#f55'); _enqueue('error',m.slice(0,300)); box.style.display='block'; _oe.apply(console,arguments); };
+  }
+  // In prod, still capture console.error/warn to backend
+  else {
+    console.warn  = function(){ _enqueue('warn',  Array.prototype.join.call(arguments,' ').slice(0,300)); _ow.apply(console,arguments); };
+    console.error = function(){ _enqueue('error', Array.prototype.join.call(arguments,' ').slice(0,300)); _oe.apply(console,arguments); };
+  }
+})();
+</script>
+
+<!-- ── REPLAY DEBUG INTERCEPTOR ───────────────────────────────────────────── -->
+<!-- Sadece ?dev modunda aktif. Godot print() çıktılarını ve replay flow'unu izler. -->
+<script data-cfasync="false">
+(function() {
+  if (!window._DEV) return;
+
+  // Godot engine print() → JS console bridge
+  // Engine başladıktan sonra stdout'u yakala
+  var _origPrint = window.print;
+  Object.defineProperty(window, 'print', {
+    set: function(fn) {
+      _origPrint = fn;
+      window._gdPrint = function(msg) {
+        if (typeof msg === 'string' && (
+          msg.indexOf('[STATS]') !== -1 ||
+          msg.indexOf('[LB]') !== -1 ||
+          msg.indexOf('replay') !== -1 ||
+          msg.indexOf('REPLAY') !== -1 ||
+          msg.indexOf('block_lb') !== -1 ||
+          msg.indexOf('_started') !== -1
+        )) {
+          window._earlyLog && window._earlyLog('🎮 ' + msg.slice(0, 200), '#0ff');
+        }
+        fn(msg);
+      };
+    },
+    get: function() { return _origPrint; },
+    configurable: true
+  });
+
+  // Fetch interceptor — tüm /backend/replay/* isteklerini logla
+  var _origFetch = window.fetch;
+  window.fetch = function(url, opts) {
+    var urlStr = String(url);
+    if (urlStr.indexOf('/backend/replay') !== -1 ||
+        urlStr.indexOf('/backend/stats') !== -1 ||
+        urlStr.indexOf('/backend/leaderboard') !== -1) {
+      var method = (opts && opts.method) || 'GET';
+      window._earlyLog && window._earlyLog('📡 FETCH ' + method + ' ' + urlStr.slice(0, 120), '#0af');
+      return _origFetch.apply(this, arguments).then(function(r) {
+        window._earlyLog && window._earlyLog(
+          '📡 RESP ' + r.status + ' ' + urlStr.slice(urlStr.lastIndexOf('/'), urlStr.lastIndexOf('/') + 40),
+          r.ok ? '#0f0' : '#f55'
+        );
+        return r;
+      }).catch(function(e) {
+        window._earlyLog && window._earlyLog('📡 ERR ' + urlStr.slice(0,80) + ' → ' + e.message, '#f55');
+        throw e;
+      });
+    }
+    return _origFetch.apply(this, arguments);
+  };
+
+  // XMLHttpRequest interceptor (Godot HTTPRequest uses XHR on web)
+  var _XHROpen = XMLHttpRequest.prototype.open;
+  var _XHRSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    this._dbgUrl = String(url);
+    this._dbgMethod = method;
+    return _XHROpen.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function() {
+    var url = this._dbgUrl || '';
+    if (url.indexOf('/backend/replay') !== -1 ||
+        url.indexOf('/backend/stats') !== -1 ||
+        url.indexOf('/backend/leaderboard') !== -1) {
+      var self = this;
+      window._earlyLog && window._earlyLog('🌐 XHR ' + (this._dbgMethod||'?') + ' ' + url.slice(0, 120), '#0af');
+      this.addEventListener('load', function() {
+        window._earlyLog && window._earlyLog(
+          '🌐 XHR ' + self.status + ' ' + url.slice(url.lastIndexOf('/'), url.lastIndexOf('/') + 50),
+          self.status === 200 ? '#0f0' : '#f55'
+        );
+        if (self.status === 200 && url.indexOf('/replay/') !== -1) {
+          try {
+            var d = JSON.parse(self.responseText);
+            window._earlyLog && window._earlyLog(
+              '✅ REPLAY DATA: seed=' + d.seed + ' has_log=' + (!!d.replay_log) +
+              ' log_len=' + (d.replay_log ? d.replay_log.length : 0) +
+              ' char=' + d.char + ' player_seed=' + d.player_seed, '#0f0');
+          } catch(e) {
+            window._earlyLog && window._earlyLog('⚠ REPLAY JSON parse fail: ' + e.message, '#f80');
+          }
+        }
+      });
+      this.addEventListener('error', function() {
+        window._earlyLog && window._earlyLog('🌐 XHR ERROR ' + url.slice(0, 80), '#f55');
+      });
+    }
+    return _XHRSend.apply(this, arguments);
+  };
+
+  window._earlyLog && window._earlyLog('🐛 Replay debug interceptor aktif', '#ff0');
+})();
+</script>
+
+<!-- ── GAME ENGINE LOADER ──────────────────────────────────────────────────── -->
+<script data-cfasync="false">
+(function() {
+  var DEV = window._DEV;
+  var gameUrl = "$GODOT_URL";
+  if (DEV) window._earlyLog("⏳ Downloading game.js…");
+
+  fetch(gameUrl)
+    .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
+    .then(function(code) {
+      // Bypass Safari v15.2 check injected by Emscripten
+      var p1=/throw\s+new\s+Error\(['"]This emscripten-generated code requires Safari v15.2.0.*?['"]\);?/g;
+      if(p1.test(code)){
+        code=code.replace(p1,'/* Safari check bypassed */');
+        if(DEV) window._earlyLog("🎯 Safari throw removed");
+      }
+      if(code.includes("requires Safari v15.2.0")){
+        code=code.split('\n').map(function(l){
+          return l.includes("requires Safari v15.2.0") ? "/* "+l+" */" : l;
+        }).join('\n');
+        if(DEV) window._earlyLog("🛡️ Safari line cleaned");
+      }
+      var s=document.createElement('script');
+      s.text=code; s.setAttribute('data-cfasync','false');
+      document.body.appendChild(s);
+      window._godotEngineLoaded=true;
+      if(window._startGodotSetup) window._startGodotSetup();
+    })
+    .catch(function(err){
+      window._earlyLog && window._earlyLog('❌ game.js INJECT ERROR: '+err.message,'#f55');
+    });
+})();
+</script>
+
+<!-- ── GODOT ENGINE INIT ───────────────────────────────────────────────────── -->
+<script data-cfasync="false">
+function initGodotGame() {
+  var DEV = window._DEV;
+  var GODOT_CONFIG = $GODOT_CONFIG;
+  GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] = false;
+  GODOT_CONFIG['serviceWorker'] = '';
+
+  // Cap DPR at 1.5 to reduce GPU load on high-DPI screens
+  (function() {
+    var canvas=document.getElementById('canvas'); if(!canvas) return;
+    var dpr=Math.min(window.devicePixelRatio||1, 1.5);
+    if(dpr<(window.devicePixelRatio||1)){
+      var rect=canvas.getBoundingClientRect();
+      canvas.width=Math.round(rect.width*dpr);
+      canvas.height=Math.round(rect.height*dpr);
+      if(DEV) window._earlyLog('DPR capped: '+dpr.toFixed(2)+' (native='+(window.devicePixelRatio||1).toFixed(2)+')');
+    }
+  })();
+
+  if (typeof Engine === 'undefined') {
+    if(DEV) window._earlyLog('❌ Engine not found','#f55');
+    return;
+  }
+
+  // Better WebGL context for WebView
+  var _origCtx=HTMLCanvasElement.prototype.getContext;
+  HTMLCanvasElement.prototype.getContext=function(type,attrs){
+    if(type==='webgl2'||type==='webgl'||type==='webgl-experimental'){
+      attrs=Object.assign({
+        powerPreference:'high-performance', desynchronized:true,
+        preserveDrawingBuffer:false, antialias:false,
+        depth:true, stencil:false, alpha:false,
+      },attrs||{});
+    }
+    return _origCtx.call(this,type,attrs);
+  };
+
+  var engine=new Engine(GODOT_CONFIG);
+  var statusOverlay =document.getElementById('status');
+  var statusProgress=document.getElementById('status-progress');
+  var statusNotice  =document.getElementById('status-notice');
+  var initializing=true, statusMode='';
+
+  function setStatusMode(mode) {
+    if(statusMode===mode||!initializing) return;
+    if(mode==='hidden'){statusOverlay.remove();initializing=false;return;}
+    statusOverlay.style.visibility='visible';
+    statusProgress.style.display=mode==='progress'?'block':'none';
+    statusNotice.style.display  =mode==='notice'  ?'block':'none';
+    statusMode=mode;
+  }
+  function displayFailureNotice(err) {
+    console.error(err);
+    statusNotice.innerHTML='An error occurred trying to run '+GODOT_CONFIG['executable']+':<br>'+err.message;
+    setStatusMode('notice');
+  }
+
+  var missing=Engine.getMissingFeatures({threads:false});
+  if(DEV) window._earlyLog('missing: ['+missing.join(',')+']');
+
+  setStatusMode('progress');
+  var _last=-1;
+  engine.startGame({
+    onProgress: function(cur,tot){
+      if(cur>0&&tot>0){
+        statusProgress.value=cur; statusProgress.max=tot;
+        var pct=Math.round(cur/tot*100);
+        if(pct!==_last){_last=pct;if(DEV&&(pct%10===0||pct===100))window._earlyLog('Loading: '+pct+'%');}
+      } else {
+        statusProgress.removeAttribute('value'); statusProgress.removeAttribute('max');
+      }
+    }
+  }).then(function(){
+    if(DEV) window._earlyLog('✓ Game started');
+    setStatusMode('hidden');
+  }, function(err){
+    if(DEV) window._earlyLog('❌ startGame: '+(err&&err.message?err.message:String(err)),'#f55');
+    displayFailureNotice(err);
+  });
+}
+
+window._startGodotSetup=initGodotGame;
+if(window._godotEngineLoaded) initGodotGame();
+</script>
+
+</body>
+</html>

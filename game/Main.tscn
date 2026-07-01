@@ -1,0 +1,13 @@
+[gd_scene load_steps=3 format=3 uid="uid://w2278u650525"]
+
+[ext_resource type="Script" path="res://scripts/Main.gd" id="1_main"]
+[ext_resource type="Script" path="res://scripts/GameManager.gd" id="2_gm"]
+
+[node name="Main" type="Node2D"]
+script = ExtResource("1_main")
+
+[node name="Camera2D" type="Camera2D" parent="."]
+position = Vector2(300, 400)
+
+[node name="GameManager" type="Node2D" parent="."]
+script = ExtResource("2_gm")

@@ -1,0 +1,27 @@
+CREDITS
+=======
+
+Background Music
+----------------
+"Party Tonight" (Track 2)
+Source : Free Casual Game Music Pack Vol. 2
+Author : zakiro101
+URL    : https://zakiro101.itch.io/free-casual-game-music-pack-vol-2
+License: Royalty-free. Free to use in commercial and non-commercial projects.
+         Credit appreciated but not required.
+
+Game Assets
+-----------
+Many game sprites, tiles, and visual assets are sourced from Kenney.nl.
+Source : https://kenney.nl
+License: Creative Commons Zero (CC0) — Public Domain.
+         Free to use in any project, commercial or otherwise, no attribution required.
+         Attribution is given here as a thank-you to the amazing work Kenney provides
+         to the game development community.
+
+Sound Effects
+-------------
+Jump and damage sound effects are procedurally generated original audio.
+
+---
+NimJump — developed by THE_dUDE
