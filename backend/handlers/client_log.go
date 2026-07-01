@@ -61,12 +61,9 @@ func (s *Server) handleClientLog(ctx *fasthttp.RequestCtx) {
 
 	device := buildDeviceString(ua, screen, platform, dpr)
 
-	// IP — from request (proxy-aware)
-	ip := string(ctx.Request.Header.Peek("X-Real-IP"))
-	if ip == "" { ip = string(ctx.Request.Header.Peek("X-Forwarded-For")) }
-	if ip == "" { ip = ctx.RemoteIP().String() }
-	// Keep only first IP if comma-separated
-	if idx := strings.Index(ip, ","); idx >= 0 { ip = strings.TrimSpace(ip[:idx]) }
+	// IP — resolved via realClientIP: only trusts CF-Connecting-IP/X-Forwarded-For
+	// when the request actually came from a Cloudflare edge, spoof-proof otherwise.
+	ip := realClientIP(ctx)
 	if len(ip) > 45 { ip = ip[:45] }
 
 	// Player ID from auth token — optional

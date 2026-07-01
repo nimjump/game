@@ -135,7 +135,7 @@ func (rl *RateLimiter) Middleware(next fasthttp.RequestHandler, isAuthedFn func(
 			return
 		}
 
-		ip := ctx.RemoteIP().String()
+		ip := realClientIP(ctx)
 		authed := isAuthedFn(ctx)
 
 		if !rl.Allow(ip, authed) {

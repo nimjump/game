@@ -93,12 +93,13 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/vs/ws/{room_id}",           s.handleVSWebSocket)  // no rate-limit — WS upgrade
 }
 
-// StartBackgroundServices — starts retry loop and balance monitor
-// called from main.go
+// StartBackgroundServices — starts retry loop, balance monitor, and the
+// Cloudflare IP list refresher. Called from main.go
 func (s *Server) StartBackgroundServices() {
 	s.Store.StartRetryLoop()
 	s.Store.StartBalanceMonitor()
-	log.Printf("[STARTUP] background services started (retry loop + balance monitor)")
+	StartCloudflareIPRefresher()
+	log.Printf("[STARTUP] background services started (retry loop + balance monitor + cloudflare ip refresher)")
 }
 
 // GET /bj/developer-mode — returns current dev mode status (public, read-only)
@@ -254,7 +255,7 @@ type submitReq struct {
 }
 
 func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
-	ip := ctx.RemoteIP().String()
+	ip := realClientIP(ctx)
 
 	// Auth required
 	authedPlayer := s.tokenPlayerID(ctx)
