@@ -59,6 +59,7 @@
           window.nimiq = nimiq;
         } catch(e) {
           if (window._DEV) console.warn('[Nimiq] Provider not found:', e);
+          window._nimiqProviderMissing = true; // definitive: we are NOT inside Nimiq Pay
           return;
         }
         let address = '';
@@ -87,6 +88,7 @@
         window._nimiqReady = true;
       } catch(e) {
         if (window._DEV) console.warn('[Nimiq] SDK load failed:', e);
+        window._nimiqProviderMissing = true; // SDK itself failed to load -> definitely not inside Nimiq Pay
       }
     }
     setTimeout(function() {
@@ -178,29 +180,78 @@
   <!-- ── NIMIQ PAY BANNER ───────────────────────────────────────────────────── -->
   <script data-cfasync="false">
   (function() {
-    if (window.nimiqPay) return;
-    var DEEP_LINK = 'nimiqpay://miniapp?url=nimjump.io';
+    // Deep-link host resolution mirrors ApiConfig.gd's game_url():
+    //   1. ?game_url= query param
+    //   2. localStorage 'nj_game_url'
+    //   3. this page's own origin (window.location.origin)
+    //   4. hardcoded last-resort fallback (only if all else fails)
+    function resolveGameHost() {
+      try {
+        var q = (new URLSearchParams(window.location.search)).get('game_url');
+        if (q) return q.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      } catch(e) {}
+      try {
+        var ls = localStorage.getItem('nj_game_url');
+        if (ls) return ls.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      } catch(e) {}
+      if (window.location.origin && window.location.origin !== 'null') {
+        return window.location.origin.replace(/^https?:\/\//, '').replace(/\/$/, '');
+      }
+      return ''; // nothing resolved — deep link will be built without a host
+    }
+    var _host = resolveGameHost();
+    var DEEP_LINK = _host ? ('nimiqpay://miniapp?url=' + _host) : '';
     try { if (sessionStorage.getItem('nq_banner_dismissed')==='1') return; } catch(e) {}
-    var banner=document.createElement('div');
-    banner.id='nq-banner';
-    banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99998;background:linear-gradient(90deg,#1a1a2e,#16213e);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;font-family:sans-serif;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.5);box-sizing:border-box';
-    var txt=document.createElement('span');
-    txt.textContent='🐰 Play in Nimiq Pay & earn NIM rewards!';
-    txt.style.cssText='flex:1;margin-right:10px;line-height:1.3';
-    var open=document.createElement('button');
-    open.textContent='Open ↗';
-    open.style.cssText='background:#f6b221;color:#1a1a2e;border:none;border-radius:8px;padding:7px 14px;font-weight:bold;font-size:13px;cursor:pointer;white-space:nowrap;flex-shrink:0';
-    open.onclick=function(){window.location.href=DEEP_LINK;};
-    var cls=document.createElement('button');
-    cls.textContent='✕';
-    cls.style.cssText='background:transparent;color:#aaa;border:none;font-size:18px;cursor:pointer;margin-left:8px;padding:0 4px;flex-shrink:0';
-    cls.onclick=function(){
-      banner.style.display='none';
-      try{sessionStorage.setItem('nq_banner_dismissed','1');}catch(e){}
-    };
-    banner.appendChild(txt); banner.appendChild(open); banner.appendChild(cls);
-    if (document.body) document.body.appendChild(banner);
-    else document.addEventListener('DOMContentLoaded',function(){document.body.appendChild(banner);});
+
+    // We're already inside Nimiq Pay if either the host injects window.nimiqPay,
+    // or our own SDK init (see _initNimiq above) found a wallet provider and set
+    // window.nimiq / window._nimiqReady.
+    function insideNimiqPay() {
+      return !!(window.nimiqPay || window.nimiq || window._nimiqReady);
+    }
+    // Definitive negative: _initNimiq's sdk.init() rejected ("provider not found")
+    // or the SDK failed to load entirely — this is the real "we are NOT in Nimiq
+    // Pay" signal, set by the NIMIQ SDK script above. Only fires from here.
+    function providerConfirmedMissing() {
+      return !!window._nimiqProviderMissing;
+    }
+
+    function showBanner() {
+      if (insideNimiqPay()) return;
+      var banner=document.createElement('div');
+      banner.id='nq-banner';
+      banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99998;background:linear-gradient(90deg,#1a1a2e,#16213e);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;font-family:sans-serif;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.5);box-sizing:border-box';
+      var txt=document.createElement('span');
+      txt.textContent='🐰 Play in Nimiq Pay & earn NIM rewards!';
+      txt.style.cssText='flex:1;margin-right:10px;line-height:1.3';
+      var open=document.createElement('button');
+      open.textContent='Open ↗';
+      open.style.cssText='background:#f6b221;color:#1a1a2e;border:none;border-radius:8px;padding:7px 14px;font-weight:bold;font-size:13px;cursor:pointer;white-space:nowrap;flex-shrink:0';
+      open.onclick=function(){ if (DEEP_LINK) window.location.href=DEEP_LINK; };
+      var cls=document.createElement('button');
+      cls.textContent='✕';
+      cls.style.cssText='background:transparent;color:#aaa;border:none;font-size:18px;cursor:pointer;margin-left:8px;padding:0 4px;flex-shrink:0';
+      cls.onclick=function(){
+        banner.style.display='none';
+        try{sessionStorage.setItem('nq_banner_dismissed','1');}catch(e){}
+      };
+      banner.appendChild(txt); banner.appendChild(open); banner.appendChild(cls);
+      if (document.body) document.body.appendChild(banner);
+      else document.addEventListener('DOMContentLoaded',function(){document.body.appendChild(banner);});
+    }
+
+    // Wait for the SDK's definitive result instead of guessing off a fixed delay.
+    // _initNimiq starts ~3.5s after load and sdk.init() itself can take up to 10s,
+    // so worst case this can take up to ~15s — that's fine, it's the correct signal.
+    // A generous ceiling is kept only as a safety net in case the SDK hangs/never
+    // resolves (e.g. blocked network); in that edge case we fall back to showing.
+    var MAX_WAIT_MS = 16000, STEP_MS = 100, waited = 0;
+    var poll = setInterval(function() {
+      waited += STEP_MS;
+      if (insideNimiqPay()) { clearInterval(poll); return; }               // confirmed: inside -> never show
+      if (providerConfirmedMissing()) { clearInterval(poll); showBanner(); return; } // confirmed: not inside -> show now
+      if (waited >= MAX_WAIT_MS) { clearInterval(poll); showBanner(); }    // safety-net fallback
+    }, STEP_MS);
   })();
   </script>
 

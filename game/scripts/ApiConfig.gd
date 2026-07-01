@@ -1,33 +1,58 @@
 extends Node
 # ── ApiConfig (autoload singleton) ───────────────────────────────────────────
 # Single source of truth for the backend base URL, resolved at runtime so the
-# game works no matter where it's hosted:
+# game works no matter where it's hosted or deployed. Nothing below is baked
+# into the binary as "the" backend — every value is an overridable fallback.
 #
+# Resolution order for the API base URL:
 #   1. An explicit override (highest priority), useful for testing:
-#        • URL query param  ?api=http://host:port
-#        • localStorage key  nj_api_base
+#        • Web: URL query param  ?api=http://host:port
+#        • Web: localStorage key  nj_api_base
+#        • Native: command-line arg  --api=http://host:port
+#        • Native: environment variable  NIMJUMP_API_BASE
 #   2. On the web, the page's own origin (window.location.origin) — so when the
 #      game is served from the SAME port as the backend, the API "just works"
 #      from whatever IP/domain it was opened on (localhost, LAN IP, etc.).
-#   3. Native / fallback: DEFAULT_BASE below (change this one line for prod)
+#   3. Native: a local config file (config.cfg next to the executable, or
+#      user://config.cfg) — lets ops change the backend post-build with no
+#      recompile and no editing of this script. Format:
+#        [api]
+#        base="https://api.example.com"
+#        game_url="https://example.com"
+#   4. _FALLBACK_BASE below — only used if nothing above resolved anything.
+#      This is a local-dev convenience, never a production value.
 #
-# Public game URL (share links, replay deep links, VS invites):
-#   1. ?game_url=... query param or localStorage nj_game_url
+# Public game URL (share links, replay deep links, VS invites) follows the
+# same pattern:
+#   1. ?game_url=... query param / localStorage nj_game_url (web)
+#      or --game-url=... / NIMJUMP_GAME_URL env var (native)
 #   2. Server-provided game_url (stats/submit responses) via set_game_url()
 #   3. Web: window.location.origin
-#   4. DEFAULT_GAME_URL fallback
+#   4. Native config file entry (game_url key)
+#   5. _FALLBACK_GAME_URL — local-dev-only last resort
 
-const DEFAULT_BASE     := "http://127.0.0.1:8080"
-const DEFAULT_GAME_URL := "https://nimjump.io"
+const CONFIG_FILE_NAME := "config.cfg"
+
+# ════════════════════════════════════════════════════════════════════════
+#  BURAYA KENDİ BACKEND URL'İNİ YAZ (deploy ettiğin domain/IP)
+#  Örnek:  const PROD_BASE := "https://api.nimjump.io"
+#  Örnek:  const PROD_BASE := "http://1.2.3.4:8080"
+# ════════════════════════════════════════════════════════════════════════
+const PROD_BASE     := "https://backbone.zetashare.com"   # <-- backend API URL'i
+const PROD_GAME_URL := "https://game.zetashare.com"        # <-- oyunun public URL'i (share/replay/VS invite linkleri)
+
+# Local-dev-only last-resort values. These are intentionally NOT "the"
+# production backend — real deployments must set NIMJUMP_API_BASE / --api=
+# or ship a config.cfg next to the executable. Kept here only so the game
+# still boots on a bare checkout with zero configuration.
+const _FALLBACK_BASE     := "http://127.0.0.1:8080"
+const _FALLBACK_GAME_URL := "http://127.0.0.1:8080"
 # Scheme used to silently try to open the Nimiq Pay app on every visit.
 # %s gets replaced with game_url()'s host — keep adjustable here.
 const NIMIQ_DEEP_SCHEME := "nimiqpay://miniapp?url=%s"
 
 var _cached     := ""
 var _game_cached := ""
-
-## Legacy alias — prefer game_url() which resolves at runtime.
-const GAME_URL := DEFAULT_GAME_URL
 
 ## Outgoing links (share, replay, VS invite, etc) are passed through as-is.
 func tag_url(url: String) -> String:
@@ -52,6 +77,10 @@ func replay_url(session_id: String) -> String:
 	return tag_url(game_url() + "?replay=" + session_id.uri_encode())
 
 func _resolve_game_url() -> String:
+	var prod := PROD_GAME_URL.strip_edges()
+	if prod == "":
+		prod = PROD_BASE.strip_edges()
+
 	if OS.has_feature("web"):
 		var q : String = str(JavaScriptBridge.eval(
 			"(new URLSearchParams(window.location.search)).get('game_url') || ''", true))
@@ -63,12 +92,61 @@ func _resolve_game_url() -> String:
 		ls = ls.strip_edges()
 		if ls != "":
 			return _trim_slash(ls)
+		if prod != "":
+			return _trim_slash(prod)
 		var origin : String = str(JavaScriptBridge.eval(
 			"window.location.origin || ''", true))
 		origin = origin.strip_edges()
 		if origin != "" and origin != "null":
 			return _trim_slash(origin)
-	return DEFAULT_GAME_URL
+		return _FALLBACK_GAME_URL
+
+	# Native: cmdline arg > env var > PROD_GAME_URL/PROD_BASE > config file > local-dev fallback.
+	var cli := _cmdline_value("--game-url=")
+	if cli != "":
+		return _trim_slash(cli)
+	var env := OS.get_environment("NIMJUMP_GAME_URL").strip_edges()
+	if env != "":
+		return _trim_slash(env)
+	if prod != "":
+		return _trim_slash(prod)
+	var cfg := _config_value("game_url")
+	if cfg != "":
+		return _trim_slash(cfg)
+	return _FALLBACK_GAME_URL
+
+
+## Reads --key=value from the command line, e.g. _cmdline_value("--api=").
+func _cmdline_value(prefix: String) -> String:
+	for arg in OS.get_cmdline_args():
+		if arg.begins_with(prefix):
+			return arg.substr(prefix.length()).strip_edges()
+	return ""
+
+
+## Reads an [api] key from a config.cfg checked in two locations, in order:
+##   1. user://config.cfg — per-user override dir, no rebuild needed
+##   2. config.cfg placed next to the exported executable
+## Example file:
+##   [api]
+##   base="https://api.example.com"
+##   game_url="https://example.com"
+func _config_value(key: String) -> String:
+	var cfg := ConfigFile.new()
+	var user_path := "user://" + CONFIG_FILE_NAME
+	if cfg.load(user_path) == OK:
+		var v : String = str(cfg.get_value("api", key, ""))
+		if v.strip_edges() != "":
+			return v.strip_edges()
+
+	var exe_dir := OS.get_executable_path().get_base_dir()
+	var side_path := exe_dir.path_join(CONFIG_FILE_NAME)
+	var cfg2 := ConfigFile.new()
+	if cfg2.load(side_path) == OK:
+		var v2 : String = str(cfg2.get_value("api", key, ""))
+		if v2.strip_edges() != "":
+			return v2.strip_edges()
+	return ""
 
 ## Builds the nimiqpay:// deep link from game_url().
 func nimiq_deep_link() -> String:
@@ -93,12 +171,28 @@ func _resolve() -> String:
 		ls = ls.strip_edges()
 		if ls != "":
 			return _trim_slash(ls)
+		if PROD_BASE.strip_edges() != "":
+			return _trim_slash(PROD_BASE)
 		var origin : String = str(JavaScriptBridge.eval(
 			"window.location.origin || ''", true))
 		origin = origin.strip_edges()
 		if origin != "" and origin != "null":
 			return _trim_slash(origin)
-	return DEFAULT_BASE
+		return _FALLBACK_BASE
+
+	# Native: cmdline arg > env var > PROD_BASE > config file > local-dev fallback.
+	var cli := _cmdline_value("--api=")
+	if cli != "":
+		return _trim_slash(cli)
+	var env := OS.get_environment("NIMJUMP_API_BASE").strip_edges()
+	if env != "":
+		return _trim_slash(env)
+	if PROD_BASE.strip_edges() != "":
+		return _trim_slash(PROD_BASE)
+	var cfg := _config_value("base")
+	if cfg != "":
+		return _trim_slash(cfg)
+	return _FALLBACK_BASE
 
 func _trim_slash(u: String) -> String:
 	while u.ends_with("/"):
