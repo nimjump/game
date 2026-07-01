@@ -4,9 +4,13 @@ build — Compress Godot WebAssembly exports and finish the export folder.
 
 For every .wasm file found:
   1. Produces .wasm.gz (gzip q9) and .wasm.br (brotli q5) next to it.
-  2. Deletes the original uncompressed .wasm (it's not needed at runtime
-     once the compressed versions exist — keeping it just adds dead
-     weight to the upload).
+  2. Deletes the original uncompressed .wasm, then renames the .wasm.br
+     file back to .wasm. The file the browser requests (index.wasm) is
+     now Brotli-compressed bytes under its original name — that's what
+     lets the _headers rule (Content-Encoding: br) work, since
+     Cloudflare Pages serves whatever file is actually at that path
+     rather than negotiating content on the fly. The .wasm.gz sits
+     alongside as a spare/reference copy but isn't what gets requested.
 
 Then copies the deploy-time extras from game/template into the export
 folder:
@@ -149,8 +153,18 @@ def main():
         print(f"[{wasm.name}]  ({wasm.stat().st_size/1e6:.1f} MB)")
         gzip_file(wasm)
         brotli_file(wasm)
+
+        br_path = wasm.parent / (wasm.name + ".br")
         wasm.unlink()
-        print(f"  deleted original {wasm.name} (uncompressed, no longer needed)")
+        if br_path.is_file():
+            br_path.rename(wasm)
+            print(f"  renamed {br_path.name} → {wasm.name}")
+            print(f"  (the file at {wasm.name} is now Brotli-compressed bytes;")
+            print(f"   _headers tells Cloudflare it's already br-encoded)")
+        else:
+            print(f"  WARNING: {br_path.name} missing — is brotli installed? "
+                  f"index.wasm has been deleted with nothing to replace it, "
+                  f"the game will 404 until this is fixed.")
         print()
 
     template_folder = find_template_folder()
