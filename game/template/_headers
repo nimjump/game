@@ -1,4 +1,14 @@
-/index.wasm
-  Content-Encoding: br
-  Content-Type: application/wasm
-  Cache-Control: public, max-age=31536000, immutable, no-transform
+# _headers — Cloudflare Pages custom headers
+#
+# Previously had a Content-Encoding: br rule for /index.wasm — that's
+# gone now that build.py splits large wasm files into .part1/.part2
+# instead of brotli-compressing them (see setup/build.py, section 5
+# of the README). Those parts are raw bytes, not brotli, so keeping
+# `Content-Encoding: br` here would make browsers try to brotli-decode
+# them and fail.
+#
+# Left empty for now — add rules back here if/when we need custom
+# caching or headers again (e.g. Cache-Control for .part1/.part2 or
+# wasm-loader.js). Whatever goes here gets copied into export/ as-is
+# by build.py on every run — this file (in game/template/) is the
+# source of truth, don't edit the copy inside export/ directly.

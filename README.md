@@ -2,7 +2,7 @@
 
 This is not just a web export guide — it covers the full setup: the web
 build for the browser, the native build the backend needs for replay
-verification, compression, and deployment to Cloudflare Pages.
+verification, wasm splitting, and deployment to Cloudflare Pages.
 
 All paths below are relative to the NimJump root folder.
 
@@ -27,8 +27,9 @@ NimJump/
 └── export/                      (web export output folder)
     ├── index.html
     ├── index.js
-    ├── index.wasm.gz
-    ├── index.wasm.br
+    ├── index.wasm.part1         (or plain index.wasm if under 24 MiB)
+    ├── index.wasm.part2
+    ├── wasm-loader.js            (only generated if a split happened)
     ├── index.pck
     └── _headers
 ```
@@ -39,7 +40,8 @@ NimJump/
 
 - Godot 4.7 exactly (check via Help → About Godot)
 - Web export templates installed (Editor → Manage Export Templates)
-- Python 3.9+ with pip install brotli
+- Python 3.9+ (no extra pip packages needed — build.py only uses the
+  standard library)
 - A Cloudflare Pages project already connected (initial Pages setup is
   not covered here)
 - Know which OS you're exporting from — it determines which native
@@ -111,7 +113,7 @@ After both exports, you should have:
 export/
 ├── index.html
 ├── index.js
-├── index.wasm        (uncompressed, ~30 MB)
+├── index.wasm        (single file at this point, typically ~30 MB)
 ├── index.pck
 └── index.audio.worklet.js   (if using AudioWorklet)
 
@@ -119,30 +121,43 @@ backend/replay-verifier/
 └── replay.exe (or replay.zip) + its .pck
 ```
 
-Do not upload the export/ folder to Cloudflare yet — the .wasm still
-needs compressing.
+Do not upload the export/ folder to Cloudflare yet — Cloudflare Pages
+rejects any single file over 25 MiB, and Godot's wasm export is
+routinely bigger than that. That's what build.py handles next.
 
 ---
 
-## 5. Compress the WASM Output
+## 5. Split the WASM Output
 
 Run (from inside the setup folder):
 
     cd setup
     python build.py
 
-This script does the rest of the export folder prep, not just
-compression:
+Cloudflare Pages has a hard 25 MiB per-file limit. Instead of
+compressing index.wasm to fit under it, build.py splits it:
 
-1. Compresses index.wasm into index.wasm.gz and index.wasm.br
-2. Deletes the original uncompressed index.wasm (the ~30 MB one) — it's
-   not needed once the compressed versions exist
-3. Copies _headers and the assets/ folder from game/template into
-   export/, overwriting whatever was there
+1. Scans export/ for any .wasm file over 24 MiB (a little headroom
+   under Cloudflare's 25 MiB cap).
+2. For each oversized file, cuts it into two roughly-equal halves —
+   index.wasm.part1 and index.wasm.part2 — and deletes the original
+   index.wasm. It never exists as one file on disk after this, so it
+   can never be uploaded (and rejected) as a single blob.
+3. Writes wasm-loader.js into export/. This patches window.fetch so
+   that when Godot's own loader requests "index.wasm", it instead
+   fetches both .part1 and .part2, stitches the bytes back together,
+   and hands Godot a normal-looking Response. Godot never knows the
+   file was split.
+4. Injects `<script src="wasm-loader.js"></script>` as the very first
+   script in index.html's `<head>` — it has to run before Godot's own
+   loader script, or the patch happens too late. Safe to re-run
+   (won't duplicate the tag).
+5. Copies _headers and the assets/ folder from game/template into
+   export/, overwriting whatever was there.
 
-So after running it, export/ has index.wasm.gz, index.wasm.br,
-_headers, and assets/ — no plain index.wasm left behind, and no manual
-copying needed on your end.
+If a .wasm file happens to be under 24 MiB, it's left alone as a
+single file and no wasm-loader.js is generated at all — the split
+step only kicks in when it's actually needed.
 
 If you edit _headers or add something to assets/, do it in
 game/template — that's the source. Editing the copies inside export/
@@ -154,12 +169,15 @@ directly will just get overwritten next time you run build.py.
 
 1. Cloudflare dashboard → Workers & Pages → the NimJump Pages project
 2. Deployments → Direct upload (drag the whole export folder, including
-   the generated _headers) or push via your Git-connected branch
+   the generated _headers and wasm-loader.js if present) or push via
+   your Git-connected branch
 3. Once live, open the site → DevTools → Network → reload
-4. Check the index.wasm request:
-   - Content-Encoding header should be br or gzip depending on what
-     Cloudflare served
-   - Transferred size should be a fraction of the original 30 MB
+4. Confirm the wasm loading worked:
+   - You should see two requests, index.wasm.part1 and
+     index.wasm.part2, each returning 200 — not a single index.wasm
+     request
+   - wasm-loader.js should load and execute before index.js
+   - No "wasm-loader: failed to fetch parts" error in the console
 5. Confirm the game actually loads and plays
 
 ---
@@ -200,9 +218,10 @@ verification to actually work while it's running.
 | Symptom | Likely cause |
 |---|---|
 | Default Godot robot favicon shows up instead of ours | Custom HTML Shell wasn't set to game/template/index.html in the Web preset |
-| index.wasm still transfers at full ~30 MB | build.py wasn't run before deploying, or the original index.wasm got re-added some other way |
+| Upload to Cloudflare fails / "file too large" | build.py wasn't run before deploying, so index.wasm is still one file over the 25 MiB limit |
+| Game hangs on the loading bar, console shows a fetch error for .part1/.part2 | wasm-loader.js didn't get uploaded, or the `<script>` tag wasn't injected into index.html — rerun build.py and re-check index.html's `<head>` |
+| Game hangs on the loading bar (no fetch errors) | index.wasm(.part1/.part2) and index.pck are from different export runs — always redo export → build.py → deploy together, never mix files from different runs |
 | Backend replay-verifier fails to run the export | Native export platform doesn't match the OS the backend host runs on (see 3.2) |
-| Game hangs on the loading bar | index.wasm and index.pck are from different export runs — always redo export → compress → deploy together, never mix files from different runs |
 | Custom HTML Shell reset to blank | Some Godot version upgrades reset export preset fields — recheck section 3.1 after upgrading the editor |
 
 ---
@@ -210,5 +229,6 @@ verification to actually work while it's running.
 ## Checklist Before Uploading
 
 - [ ] export/index.html — the custom shell, not Godot's default
-- [ ] export/index.wasm.gz and export/index.wasm.br generated by build.py
+- [ ] export/index.wasm.part1 and .part2 present (or plain index.wasm if it was under 24 MiB) — generated by build.py, no single oversized index.wasm left behind
+- [ ] export/wasm-loader.js present and referenced as the first `<script>` in index.html's `<head>` (only applies if a split happened)
 - [ ] backend/replay-verifier/replay.exe (or replay.zip) — native build present and matching the backend host's OS
