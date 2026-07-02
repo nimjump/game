@@ -108,10 +108,32 @@ var (
 
 // jobDirFromEnv — REPLAY_JOB_DIR env override for the worker job/result file
 // directory. Falls back to os.TempDir() if unset or if the dir can't be created.
+//
+// FIX: if REPLAY_JOB_DIR is set to a RELATIVE path (e.g. "data/replay-jobs"
+// in .env), this used to hand that relative string straight to the Godot
+// child via the WORKER_JOB_DIR env var. This Go process resolves that
+// relative path against ITS OWN cwd (wherever `go run .` / the binary was
+// started from, e.g. backend/) when creating the directory — but Godot, for
+// a self-contained export with an adjacent .pck, chdir()s into ITS OWN
+// binary's directory (e.g. backend/replay-verifier/) as part of resolving
+// its resource path, and THEN looks up WORKER_JOB_DIR relative to THAT
+// different cwd. The two processes end up resolving the exact same
+// relative string to two DIFFERENT absolute paths — Godot polls a
+// directory that never exists, ENOENT-loops forever, and never prints
+// "[WORKER#N] READY", which is exactly the long-standing "worker READY
+// timeout" mystery (confirmed via strace: repeated
+// chdir(".../replay-verifier/data/replay-jobs") = -1 ENOENT). Resolving to
+// an absolute path here means the same string means the same location
+// regardless of which directory either process's cwd happens to be.
 func jobDirFromEnv() string {
 	dir := os.Getenv("REPLAY_JOB_DIR")
 	if dir == "" {
 		return os.TempDir()
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	} else {
+		log.Printf("[WORKER_POOL] REPLAY_JOB_DIR abs path resolve failed (%s): %v — using as-is", dir, err)
 	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Printf("[WORKER_POOL] REPLAY_JOB_DIR mkdir failed (%s): %v — falling back to os.TempDir()", dir, err)
