@@ -730,7 +730,7 @@ deploy or binary swap isn't something that's always safe to blindly
 repeat automatically, so this surfaces it for you to look at and
 re-schedule manually instead of guessing.
 
-### 18.6 The "mis gibi" scenario, end to end
+### 18.6 The full update flow, end to end
 
 Putting all of section 11 + 18 together, this is what a full update
 looks like in practice:
@@ -854,3 +854,4 @@ on failure" under the task's Settings tab) or a small wrapper like
 [NSSM](https://nssm.cc/) to install `nimjump-backend.exe` as a proper
 Windows service with restart-on-crash. The binary and `.env` setup are
 identical either way — only the "keep it running" mechanism changes.
+   
