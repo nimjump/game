@@ -361,10 +361,13 @@ func _build_ui() -> void:
 
 		var icon_row := HBoxContainer.new()
 		icon_row.add_theme_constant_override("separation", int(ref * 0.008))
-		# Pinned to the card's top-left corner (not centered) — SHRINK_BEGIN
-		# makes the row hug its own content width instead of stretching, and
-		# anchors that compact block to the left edge instead of the middle.
-		icon_row.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+		# Was SHRINK_BEGIN (pinned to the card's top-left) — but the number
+		# below it (val_lbl) is centered across the full card width, so the
+		# "Games Played" label sat off to the side instead of centered above
+		# its number. SHRINK_CENTER keeps the row hugging its own content
+		# width (icon+label stay together, no stretching) but centers that
+		# whole block horizontally, matching the centered number below it.
+		icon_row.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 		cv.add_child(icon_row)
 
 		# Lucide icon — UITheme ile çizilir, renk garantili. A bit bigger than

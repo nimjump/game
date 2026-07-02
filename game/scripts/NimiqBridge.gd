@@ -113,10 +113,39 @@ func _poll() -> void:
 	print("[NimiqBridge] emit nimiq_ready addr=%s auth_verified=%s" % [nimiq_address.left(12), str(auth_verified)])
 	nimiq_ready.emit(nimiq_address, nimiq_label, nimiq_avatar, device_id)
 	if not auth_verified and not _restore_network_failed:
-		print("[NimiqBridge] not verified — starting sign auth...")
-		_do_sign_auth()
+		# BUG FIX: this used to call _do_sign_auth() the instant polling
+		# finished — but polling can take up to ~18s (window._nimiqAddress
+		# detection + session-restore wait), and the player is free to start
+		# playing well before that resolves (game start never waits on this
+		# poll). The result was the wallet's native sign prompt popping up
+		# out of nowhere while the player was mid-run, taking over the
+		# screen. Now it waits for a safe moment — not actively playing
+		# (menu) or the game-over screen — before prompting.
+		print("[NimiqBridge] not verified — waiting for a safe moment to sign...")
+		_wait_for_safe_moment_then_sign()
 	elif _restore_network_failed:
 		print("[NimiqBridge] network was offline during restore — skipping sign, will retry when online")
+
+
+## True while the player is actively mid-run (game started, not yet on the
+## game-over screen) — the wrong moment to pop up a native wallet sign
+## prompt over the gameplay.
+func _is_mid_gameplay() -> bool:
+	var main_node = get_tree().get_root().get_node_or_null("Main")
+	if not main_node: return false
+	var started : bool = bool(main_node.get("_started"))
+	if not started: return false
+	var gm = main_node.get("_gm")
+	if not is_instance_valid(gm): return false
+	return not bool(gm.get("_game_over"))
+
+
+func _wait_for_safe_moment_then_sign() -> void:
+	while _is_mid_gameplay():
+		await get_tree().create_timer(1.0).timeout
+	if auth_verified: return  # got signed in some other way while waiting
+	print("[NimiqBridge] safe moment reached — starting sign auth now")
+	_do_sign_auth()
 
 
 ## Check token in localStorage — emit auth_success if valid

@@ -438,6 +438,18 @@ static func _apply_pixel_font(ctrl: Control) -> void:
 		_font_loaded = true
 		if ResourceLoader.exists(PIXEL_FONT_PATH):
 			_cached_font = load(PIXEL_FONT_PATH) as FontFile
+			if _cached_font:
+				# BUG FIX: KartwoFilled.ttf is a decorative pixel font with a
+				# limited glyph set — characters like "/" aren't in it. With no
+				# fallback configured, Godot rendered those as broken/missing
+				# glyph boxes (tofu), visible in WebView wherever UI text used
+				# such a character. Godot's built-in default font (ThemeDB's
+				# fallback) has full common-glyph coverage, so chaining it as
+				# a fallback here makes any glyph missing from our custom font
+				# silently render in the normal system-style font instead of
+				# showing as broken — applies everywhere apply_label() is used,
+				# since they all share this one cached Font resource.
+				_cached_font.fallbacks = [ThemeDB.fallback_font]
 	if _cached_font:
 		ctrl.add_theme_font_override("font", _cached_font)
 

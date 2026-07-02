@@ -228,51 +228,123 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 				var full = %s;
 				console.log('[Share] url=', url, 'text=', text);
 
-				function showToast(msg) { try { window._nj_toast_cb(msg); } catch(e) { console.warn('[Share] toast bridge failed', e); } }
+				// If the toast bridge itself fails for some reason, fall through to
+				// the banner bridge as a second attempt — belt and suspenders so
+				// there's truly no dead-silent outcome.
+				function showToast(msg) {
+					try { window._nj_toast_cb(msg); }
+					catch(e) {
+						console.warn('[Share] toast bridge failed, trying banner', e);
+						try { window._nj_banner_cb(msg, 'toast-bridge-failed'); } catch(e2) { console.error('[Share] banner bridge also failed', e2); }
+					}
+				}
 				function showFallbackBanner(why) { try { window._nj_banner_cb(full, why); } catch(e) { console.warn('[Share] banner bridge failed', why, e); } }
 
-				function tryClipboard() {
-					console.log('[Share] tryClipboard()');
-					if (navigator.clipboard && navigator.clipboard.writeText) {
-						navigator.clipboard.writeText(full).then(function(){
-							console.log('[Share] clipboard write succeeded');
-							showToast('Score copied to clipboard!');
-						}).catch(function(e){
-							console.warn('[Share] clipboard write rejected', e);
-							try {
-								var ok = window.prompt('Copy this:', full);
-								if (ok === null) showFallbackBanner('prompt-dismissed');
-							} catch(e2) {
-								showFallbackBanner('prompt-blocked');
-							}
-						});
-					} else {
-						try {
-							var ok = window.prompt('Copy this:', full);
-							if (ok === null) showFallbackBanner('no-clipboard-api');
-						} catch(e3) {
-							showFallbackBanner('no-prompt');
+				// BUG FIX: inside embedded WebViews (e.g. Nimiq Pay's in-app browser),
+				// navigator.clipboard.writeText() commonly rejects — WebViews often
+				// don't grant the async Clipboard permission at all — and the old
+				// fallback here was window.prompt(), which most Android WebViews
+				// never implement (no WebChromeClient.onJsPrompt override), so it
+				// either does nothing or throws immediately. Net effect: total
+				// silence, no toast, nothing copied — exactly what was reported.
+				// Fix: try the legacy execCommand('copy') trick FIRST — it works
+				// through a hidden textarea + a real selection/copy, which is far
+				// more widely supported inside restrictive WebViews than the async
+				// Clipboard API since it doesn't need a permissions grant. Only if
+				// that ALSO fails do we fall through to the async API, and finally
+				// to the in-game banner (with prompt() dropped entirely).
+				function execCommandCopy() {
+					var ta = null;
+					try {
+						ta = document.createElement('textarea');
+						ta.value = full;
+						ta.setAttribute('readonly', '');
+						// Off-screen but still a real, focusable/selectable element —
+						// execCommand('copy') requires an actual selection to exist,
+						// display:none or zero-size elements can't be selected in
+						// some WebViews so this stays fully laid out, just off-screen.
+						ta.style.position = 'fixed';
+						ta.style.top = '-9999px';
+						ta.style.left = '-9999px';
+						ta.style.fontSize = '16px';   // avoid iOS Safari auto-zoom on focus
+						document.body.appendChild(ta);
+
+						// iOS Safari/WebView: textarea.select() alone is unreliable —
+						// needs an explicit Range+Selection, plus setSelectionRange as
+						// a belt-and-suspenders second pass.
+						var isIOS = /ipad|iphone|ipod/i.test(navigator.userAgent);
+						if (isIOS) {
+							var range = document.createRange();
+							range.selectNodeContents(ta);
+							var sel = window.getSelection();
+							sel.removeAllRanges();
+							sel.addRange(range);
+							ta.setSelectionRange(0, 999999);
+						} else {
+							ta.focus();
+							ta.select();
 						}
+						return document.execCommand('copy');
+					} catch (e) {
+						console.warn('[Share] execCommand copy failed', e);
+						return false;
+					} finally {
+						// Always clean up, even if execCommand itself threw.
+						if (ta && ta.parentNode) ta.parentNode.removeChild(ta);
 					}
 				}
 
+				function tryClipboard() {
+					console.log('[Share] tryClipboard()');
+					if (execCommandCopy()) {
+						console.log('[Share] execCommand copy succeeded');
+						showToast('Score copied to clipboard!');
+						return;
+					}
+					if (navigator.clipboard && navigator.clipboard.writeText) {
+						navigator.clipboard.writeText(full).then(function(){
+							console.log('[Share] clipboard.writeText succeeded');
+							showToast('Score copied to clipboard!');
+						}).catch(function(e){
+							console.warn('[Share] clipboard write rejected', e);
+							showFallbackBanner('clipboard-blocked');
+						});
+					} else {
+						showFallbackBanner('no-clipboard-support');
+					}
+				}
+
+				// Every path below must end in a showToast/showFallbackBanner call —
+				// no silent "nothing happened" outcome, per explicit request. That
+				// includes the user dismissing the native share sheet (AbortError)
+				// and the stale/late-resolve case, which used to just `return`.
 				try {
 					if (navigator.share) {
 						var _shareStartedAt = Date.now();
 						var SHARE_STALE_MS = 10000;
 						navigator.share({ title: 'NimJump', text: text, url: url }).then(function(){
 							console.log('[Share] navigator.share resolved (user shared)');
+							showToast('Shared!');
 						}).catch(function(e){
+							console.warn('[Share] navigator.share rejected/cancelled', e);
 							var elapsed = Date.now() - _shareStartedAt;
-							if (e && e.name === 'AbortError') return;
-							if (elapsed > SHARE_STALE_MS) return;
+							if (e && e.name === 'AbortError') {
+								showToast('Share cancelled');
+								return;
+							}
+							if (elapsed > SHARE_STALE_MS) {
+								showToast('Share timed out — copying instead');
+							}
 							tryClipboard();
 						});
 					} else {
 						tryClipboard();
 					}
 				} catch (syncErr) {
-					console.error('[Share] navigator.share threw:', syncErr);
+					console.error('[Share] unexpected error:', syncErr);
+					// Last-resort catch-all — even if something above threw in a way
+					// none of the inner try/catches anticipated, still surface it
+					// in-game instead of failing completely silently.
 					tryClipboard();
 				}
 			})();

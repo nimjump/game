@@ -142,9 +142,11 @@ func (s *Server) handleQuestProgress(ctx *fasthttp.RequestCtx) {
 		case models.QuestTotalScore:
 			prog.Progress += serverScore
 
-		// ── Match count ───────────────────────────────────────────────────
+		// ── Match count — only counts matches that scored at least 300 ─────
 		case models.QuestGames, models.QuestGames5, models.QuestGames10:
-			prog.Progress += 1
+			if serverScore >= 300 {
+				prog.Progress += 1
+			}
 
 		// ── Altitude (New logic: Reach score X in a single match) ─────────
 		case models.QuestAltitude:

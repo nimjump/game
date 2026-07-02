@@ -2191,17 +2191,16 @@ func _build_start_ui() -> void:
 	var btn_w       := _p(0.72)
 	var play_h      := int(_p(0.105))
 	var set_h       := int(_p(0.080))
-	var gap         := int(_p(0.018))
+	var gap         := int(_p(0.034))   # slightly bigger than the old inter-button gap so there's still visible breathing room, without the full VS-row gap
 
-	# Centre the PLAY/VS/Settings block in the space between the character
+	# Centre the PLAY/Settings block in the space between the character
 	# selector's bottom edge (the arrow row above) and the bottom nav bar's
 	# top edge, so the gap above the block equals the gap below it —
 	# instead of a fixed offset from the screen edge that left them uneven.
 	var sel_bottom_abs     : float = _vh * 0.5 + sel_pc.offset_bottom
 	var bottom_bar_h       : float = _vh * 0.09  # must match _build_bottom_bar()'s bar_h formula
 	var bottom_bar_top_abs : float = _vh - bottom_bar_h
-	# VS button removed from the menu (system/panel kept, just no entry point
-	# here) — block height no longer reserves space for it.
+	# VS button removed — no longer reserving vs_h+gap of blank space here.
 	var block_h            : float = play_h + gap + set_h
 	var avail_h             : float = bottom_bar_top_abs - sel_bottom_abs
 	var equal_margin        : float = maxf((avail_h - block_h) * 0.5, 0.0)
@@ -2274,7 +2273,7 @@ func _build_start_ui() -> void:
 		var _base := base_bottom  # same equal-margin position computed above, not a fixed screen offset
 		var _set_h2 := int(_p(0.080))
 		var _play_h2 := int(_p(0.105))
-		var _gap2 := int(_p(0.018))
+		var _gap2 := int(_p(0.034))   # must match `gap` above
 		intro.tween_property(settings_btn, "offset_top",    _base - _set_h2,              0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 		intro.tween_property(settings_btn, "offset_bottom", _base,                         0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 		intro.tween_property(_play_btn, "offset_top",    _base - _set_h2 - _gap2 - _play_h2, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
@@ -3350,7 +3349,7 @@ func _build_settings_popup() -> void:
 	about_vbox.add_child(about_game)
 
 	var about_dev := Label.new()
-	about_dev.text = "By: thedude"
+	about_dev.text = "By: the_dude"
 	about_dev.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	UITheme.apply_label(about_dev, S_MID, int(_p(0.036)))
 	about_vbox.add_child(about_dev)
@@ -3747,14 +3746,6 @@ func _change_char_settings(dir: int) -> void:
 func _on_play_pressed() -> void:
 	_start_bgm_if_needed()  # ilk etkileşim → BGM başlat
 	if _started: return
-
-	# Clear token if 1 day until expiry — proactive re-auth
-	# nimiq_expires_at getter reads bridge.auth_expires_at directly — always fresh
-	if _auth_token != "" and nimiq_expires_at > 0:
-		var remaining := nimiq_expires_at - int(Time.get_unix_time_from_system())  # determinism-ok: UI-only auth countdown
-		if remaining < 86400:
-			print("[MAIN] token expires in %ds (<1 day) — forcing re-auth" % remaining)
-			_on_auth_expired()
 
 	# Sign-in required — request if no auth, wait again if rejected (game must not start)
 	if _auth_token == "":

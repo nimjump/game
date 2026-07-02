@@ -46,9 +46,9 @@ var questPool = []questTemplate{
 	{models.QuestTotalScore,   10000, "Earn 10 000 total points today",                  18.0},
 
 	// ── Match count ────────────────────────────────────────────────
-	{models.QuestGames,        3,     "Play 3 matches today",                             8.0},
-	{models.QuestGames5,       5,     "Play 5 matches today",                             12.0},
-	{models.QuestGames10,      10,    "Play 10 matches today — keep the streak alive!",  20.0},
+	{models.QuestGames,        3,     "Play 3 matches today (300+ points each)",          8.0},
+	{models.QuestGames5,       5,     "Play 5 matches today (300+ points each)",         12.0},
+	{models.QuestGames10,      10,    "Play 10 matches today (300+ points each) — keep the streak alive!", 20.0},
 
 	// ── Enemy kills ────────────────────────────────────────────────
 	{models.QuestKills,        10,    "Kill 10 enemies in a single match",                8.0},
@@ -215,9 +215,12 @@ func (s *Store) UpdateQuestProgressFromReplay(playerID string, result *GodotRepl
 		case models.QuestTotalScore:
 			newProgress = prog.Progress + result.ServerScore
 
-		// ── Match count ───────────────────────────────────────────────────
+		// ── Match count — only counts matches that scored at least 300 ─────
 		case models.QuestGames, models.QuestGames5, models.QuestGames10:
-			newProgress = prog.Progress + 1
+			newProgress = prog.Progress
+			if result.ServerScore >= 300 {
+				newProgress = prog.Progress + 1
+			}
 
 		// ── Enemy kills ───────────────────────────────────────────────────
 		case models.QuestKills:
