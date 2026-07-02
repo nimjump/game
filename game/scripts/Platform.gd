@@ -59,6 +59,17 @@ func setup(ptype: PlatformType, texture: Texture2D, plat_size: Vector2, broken_t
 	rect.size = plat_size
 	_col_shape = CollisionShape2D.new()
 	_col_shape.shape = rect
+	# THE BUG: add_child()'s default force_readable_name is false, so without
+	# an explicit name Godot assigns an internal placeholder like
+	# "@CollisionShape2D@3" instead of the plain "CollisionShape2D". Every
+	# enemy platform-gap lookup does get_node_or_null("CollisionShape2D") by
+	# that exact string — with the placeholder name, EVERY one of those
+	# lookups silently returns null, so the enemy falls back to "just keep
+	# whatever Y it already happened to be at" instead of ever snapping to
+	# the platform's real surface. This is why PLATFORM_GAP_FIX values (and
+	# any other platform-relative Y calc) had ZERO effect for ground enemies
+	# no matter what they were set to — the code that reads them never ran.
+	_col_shape.name = "CollisionShape2D"
 	add_child(_col_shape)
 
 	# Visual setup — skip entirely in headless

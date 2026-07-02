@@ -1,9 +1,79 @@
 "use client";
 import { useEffect, useState } from "react";
-import { fetchLeaderboard, type LBEntry } from "@/lib/api";
+import {
+  fetchLeaderboard, type LBEntry,
+  fetchLeaderboardPrizes, saveLeaderboardPrizes, type LeaderboardConfig,
+} from "@/lib/api";
 import NimiqAvatar from "@/components/NimiqAvatar";
 
 type Period = "daily" | "weekly";
+
+function PrizesCard() {
+  const [cfg, setCfg]         = useState<LeaderboardConfig | null>(null);
+  const [saving, setSaving]   = useState(false);
+  const [error, setError]     = useState("");
+  const [savedAt, setSavedAt] = useState(0);
+
+  useEffect(() => {
+    fetchLeaderboardPrizes().then(setCfg).catch(e => setError(String(e)));
+  }, []);
+
+  const setVal = (period: "daily" | "weekly", rank: "first" | "second" | "third", raw: string) => {
+    if (!cfg) return;
+    const n = Number(raw);
+    setCfg({ ...cfg, [period]: { ...cfg[period], [rank]: Number.isFinite(n) ? n : 0 } });
+  };
+
+  const save = async () => {
+    if (!cfg) return;
+    setSaving(true); setError("");
+    try {
+      await saveLeaderboardPrizes(cfg);
+      setSavedAt(Date.now());
+    } catch (e: unknown) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!cfg) return null;
+
+  const row = (label: string, period: "daily" | "weekly") => (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+      <span style={{ fontSize: 13, color: "var(--text-muted)", width: 60 }}>{label}</span>
+      {(["first", "second", "third"] as const).map(rank => (
+        <label key={rank} style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12 }}>
+          {rank === "first" ? "🥇" : rank === "second" ? "🥈" : "🥉"}
+          <input type="number" min={0} step="1" value={cfg[period][rank]}
+            onChange={e => setVal(period, rank, e.target.value)}
+            style={{ width: 70, padding: "4px 6px", fontSize: 13 }} />
+          <span style={{ color: "var(--text-muted)" }}>NIM</span>
+        </label>
+      ))}
+    </div>
+  );
+
+  return (
+    <div className="card" style={{ padding: 16, marginBottom: 16 }}>
+      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 12 }}>Leaderboard Prizes</div>
+      {row("Daily", "daily")}
+      {row("Weekly", "weekly")}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 8 }}>
+        <button className="btn btn-active" disabled={saving} onClick={save}>
+          {saving ? "Saving…" : "Save prizes"}
+        </button>
+        {savedAt > 0 && Date.now() - savedAt < 3000 && (
+          <span style={{ fontSize: 12, color: "var(--green)" }}>Saved</span>
+        )}
+        {error && <span style={{ fontSize: 12, color: "var(--red)" }}>{error}</span>}
+      </div>
+      <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 8 }}>
+        Applies to the next snapshot (end of period, or manual pay-winners) — doesn&apos;t change prizes already snapshotted/paid.
+      </div>
+    </div>
+  );
+}
 
 export default function LeaderboardTab() {
   const [period,  setPeriod]  = useState<Period>("daily");
@@ -31,6 +101,8 @@ export default function LeaderboardTab() {
 
   return (
     <div>
+      <PrizesCard />
+
       {/* Period selector */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
         {(["daily", "weekly"] as Period[]).map(p => (

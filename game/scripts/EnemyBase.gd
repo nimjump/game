@@ -603,9 +603,20 @@ func _start_spin(speed: float = 1.0) -> void:
 			if is_instance_valid(_anim): _anim.rotation_degrees = 0.0)
 
 
+## Virtual hook — called right before this enemy is removed from play,
+## whether by being stomped (_die) or by its platform breaking out from
+## under it (_fall_off_platform). Subclasses (Enemy.gd) override this to
+## clean up any extra scene-tree nodes they spawned as siblings (not
+## children) of themselves — e.g. the spider's web Line2D — which would
+## otherwise be orphaned forever since these two generic removal paths
+## have no idea such nodes exist.
+func _on_removed() -> void:
+	pass
+
 func _fall_off_platform() -> void:
 	if can_fly: return
 	if not _setup_done: return
+	_on_removed()
 	set_deferred("monitoring", false)
 	set_deferred("monitorable", false)
 	_setup_done = false
@@ -624,6 +635,7 @@ func _fall_off_platform() -> void:
 		queue_free()
 
 func _die() -> void:
+	_on_removed()
 	set_deferred("monitoring", false)
 	set_deferred("monitorable", false)
 	_setup_done = false

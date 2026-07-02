@@ -53,20 +53,20 @@ const PLATFORM_GAP_FIX := {
 	EnemyType.SPRINGMAN:    -0.012,
 	EnemyType.SUN:          0.0,
 	EnemyType.CLOUD:        0.0,
-	EnemyType.BARNACLE:     -0.024,
+	EnemyType.BARNACLE:     -0.016,
 	EnemyType.BEE:          0.0,
 	EnemyType.FLY:          0.0,
-	EnemyType.FROG:         -0.012,
+	EnemyType.FROG:         -0.016,
 	EnemyType.MOUSE:        -0.012,
 	EnemyType.SLIME_BLOCK:  -0.012,
-	EnemyType.SLIME_BLUE:   -0.012,
-	EnemyType.SLIME_GREEN:  -0.012,
-	EnemyType.SLIME_PURPLE: -0.012,
+	EnemyType.SLIME_BLUE:   -0.016,
+	EnemyType.SLIME_GREEN:  -0.016,
+	EnemyType.SLIME_PURPLE: -0.016,
 	EnemyType.SLIME_FIRE:   -0.012,
-	EnemyType.SNAIL:        0.012,
-	EnemyType.WORM_GREEN:   0.012,
-	EnemyType.WORM_PINK:    0.012,
-	EnemyType.LADYBUG:      -0.012,
+	EnemyType.SNAIL:        -0.016,
+	EnemyType.WORM_GREEN:   -0.016,
+	EnemyType.WORM_PINK:    -0.016,
+	EnemyType.LADYBUG:      -0.016,
 	EnemyType.SPIDER:       -0.026,
 	EnemyType.GHOST:        0.0,
 	EnemyType.UFO:          0.0,
@@ -1966,7 +1966,16 @@ func _worm_spawn_baby(offset: Vector2) -> void:
 	if is_instance_valid(_platform):
 		baby._platform = _platform
 	baby._gm_ref = _gm_ref
+	baby.set("_player_ref", _player_ref)
 	baby.setup(enemy_type, _worm_baby_frames, minf(difficulty + 0.15, 1.0), true)
+	# BUG FIX: babies spawned here bypass GameManager._add_enemy(), so without
+	# these two calls they never enter the platform's overlap-tracking list and
+	# never enter _enemies (the array simulate_tick() loops over every physics
+	# frame) — result: baby sits in the tree fully set up but frozen, no AI/move.
+	if is_instance_valid(_platform) and _platform.has_method("connect_enemy"):
+		_platform.call("connect_enemy", baby)
+	if is_instance_valid(_gm_ref) and _gm_ref.has_method("register_split_enemy"):
+		_gm_ref.call("register_split_enemy", baby)
 	# Cosmetic spawn "pop" — animate only the sprite's local offset, never the
 	# Area2D's own global_position. That position drives real collision in
 	# _tick_player_overlap (checked every tick, both modes) — a Tween on it
@@ -2278,6 +2287,23 @@ func _spider_web_jump_to(target_plat: Node) -> void:
 	_spider_web_throw_elapsed = 0
 	_spider_web_throw_total   = maxi(1, int(round(throw_t * 60.0)))
 	_spider_web_throwing      = true
+
+
+## Overrides EnemyBase's virtual hook — called right before this enemy is
+## removed via _die() (stomped) or _fall_off_platform() (its platform broke).
+## BUG FIX: if a spider is killed (or its platform breaks) WHILE it's mid
+## web-throw or mid-climb, _spider_web_line was never cleaned up — neither
+## _die() nor _fall_off_platform() knew it existed, since it's a sibling
+## Line2D node, not a child of the spider. The spider itself would fade out
+## normally, but the web thread was left dangling in the scene forever with
+## no spider attached to it. This is almost certainly the "web sometimes
+## just disappears/vanishes" symptom — really it's the SPIDER vanishing
+## while an orphaned web thread stays frozen in place (or, depending on
+## timing, gets silently overwritten/leaked on the next throw). Despawning
+## it here (same fade-out used on a normal successful climb) fixes both.
+func _on_removed() -> void:
+	if enemy_type == EnemyType.SPIDER:
+		_spider_despawn_web()
 
 
 func _spider_despawn_web() -> void:

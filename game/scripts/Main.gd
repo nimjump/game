@@ -960,6 +960,18 @@ func _on_viewport_resized() -> void:
 	if _started:
 		return
 
+	# Bir panel (VS, Quest, Stats, Leaderboard) tüm ekranı kaplayarak açıkken
+	# alttaki ana menüyü yıkıp yeniden kurmanın hiçbir faydası yok — panel
+	# zaten üstünde duruyor, sadece riskli bir teardown/rebuild'i tetikliyordu.
+	# VS panelinde NIM tutar/davet linki gibi LineEdit'ler olduğu için klavye
+	# açılışı en çok orada resize tetikliyordu.
+	for panel in [_vs_panel, _quest_panel, _stats_panel, _leaderboard_panel]:
+		if is_instance_valid(panel) and panel.visible:
+			_vw  = new_w
+			_vh  = new_h
+			_ref = minf(minf(_vw, _vh), GameConstants.VW)
+			return
+
 	# Küçük boyut değişikliklerini yoksay (klavye, status bar vs.)
 	# Sadece gerçek yönelim değişikliği (genişlik/yükseklik yer değiştirdi) rebuild yap
 	var w_changed := absf(new_w - _last_vw_real) > 80.0
@@ -994,6 +1006,16 @@ func _on_viewport_resized() -> void:
 	if is_instance_valid(_quest_panel):      _quest_panel.free();      _quest_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.free(); _leaderboard_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_stats_panel):      _stats_panel.free();      _stats_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
+	# BUG FIX: _vs_panel was missing from this list entirely. VSPanel is the
+	# ONLY one of the four panels with actual text-input fields (NIM amount,
+	# invite link) — so it's the only one that ever has a LineEdit focused
+	# when a keyboard-triggered resize slips past the shrink_ratio>0.25 guard
+	# above (e.g. a device where the virtual keyboard takes up less than 25%
+	# of the screen). When that happened, this block tore down and rebuilt
+	# the ENTIRE main menu underneath a VS panel that was left dangling —
+	# never freed, never nulled, still holding an active HTTPRequest/Timer
+	# from mid-typing — which is what was actually crashing the game.
+	if is_instance_valid(_vs_panel):         _vs_panel.free();         _vs_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	_build_start_ui()
 
 
@@ -1732,7 +1754,6 @@ func _build_game() -> void:
 		["res://assets/hud/platform_icon.png",  "P",  "0",  "PLATFORMS"],
 		["res://assets/hud/skull_icon.png",     "K",  "0",  "KILLS"    ],
 		["res://assets/items/nimiq_hexagon_item.png", "C", "0",  "COINS"    ],
-		["res://assets/hud/lightning_icon.png", "X", "1x", "BEST COMBO"],
 	]
 
 	var _stat_val_nodes : Array[Label] = []
@@ -4116,12 +4137,10 @@ func show_game_over(p_score: int, p_best: int, p_stats: Dictionary = {}) -> void
 		var _plat : int = p_stats.get("platforms", 0)
 		var _kill : int = p_stats.get("kills",     0)
 		var _coin : int = p_stats.get("coins",     0)
-		var _combo: int = p_stats.get("combo_max", 1)
-		if sv.size() >= 4:
+		if sv.size() >= 3:
 			(sv[0] as Label).text = str(_plat)
 			(sv[1] as Label).text = str(_kill)
 			(sv[2] as Label).text = str(_coin)
-			(sv[3] as Label).text = "%dx" % maxi(_combo, 1)
 	if is_instance_valid(_go_stats_lbl):
 		_go_stats_lbl.text = ""
 	_show_go_panel()

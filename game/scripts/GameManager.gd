@@ -1345,6 +1345,18 @@ func _enemies_for_biome(p_score: int = -1) -> Array[Enemy.EnemyType]:
 	return available
 
 
+## Registers an enemy that was spawned OUTSIDE the normal _add_enemy() path
+## (currently: baby worms split off from a killed adult, see
+## Enemy.gd::_worm_spawn_baby) into the same _enemies array that drives
+## simulate_tick() every physics frame. Without this, such an enemy sits in
+## the scene tree fully initialized but never actually ticks — no movement,
+## no AI, no platform-snap — because `for e in _enemies: e.simulate_tick()`
+## is the only thing that ever calls simulate_tick() on anyone.
+func register_split_enemy(e: Node) -> void:
+	if is_instance_valid(e) and not _enemies.has(e):
+		_enemies.append(e)
+
+
 func _add_enemy(plat: StaticBody2D, p_diff: float = -1.0, p_score: int = -1) -> void:
 	var use_diff := p_diff if p_diff >= 0.0 else _difficulty()
 	if _enemy_frames.is_empty(): return

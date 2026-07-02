@@ -19,7 +19,7 @@ func DefaultLeaderboardConfig() LeaderboardConfig {
 		Daily: LeaderboardPrizes{
 			First:  100,
 			Second: 50,
-			Third:  30,
+			Third:  25,
 		},
 		Weekly: LeaderboardPrizes{
 			First:  500,

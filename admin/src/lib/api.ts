@@ -427,6 +427,32 @@ export async function saveAppConfig(patch: Partial<{
   return r.json();
 }
 
+export interface LeaderboardPrizes {
+  first: number;
+  second: number;
+  third: number;
+}
+
+export interface LeaderboardConfig {
+  daily: LeaderboardPrizes;
+  weekly: LeaderboardPrizes;
+}
+
+export async function fetchLeaderboardPrizes(): Promise<LeaderboardConfig> {
+  const r = await fetch(`${BASE}/backend/leaderboard/prizes`, { cache: "no-store" });
+  if (!r.ok) throw new Error("prizes fetch failed");
+  return r.json();
+}
+
+export async function saveLeaderboardPrizes(cfg: LeaderboardConfig): Promise<void> {
+  const r = await fetch(`${BASE}/backend/admin/prizes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(cfg),
+  });
+  if (!r.ok) throw new Error("prizes save failed");
+}
+
 export async function setUpdateMode(mode: "off" | "force" | "normal"): Promise<AppConfig> {
   const r = await fetch(`${BASE}/backend/admin/update-mode`, {
     method: "POST",

@@ -100,10 +100,18 @@ var _st  := -57.0
 var _sb  := 19.0       
 
 # ── Speed / Jump boost ──────────────────────────────────────
-var _speed_boost      := false
-var _jump_boost       := false
-var _boost_timer      := 0.0
-const BOOST_DURATION  := 6.0
+# BUG FIX: speed_boost and jump_boost used to share a single _boost_timer.
+# Picking up either type reset that ONE shared timer, so if you picked up
+# speed_boost, then jump_boost a moment later, the timer got reset for
+# BOTH — meaning whichever one you grabbed LAST decided when they both wore
+# off together, instead of each running its own independent countdown from
+# when it was actually picked up. Split into two separate timers so each
+# powerup type's remaining time is its own.
+var _speed_boost       := false
+var _jump_boost        := false
+var _speed_boost_timer := 0.0
+var _jump_boost_timer  := 0.0
+const BOOST_DURATION   := 6.0
 
 # ── DEBUG: God Mode ──────────────────────────────────────────
 var god_mode          := false
@@ -260,6 +268,12 @@ func _ready() -> void:
 	_load_frames(0)
 
 	_anim_sprite = AnimatedSprite2D.new()
+	# Same class of bug as Platform.gd's CollisionShape2D: without an explicit
+	# name, add_child()'s default force_readable_name=false gives this an
+	# internal placeholder name, breaking GameManager._spawn_ghost_sprite()'s
+	# get_node_or_null("AnimatedSprite2D") lookup (used to source the ghost
+	# effect's texture) — it silently found nothing and skipped the visual.
+	_anim_sprite.name = "AnimatedSprite2D"
 	_anim_sprite.sprite_frames = _build_sprite_frames()
 	_anim_sprite.scale = Vector2(_sc, _sc)
 	_anim_sprite.position = Vector2(0, _sy)
@@ -576,12 +590,15 @@ func simulate_tick() -> void:
 			_powerup_is_wings   = false
 			_glow_state = -1  # force glow refresh
 
-	# Speed / Jump boost timer
-	if _speed_boost or _jump_boost:
-		_boost_timer -= delta
-		if _boost_timer <= 0.0:
+	# Speed / Jump boost timers — independent, see note at declaration above
+	if _speed_boost:
+		_speed_boost_timer -= delta
+		if _speed_boost_timer <= 0.0:
 			_speed_boost = false
-			_jump_boost  = false
+	if _jump_boost:
+		_jump_boost_timer -= delta
+		if _jump_boost_timer <= 0.0:
+			_jump_boost = false
 
 	# Debuff timers — each independent
 	if _mirror_active:
@@ -849,11 +866,11 @@ func activate_powerup(type: String) -> void:
 			activate_powerup_flash()
 		"speed_boost":
 			_speed_boost = true
-			_boost_timer = BOOST_DURATION
+			_speed_boost_timer = BOOST_DURATION
 			activate_powerup_flash()
 		"jump_boost":
 			_jump_boost  = true
-			_boost_timer = BOOST_DURATION
+			_jump_boost_timer = BOOST_DURATION
 			activate_powerup_flash()
 		# ── Kalkan ───────────────────────────────────────────
 		"bubble":

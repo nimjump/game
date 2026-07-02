@@ -30,15 +30,21 @@
     }
   </style>
   $GODOT_HEAD_INCLUDE
-  <link rel="icon" type="image/png" href="assets/icon/ico.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="assets/icon/ico-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="assets/icon/ico-512.png">
   <!-- Nimiq Pay (and other mini-app hosts / "add to home screen" flows) don't
        parse this page's <head> for the favicon link above — they read the
        icon from a Web App Manifest instead, same convention the W3C MiniApp
        Manifest spec inherits from PWAs. Without this, the game works fine in
        a normal browser tab (favicon shows there) but shows no icon inside
-       Nimiq Pay's mini-app list. -->
+       Nimiq Pay's mini-app list.
+       IMPORTANT: manifest icon "sizes" must be standard PWA sizes (192x192 /
+       512x512) — many manifest parsers (Nimiq Pay's included, most likely)
+       silently SKIP non-standard sizes like the original 1254x1254-only
+       icon this manifest used to ship, which is why no icon ever showed up
+       inside Nimiq Pay even though the file itself was present and valid. -->
   <link rel="manifest" href="manifest.json">
-  <link rel="apple-touch-icon" href="assets/icon/ico.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="assets/icon/ico-180.png">
   <meta name="theme-color" content="#242424">
 
   <!-- ── DEV MODE ──────────────────────────────────────────────────────────────
