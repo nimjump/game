@@ -83,6 +83,19 @@ func ReplaySemCap() chan struct{} {
 	return replaySem
 }
 
+// ServerGamesDir — exported wrapper, used by the admin replay-binary
+// upload endpoint to know where to save the uploaded replay.zip/replay.exe.
+func ServerGamesDir() string { return servergamesDir() }
+
+// ResetBinaryCache — clears the cached binary path so godotBinary() re-
+// resolves it on next call. Call after uploading a new replay.zip /
+// replay.exe via the admin panel, then RestartAllWorkers() so the
+// persistent worker pool actually picks it up.
+func ResetBinaryCache() {
+	_cachedBin = ""
+	_cachedBinOnce = sync.Once{}
+}
+
 // servergamesDir — replay binary + replay.zip klasoru.
 // Priority: SERVERGAMES_DIR env → working directory/servergames → next to executable/servergames
 func servergamesDir() string {

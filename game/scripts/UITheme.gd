@@ -192,11 +192,35 @@ static func apply_button(btn: Button, _color: Color = COL_GOLD, _text_color: Col
 	_apply_pixel_font(btn)
 	_apply_hand_cursor(btn)
 
+## btn_wide_normal.png / btn_wide_pressed.png (used by both apply_play_button
+## and apply_ghost_button below) have transparent padding baked in ONLY at
+## the top of the canvas (measured: 4px of a 32px-tall source image, i.e. the
+## visible button artwork occupies the bottom 87.5% of the canvas, not the
+## full height). Godot centers button text within the full Control rect, so
+## with zero content margins the text lands at the rect's true vertical
+## center — which sits visibly ABOVE the actual visible button graphic's
+## center, since the graphic itself is shifted down by that top padding.
+## Adding a top content margin equal to that same 12.5% fraction of the
+## button's own height pulls the text-centering rect down to match, so the
+## text ends up centered on the visible artwork instead of the invisible
+## padding. Computed per-button (not hardcoded in px) since these buttons
+## come in several different heights across the game.
+const _WIDE_BTN_TOP_PAD_FRAC := 0.125
+
+static func _apply_wide_btn_vcenter_fix(btn: Button, styles: Array[StyleBoxTexture]) -> void:
+	var h : float = btn.custom_minimum_size.y
+	if h <= 0.0: return  # size not set yet at call time — skip, no regression vs. before
+	var top_margin := int(round(h * _WIDE_BTN_TOP_PAD_FRAC))
+	for s in styles:
+		s.content_margin_top    = top_margin
+		s.content_margin_bottom = 0
+
 static func apply_play_button(btn: Button) -> void:
 	var assets  := get_theme_assets()
 	var normal  := _with_no_padding(_nine_patch(assets["btn_2_normal"],  6, 6, 6, 6))
 	var hover   := _with_no_padding(_nine_patch(assets["btn_2_hover"],   6, 6, 6, 6))
 	var pressed := _with_no_padding(_nine_patch(assets["btn_2_pressed"], 6, 6, 6, 6))
+	_apply_wide_btn_vcenter_fix(btn, [normal, hover, pressed])
 
 	btn.add_theme_stylebox_override("normal",  normal)
 	btn.add_theme_stylebox_override("hover",   hover)
@@ -211,6 +235,7 @@ static func apply_ghost_button(btn: Button, _color: Color = COL_GOLD) -> void:
 	var normal  := _with_no_padding(_nine_patch(assets["btn_3_normal"],  6, 6, 6, 6))
 	var hover   := _with_no_padding(_nine_patch(assets["btn_3_hover"],   6, 6, 6, 6))
 	var pressed := _with_no_padding(_nine_patch(assets["btn_3_pressed"], 6, 6, 6, 6))
+	_apply_wide_btn_vcenter_fix(btn, [normal, hover, pressed])
 
 	btn.add_theme_stylebox_override("normal",  normal)
 	btn.add_theme_stylebox_override("hover",   hover)
@@ -326,6 +351,24 @@ static func apply_toggle_button(btn: CheckButton, icon_height: int = 36) -> void
 		btn.add_theme_stylebox_override("disabled", eb)
 		btn.add_theme_stylebox_override("focus",    eb)
 		btn.text = ""
+
+# ── SCROLL TOUCH PASSTHROUGH ────────────────────────────────
+# Recursively sets MOUSE_FILTER_PASS on all non-interactive Control
+# descendants of `node` so a ScrollContainer receives drag gestures no
+# matter where the finger/mouse lands inside its content (cards, labels,
+# rows, etc.). Interactive controls (Button/BaseButton/Slider/LineEdit)
+# keep their default filter so taps still register on them normally.
+# Same behavior as Main.gd's Settings panel — call this once after a
+# panel's scrollable content has finished building/rebuilding.
+static func set_scroll_passthrough(node: Node) -> void:
+	for child in node.get_children():
+		if child is Button or child is BaseButton or child is Slider or child is LineEdit:
+			pass  # leave interactive controls alone
+		elif child is Control:
+			child.mouse_filter = Control.MOUSE_FILTER_PASS
+			set_scroll_passthrough(child)
+		else:
+			set_scroll_passthrough(child)
 
 # ── BACKGROUND SELECTOR FUNCTIONS ───────────────────────────
 # These functions do NOT make random selections.

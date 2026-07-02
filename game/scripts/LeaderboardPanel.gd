@@ -585,6 +585,8 @@ func _build_list(data: Variant) -> void:
 			spacer.custom_minimum_size = Vector2(int(ref * 0.056), 0)
 			row.add_child(spacer)
 
+	UITheme.set_scroll_passthrough(_list_root)
+
 
 func _make_col_label(txt: String, ref: float, w_ratio: float, col: Color, bold: bool) -> Label:
 	var lbl := Label.new()

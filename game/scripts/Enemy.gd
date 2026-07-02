@@ -25,6 +25,57 @@ enum EnemyType {
 	ALIEN_GREEN, ALIEN_BLUE, ALIEN_PINK, ALIEN_YELLOW
 }
 
+# ═══════════════════════════════════════════════════════════════════
+#  ★ PLATFORM YÜKSEKLİK AYARI — burayı düzenle ★
+#  ---------------------------------------------------------------
+#  Her yaratığın platformdan ne kadar yukarıda/gömülü duracağını
+#  buradan test edebilirsin. Sayı _vw'nin bir yüzdesi (ekran genişliğinin
+#  yüzdesi) olarak girilir. DİKKAT — yön kafa karıştırabilir, dikkatli oku:
+#     0.0     → varsayılan boşluk (PLATFORM_STAND_GAP, EnemyBase.gd'de)
+#     DAHA NEGATİF yap  → yaratık platforma daha YAKINLAŞIR / GÖMÜLÜR
+#                          (yaratık havada duruyorsa, "float" fazlaysa BUNU yap — sayıyı küçült/eksi yap)
+#     DAHA POZİTİF yap  → yaratık platformdan daha da UZAKLAŞIR / havada kalır
+#                          (yaratık gömülü/platforma batmış görünüyorsa BUNU yap)
+#  Yani "yaratık havada duruyor, platforma yapıştırmak istiyorum" dersen
+#  değeri AZALT (daha negatif), ARTTIRMA — arttırmak onu platformdan daha
+#  da uzaklaştırır (daha çok havada bırakır), tam tersi etki yapar.
+#  Değeri değiştirip oyunu Godot editöründen çalıştırarak anında test
+#  edebilirsin — build/deploy gerekmez, F5'e basman yeterli.
+#  Uçan tipler (FLYMAN/WINGMAN/CLOUD/BEE/FLY/LADYBUG/GHOST/UFO) ve
+#  yukarı-aşağı sallanan tipler (SPIKEBALL/SUN) bu ayardan etkilenmez,
+#  çünkü onlar zaten platforma "oturmuyor" — havada süzülüyor/sallanıyor.
+# ═══════════════════════════════════════════════════════════════════
+const PLATFORM_GAP_FIX := {
+	EnemyType.FLYMAN:       0.0,
+	EnemyType.WINGMAN:      0.0,
+	EnemyType.SPIKEMAN:     -0.012,
+	EnemyType.SPIKEBALL:    0.0,
+	EnemyType.SPRINGMAN:    -0.012,
+	EnemyType.SUN:          0.0,
+	EnemyType.CLOUD:        0.0,
+	EnemyType.BARNACLE:     -0.024,
+	EnemyType.BEE:          0.0,
+	EnemyType.FLY:          0.0,
+	EnemyType.FROG:         -0.012,
+	EnemyType.MOUSE:        -0.012,
+	EnemyType.SLIME_BLOCK:  -0.012,
+	EnemyType.SLIME_BLUE:   -0.012,
+	EnemyType.SLIME_GREEN:  -0.012,
+	EnemyType.SLIME_PURPLE: -0.012,
+	EnemyType.SLIME_FIRE:   -0.012,
+	EnemyType.SNAIL:        0.012,
+	EnemyType.WORM_GREEN:   0.012,
+	EnemyType.WORM_PINK:    0.012,
+	EnemyType.LADYBUG:      -0.012,
+	EnemyType.SPIDER:       -0.026,
+	EnemyType.GHOST:        0.0,
+	EnemyType.UFO:          0.0,
+	EnemyType.ALIEN_GREEN:  0.052,
+	EnemyType.ALIEN_BLUE:   0.052,
+	EnemyType.ALIEN_PINK:   0.052,
+	EnemyType.ALIEN_YELLOW: 0.041,
+}
+
 # ── FLYMAN ───────────────────────────────────────────────────────────
 # Unkillable, damages on contact
 
@@ -455,72 +506,51 @@ func _special_setup() -> void:
 	# Only _anim.* calls are guarded individually below.
 
 	# ── Platform üstünde oturma — tip bazlı yükseklik fix ──────────────────
-	# _vw'nin küçük bir yüzdesi olarak DÜZELTME MİKTARI gir (0 = dokunma).
-	# Pozitif değer  → karakteri platformdan biraz YUKARI kaldırır (gömülü duruyorsa arttır)
-	# Negatif değer  → karakteri platforma biraz daha GÖMER (aşağı indirir)
-	# Sadece sorunlu olan tipi buraya ekle, diğerleri varsayılanı (PLATFORM_STAND_GAP) kullanmaya devam eder.
-	var _gap_fix := {
-		EnemyType.FLYMAN:       0.0,
-		EnemyType.WINGMAN:      0.0,
-		EnemyType.SPIKEMAN:     0.0,
-		EnemyType.SPIKEBALL:    0.0,
-		EnemyType.SPRINGMAN:    0.0,
-		EnemyType.SUN:          0.0,
-		EnemyType.CLOUD:        0.0,
-		EnemyType.BARNACLE:     0.0,
-		EnemyType.BEE:          0.0,
-		EnemyType.FLY:          0.0,
-		EnemyType.FROG:         0.0,
-		EnemyType.MOUSE:        0.0,
-		EnemyType.SLIME_BLOCK:  0.0,
-		EnemyType.SLIME_BLUE:   0.0,
-		EnemyType.SLIME_GREEN:  0.0,
-		EnemyType.SLIME_PURPLE: 0.0,
-		EnemyType.SLIME_FIRE:   0.0,
-		EnemyType.SNAIL:        0.04,
-		EnemyType.WORM_GREEN:   0.0,
-		EnemyType.WORM_PINK:    0.0,
-		EnemyType.LADYBUG:      0.0,
-		EnemyType.SPIDER:       0.0,
-		EnemyType.GHOST:        0.0,
-		EnemyType.UFO:          0.0,
-		EnemyType.ALIEN_GREEN:  0.0,
-		EnemyType.ALIEN_BLUE:   0.0,
-		EnemyType.ALIEN_PINK:   0.0,
-		EnemyType.ALIEN_YELLOW: 0.0,
-	}
-	if _gap_fix.has(enemy_type):
-		_platform_gap_override        = PLATFORM_STAND_GAP + (_gap_fix[enemy_type] as float) * _vw
+	# Değerler artık dosyanın en üstünde, PLATFORM_GAP_FIX sabitinde —
+	# oraya bak, düzenle, F5. Buradaki kod sadece o sabiti uyguluyor.
+	if PLATFORM_GAP_FIX.has(enemy_type):
+		_platform_gap_override        = PLATFORM_STAND_GAP + (PLATFORM_GAP_FIX[enemy_type] as float) * _vw
 		_platform_gap_override_active = true
 
+	# ── Global height-based difficulty scaling ──────────────────────────
+	# `difficulty` (0.0 → 1.0) comes from base_setup()/GameManager's score-
+	# or-height curve. Every enemy type's chase/aggro numbers below are
+	# scaled by these two multipliers so ALL enemies (not just Alien/Slime/
+	# Worm) gradually get faster and more alert as the player climbs higher,
+	# ramping smoothly up to the cap at max difficulty. Pure function of
+	# `difficulty`, which is itself deterministic (score/height based), so
+	# this stays bit-identical between client and server replay sims.
+	var _diff_speed_mult : float = lerpf(1.0, 1.15, difficulty)  # up to +15% speed
+	var _diff_range_mult : float = lerpf(1.0, 1.10, difficulty)  # up to +10% aggro/detect range
+
 	# Cache computed constants (EN-04: avoid per-access multiplication)
-	WINGMAN_CHASE_RANGE = _vw * 0.30
-	WINGMAN_CHASE_SPEED = _vw * 0.38
-	SPIKEMAN_DETECT_X   = _vw * 0.20
-	SPIKEMAN_CHASE_SPEED= _vw * 0.28
+	WINGMAN_CHASE_RANGE = _vw * 0.30 * _diff_range_mult
+	WINGMAN_CHASE_SPEED = _vw * 0.38 * _diff_speed_mult
+	SPIKEMAN_DETECT_X   = _vw * 0.20 * _diff_range_mult
+	SPIKEMAN_CHASE_SPEED= _vw * 0.28 * _diff_speed_mult
 	SPIKEBALL_AMPLITUDE = _vh * 0.07
 	SUN_AMPLITUDE       = _vh * 0.08
-	CLOUD_FOLLOW_SPEED  = _vw * 0.46
+	CLOUD_FOLLOW_SPEED  = _vw * 0.23 * _diff_speed_mult   # was 0.46 — halved, was following horizontally way too fast
 	CLOUD_RAIN_RANGE_X  = _vw * 0.06
-	BEE_AGGRO_RANGE     = _vw * 0.25
-	BEE_CHASE_SPEED     = _vw * 0.55
+	BEE_AGGRO_RANGE     = _vw * 0.25 * _diff_range_mult
+	BEE_CHASE_SPEED     = _vw * 0.55 * _diff_speed_mult
 	BEE_RETURN_SPEED    = _vw * 0.5
-	FLY_AGGRO_RANGE     = _vw * 0.28
-	FLY_CHASE_SPEED     = _vw * 0.48
-	MOUSE_AGGRO_RANGE   = _vw * 0.22
-	MOUSE_CHASE_SPEED   = _vw * 0.42
-	FROG_DETECT_X       = _vw * 0.20
-	FROG_DETECT_Y       = _vh * 0.25
+	FLY_AGGRO_RANGE     = _vw * 0.28 * _diff_range_mult
+	FLY_CHASE_SPEED     = _vw * 0.48 * _diff_speed_mult
+	MOUSE_AGGRO_RANGE   = _vw * 0.22 * _diff_range_mult
+	MOUSE_CHASE_SPEED   = _vw * 0.42 * _diff_speed_mult
+	FROG_DETECT_X       = _vw * 0.20 * _diff_range_mult
+	FROG_DETECT_Y       = _vh * 0.25 * _diff_range_mult
 	FROG_JUMP_HEIGHT    = -_vh * 0.18
 	FROG_JUMP_DIST      = _vw * 0.12
-	SLIME_FIRE_DETECT   = _vw * 0.22
-	SPIDER_AGGRO_RANGE  = _vw * 0.20
-	SPIDER_DETECT_X     = _vw * 0.34
-	SPIDER_DETECT_Y     = _vh * 0.32
-	GHOST_DETECT_RANGE  = _vw * 0.28
-	GHOST_CHASE_SPEED   = _vw * 0.30
-	WORM_DIRT_RANGE     = _vw * 0.233
-	WORM_DIRT_SPEED_X   = _vw * 0.15
+	SLIME_FIRE_DETECT   = _vw * 0.22 * _diff_range_mult
+	SPIDER_AGGRO_RANGE  = _vw * 0.20 * _diff_range_mult
+	SPIDER_DETECT_X     = _vw * 0.34 * _diff_range_mult
+	SPIDER_DETECT_Y     = _vh * 0.32 * _diff_range_mult
+	GHOST_DETECT_RANGE  = _vw * 0.28 * _diff_range_mult
+	GHOST_CHASE_SPEED   = _vw * 0.30 * _diff_speed_mult
+	WORM_DIRT_RANGE     = _vw * 0.233 * _diff_range_mult
+	WORM_DIRT_SPEED_X   = _vw * 0.15   # already scaled by difficulty at use-site (line ~1869), don't double-scale here
 	WORM_DIRT_SPEED_Y   = -_vh * 0.40
 	WORM_DIRT_GRAVITY   = _vh * 0.75
 
@@ -1038,6 +1068,9 @@ func _play_idle_or_walk(resting: bool) -> void:
 func _ground_chase_step(aggro_range: float, chase_speed: float,
 		patrol_speed: float, was_chasing: bool) -> bool:
 	const FIXED_DELTA := 1.0 / 60.0
+	# Per-instance variance so a pack of the same enemy type chasing at once
+	# doesn't all move in identical lockstep — see _speed_variance in EnemyBase.gd.
+	chase_speed *= _speed_variance
 	var p := _get_player()
 	# Platform edges — always valid (live → cache → viewport).
 	var b : Vector2 = _get_plat_bounds()
@@ -1110,15 +1143,18 @@ func _cloud_ai(_delta: float) -> void:
 	var dx : float = p.global_position.x - global_position.x
 	var dy : float = p.global_position.y - global_position.y
 
+	# Per-instance variance — see _speed_variance in EnemyBase.gd.
+	var follow_speed : float = CLOUD_FOLLOW_SPEED * _speed_variance
+
 	# X: follow player slowly
-	var target_x : float = global_position.x + signf(dx) * minf(abs(dx), CLOUD_FOLLOW_SPEED * FIXED_DELTA)
+	var target_x : float = global_position.x + signf(dx) * minf(abs(dx), follow_speed * FIXED_DELTA)
 	global_position.x = target_x
 
 	# Y: try to stay above player — target is player.y - hover_offset
 	# Move upward slowly so player ends up below the cloud
 	var hover_offset : float = _vh * 0.12   # how far above player to hover
 	var target_y : float = p.global_position.y - hover_offset
-	var y_speed  : float = CLOUD_FOLLOW_SPEED * 0.825 * FIXED_DELTA
+	var y_speed  : float = follow_speed * 0.825 * FIXED_DELTA
 	if global_position.y > target_y:
 		# Cloud is below target — move up
 		global_position.y = maxf(global_position.y - y_speed, target_y)
@@ -2116,6 +2152,12 @@ func _spider_ai(_delta: float) -> void:
 			# İp hedefe ulaştı — şimdi örümcek tırmanmaya (çıkmaya) başlar.
 			_spider_web_throwing = false
 			_spider_climbing     = true
+			# Climb animation starts HERE, not when the throw began — see the
+			# comment in _spider_web_jump_to for why.
+			if is_instance_valid(_anim):
+				var sf1 := _anim.sprite_frames
+				if sf1 and sf1.has_animation("jump"): _anim_play("jump")
+				elif sf1 and sf1.has_animation("walk"): _anim_play("walk")
 			var target_plat : Node = _spider_climb_target_plat
 			_move_to(_spider_climb_land_pos, _spider_climb_time, true, true, false, func():
 				_frog_cur_platform = target_plat
@@ -2205,10 +2247,16 @@ func _spider_web_jump_to(target_plat: Node) -> void:
 	_spider_climb_time        = climb_t
 	_spider_climb_target_plat = target_plat
 
+	# FIX: the jump/walk animation used to start here — i.e. the instant the
+	# throw begins, while the spider is still standing still and only the
+	# thread is extending (see _spider_ai's "spider stays put" comment below).
+	# A moving-looking animation playing on a stationary spider is exactly
+	# what made it look like it had already jumped to the destination
+	# platform before the web even finished traveling. Now it just faces the
+	# target (no walk/jump cycle) during the throw, and the actual climb
+	# animation only starts once climbing motion actually begins — see the
+	# tt >= 1.0 branch in _spider_ai().
 	if is_instance_valid(_anim):
-		var sf := _anim.sprite_frames
-		if sf and sf.has_animation("jump"): _anim_play("jump")
-		elif sf and sf.has_animation("walk"): _anim_play("walk")
 		_anim_flip(signf(land_x - global_position.x))
 
 	# Web thread visual — a single line from launch point that extends out to
@@ -2218,7 +2266,7 @@ func _spider_web_jump_to(target_plat: Node) -> void:
 		var web_parent := get_parent()
 		if is_instance_valid(web_parent):
 			var web := Line2D.new()
-			web.width = maxf(1.5, _vw * 0.003)
+			web.width = maxf(3.0, _vw * 0.006)   # was maxf(1.5, vw*0.003) — too thin, per request
 			web.default_color = Color(0.92, 0.92, 0.95, 0.85)
 			web.z_index = 1
 			web.points = PackedVector2Array([from_pos, from_pos])
@@ -2250,22 +2298,14 @@ func _spider_despawn_web() -> void:
 
 
 # ── GHOST AI ─────────────────────────────────────────────────────────
-# Aerial patrol + fade — chases for GHOST_CHASE_DURATION when player spotted
+# Aerial patrol — chases for GHOST_CHASE_DURATION when player spotted.
+# NOTE: used to fade in/out (with a brief "intangible" window while faded)
+# — removed per request, ghost now stays a normal solid color and is
+# always hittable. _ghost_visible is kept fixed at true (see EnemyBase.gd)
+# so _special_hit's old fade-gate is a permanent no-op rather than deleting
+# that branch and risking a behavior change if re-enabled later.
 func _ghost_ai(_delta: float) -> void:
 	const FIXED_DELTA := 1.0 / 60.0
-	# Fade effect — visual, tick-based counter
-	_ghost_fade_timer += FIXED_DELTA
-	var half := GHOST_FADE_PERIOD * 0.5
-	if _ghost_fade_timer >= GHOST_FADE_PERIOD:
-		_ghost_fade_timer = 0.0
-		if not _ghost_visible:
-			_ghost_visible = true
-			var tw := _make_tween()
-			if tw: tw.tween_property(self, "modulate:a", 1.0, half * 0.4)
-	elif _ghost_fade_timer >= half and _ghost_visible:
-		_ghost_visible = false
-		var tw := _make_tween()
-		if tw: tw.tween_property(self, "modulate:a", 0.15, half * 0.6)
 
 	var p := _get_player()
 	if not p: return

@@ -15,7 +15,7 @@ var target_anim_size : float:
 # texture) so headless replay/anti-cheat verification stays bit-identical
 # with the graphical client, which is the only place textures are loaded.
 var PLATFORM_STAND_GAP : float:
-	get: return _vw * 0.04
+	get: return _vw * 0.055  # was 0.04 — enemies were visibly sinking into platforms across the board
 # Per-enemy-type fine-tune: most enemies look right with PLATFORM_STAND_GAP,
 # but a sprite with unusual padding/shape (e.g. a flatter or top-heavy asset)
 # can still look like it's sinking or floating even after the generic value
@@ -44,6 +44,13 @@ const DEBUG_DRAW_BOUNDS := false
 
 # ── State variables ──────────────────────────────────────────────────────────────────
 var _rng           : RandomNumberGenerator = RandomNumberGenerator.new()
+# Per-instance chase/follow speed multiplier — rolled once from this enemy's
+# own seeded _rng (see base_setup()) so that same-type enemies chasing the
+# player at the same time don't all move in perfect lockstep. Deterministic:
+# _rng is seeded from game_seed + a monotonic spawn counter (GameManager
+# _spawn_enemy_on_platform) before setup() ever runs, so client and server
+# always roll the identical value for the identical enemy.
+var _speed_variance : float = 1.0
 var difficulty     := 0.0
 var enemy_type     : int
 var can_fly        := false
@@ -155,6 +162,11 @@ func base_setup(etype: int, anim_frames: Dictionary, diff: float) -> void:
 
 	_hp        = _base_hp_for(etype)
 	_snap_dirty = true
+
+	# ±12% chase/follow speed variance — see field comment above. Rolled here
+	# (not in _special_setup) so it's set before ANY AI code can possibly run,
+	# regardless of per-type setup order.
+	_speed_variance = _rng.randf_range(0.88, 1.12)
 
 	# Calculate platform bounds cache (for mouse/frog/spikeman boundary checks)
 	_plat_bounds_valid = false

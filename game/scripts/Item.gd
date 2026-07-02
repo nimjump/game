@@ -3,8 +3,12 @@ class_name Item
 
 enum ItemType { NIMIQ, CARROT, JETPACK, WINGS, BUBBLE, GOLDEN_CARROT, MYSTERY_BOX }
 
+## Popup numbers shown on pickup — these must match the item's REAL effect,
+## not an arbitrary "score" value (items don't actually add to score; score
+## is height-based only — see GameManager.score = highest_y / 10). CARROT
+## was showing "+30" while its actual effect is add_life(1); fixed to "+1".
 const ITEM_POINTS := {
-	0: 1, 1: 30, 2: 0, 3: 0, 4: 0, 5: 200, 6: 0,
+	0: 1, 1: 1, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0,
 }
 
 var item_type  : ItemType
@@ -204,9 +208,11 @@ func _spawn_collect_fx(pts: int) -> void:
 		rtw.parallel().tween_property(ring, "modulate:a", 0.0, 0.30)
 		rtw.tween_callback(func(): if is_instance_valid(ring): ring.queue_free())
 
-	if pts > 0:
+	# GOLDEN_CARROT restores all hearts (full_heal) — not a countable "+N",
+	# so it gets a text label instead of a fake point value.
+	if pts > 0 or item_type == ItemType.GOLDEN_CARROT:
 		var lbl := Label.new()
-		lbl.text = "+%d" % pts
+		lbl.text = "FULL HP" if item_type == ItemType.GOLDEN_CARROT else "+%d" % pts
 		lbl.z_index = 15
 		lbl.add_theme_font_size_override("font_size", int(_vw * 0.033))
 		lbl.add_theme_color_override("font_color", col)

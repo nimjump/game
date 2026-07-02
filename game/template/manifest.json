@@ -1,0 +1,17 @@
+{
+  "name": "NimJump",
+  "short_name": "NimJump",
+  "description": "Jump, dodge, and earn NIM in NimJump.",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#242424",
+  "icons": [
+    {
+      "src": "assets/icon/ico.png",
+      "sizes": "1254x1254",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

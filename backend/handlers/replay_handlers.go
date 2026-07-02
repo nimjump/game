@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"log"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -26,6 +27,22 @@ func (s *Server) handleReplay(ctx *fasthttp.RequestCtx) {
 		writeErr(ctx, 404, "no_replay_log")
 		return
 	}
+
+	// ── VS room replay lock ──────────────────────────────────────────────────
+	// While a VS match is still pending (one side hasn't played their round
+	// yet), nobody but an admin gets the replay log for either side — the
+	// opponent could otherwise watch the exact same-seed run and scout the
+	// platform/enemy layout before playing themselves. Unlocks automatically
+	// once both sides have a recorded score (see FindVSRoomBySessionID).
+	if room, rerr := s.Store.FindVSRoomBySessionID(sessionID); rerr == nil && room != nil {
+		bothPlayed := room.CreatorScore != nil && room.OpponentScore != nil
+		if !bothPlayed {
+			log.Printf("[REPLAY] blocked — session=%s belongs to pending VS room=%s", sessionID, room.ID)
+			writeErr(ctx, 403, "vs_replay_locked")
+			return
+		}
+	}
+
 	writeJSON(ctx, 200, map[string]any{
 		"session_id":   sess.SessionID,
 		"seed":         strconv.FormatInt(sess.Seed, 10),
@@ -206,6 +223,12 @@ func (s *Server) handleAdminOverview(ctx *fasthttp.RequestCtx) {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "."
+	}
+	sysRes := game.GetSystemResources(dbPath)
+
 	writeJSON(ctx, 200, map[string]any{
 		"counts": map[string]any{
 			"total":          len(all),
@@ -222,6 +245,12 @@ func (s *Server) handleAdminOverview(ctx *fasthttp.RequestCtx) {
 			"max_workers": cap(game.ReplaySemCap()),
 		},
 		"worker_pool": ws,
+		"resources": map[string]any{
+			"ram_total_bytes":  sysRes.RAMTotalBytes,
+			"ram_used_bytes":   sysRes.RAMUsedBytes,
+			"disk_total_bytes": sysRes.DiskTotalBytes,
+			"disk_used_bytes":  sysRes.DiskUsedBytes,
+		},
 		"system": map[string]any{
 			"goroutines": runtime.NumGoroutine(),
 			"heap_mb":    mem.HeapAlloc / 1024 / 1024,

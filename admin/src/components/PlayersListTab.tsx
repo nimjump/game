@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState, useMemo } from "react";
-import { fetchPlayersList, RegisteredPlayer } from "@/lib/api";
+import { fetchPlayersList, type RegisteredPlayer } from "@/lib/api";
 import NimiqAvatar from "./NimiqAvatar";
 
 function fmtDate(ts: number) {
@@ -24,7 +24,6 @@ export default function PlayersListTab() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<"all" | "active" | "inactive">("all");
   const [sortBy, setSortBy] = useState<"registered" | "last_seen" | "sessions">("registered");
 
   useEffect(() => {
@@ -51,9 +50,6 @@ export default function PlayersListTab() {
       );
     }
 
-    if (filter === "active") list = list.filter((p) => p.is_active);
-    if (filter === "inactive") list = list.filter((p) => !p.is_active);
-
     list.sort((a, b) => {
       if (sortBy === "registered") return (b.registered_at ?? 0) - (a.registered_at ?? 0);
       if (sortBy === "last_seen") return (b.last_seen ?? 0) - (a.last_seen ?? 0);
@@ -62,9 +58,7 @@ export default function PlayersListTab() {
     });
 
     return list;
-  }, [players, search, filter, sortBy]);
-
-  const activeCount = players.filter((p) => p.is_active).length;
+  }, [players, search, sortBy]);
 
   return (
     <div style={{ padding: 24 }}>
@@ -73,8 +67,6 @@ export default function PlayersListTab() {
         <h2 style={{ margin: 0, fontSize: 20, fontWeight: 700 }}>Registered Players</h2>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <StatPill label="Total" value={total} color="#6366f1" />
-          <StatPill label="Active" value={activeCount} color="#22c55e" />
-          <StatPill label="Inactive" value={total - activeCount} color="#64748b" />
         </div>
         <button
           onClick={() => {
@@ -99,15 +91,6 @@ export default function PlayersListTab() {
           onChange={(e) => setSearch(e.target.value)}
           style={{ flex: "1 1 220px", padding: "8px 12px", borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e2e8f0", fontSize: 14, minWidth: 180 }}
         />
-        <select
-          value={filter}
-          onChange={(e) => setFilter(e.target.value as "all" | "active" | "inactive")}
-          style={{ padding: "8px 12px", borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e2e8f0", fontSize: 14 }}
-        >
-          <option value="all">All</option>
-          <option value="active">Active (signed in)</option>
-          <option value="inactive">Inactive</option>
-        </select>
         <select
           value={sortBy}
           onChange={(e) => setSortBy(e.target.value as "registered" | "last_seen" | "sessions")}
@@ -140,7 +123,6 @@ export default function PlayersListTab() {
                 <tr style={{ background: "#0f172a", color: "#94a3b8", textAlign: "left" }}>
                   <th style={th}>Player</th>
                   <th style={th}>Wallet</th>
-                  <th style={th}>Status</th>
                   <th style={th}>Sessions</th>
                   <th style={th}>Last Seen</th>
                   <th style={th}>Registered</th>
@@ -176,17 +158,6 @@ function PlayerRow({ player, even }: { player: RegisteredPlayer; even: boolean }
             ? player.player_id.slice(0, 10) + "…" + player.player_id.slice(-6)
             : player.player_id
           : "—"}
-      </td>
-      <td style={td}>
-        {player.is_active ? (
-          <span style={{ background: "#14532d", color: "#4ade80", borderRadius: 6, padding: "2px 8px", fontSize: 12, fontWeight: 600 }}>
-            ● Active
-          </span>
-        ) : (
-          <span style={{ background: "#1e293b", color: "#64748b", borderRadius: 6, padding: "2px 8px", fontSize: 12 }}>
-            Inactive
-          </span>
-        )}
       </td>
       <td style={{ ...td, color: "#e2e8f0", fontWeight: 600 }}>{player.session_count ?? 0}</td>
       <td style={{ ...td, color: "#94a3b8", fontSize: 13 }}>{fmtRelative(player.last_seen ?? 0)}</td>

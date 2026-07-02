@@ -196,7 +196,7 @@ static var _last_network_toast_ms : int = 0
 const _NETWORK_TOAST_COOLDOWN_MS := 4000  # aynı anda birden fazla request patlarsa toast spam'ini engelle
 
 static func network_error(context: String = "") -> void:
-	var now := Time.get_ticks_msec()
+	var now := Time.get_ticks_msec()  # determinism-ok: toast spam-cooldown UI timer only
 	if now - _last_network_toast_ms < _NETWORK_TOAST_COOLDOWN_MS:
 		if context != "":
 			print("[Toast] network_error suppressed (cooldown) ctx=%s" % context)

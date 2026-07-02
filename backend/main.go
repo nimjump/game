@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -127,6 +128,12 @@ func main() {
 	srv.StartBackgroundServices()
 	store.StartCleanupLoop()
 
+	// Root context for everything that should die when the backend does —
+	// right now just the admin app supervisor (adminproc.go). Cancelled in
+	// the shutdown handler below.
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	startAdminSupervisor(rootCtx)
+
 	// BadgerDB GC — TTL expired key'leri diskten fiziksel olarak sil.
 	// Logically silindiler (TTL'de okunmaz), ama fiziksel temizlik GC ile olur.
 	go func() {
@@ -155,7 +162,29 @@ func main() {
 		AcceptByteRange:    false,
 	}
 	staticHandler := fs.NewRequestHandler()
-	r.GET("/{filepath:*}", staticHandler)
+
+	// adminPathPrefix — same default-fallback logic as adminBasePath() in
+	// handlers/admin_proxy.go, duplicated here (unexported there) so this
+	// catch-all can recognize /admin/* paths without importing internals.
+	adminPathPrefix := os.Getenv("ADMIN_BASE_PATH")
+	if adminPathPrefix == "" {
+		adminPathPrefix = "/admin"
+	}
+	adminPathPrefix = strings.TrimSuffix(adminPathPrefix, "/")
+
+	// Defensive net: /admin routes are already registered explicitly in
+	// srv.Register(r) and should always take priority over this catch-all
+	// for /admin/* paths — but if they ever don't (router precedence
+	// surprise), route here instead of letting the static file server
+	// 404 against ../webexport, which has no "admin" file to find.
+	r.GET("/{filepath:*}", func(ctx *fasthttp.RequestCtx) {
+		path := string(ctx.Path())
+		if path == adminPathPrefix || strings.HasPrefix(path, adminPathPrefix+"/") {
+			srv.AdminFallback(ctx)
+			return
+		}
+		staticHandler(ctx)
+	})
 
 	addr := "0.0.0.0:" + port
 	log.Printf("[STARTUP] listening on http://%s", addr)
@@ -166,6 +195,8 @@ func main() {
 	go func() {
 		<-quit
 		log.Println("[SHUTDOWN] stopping...")
+		cancelRoot() // kills the admin app child process (adminproc.go)
+		time.Sleep(300 * time.Millisecond)
 		os.Exit(0)
 	}()
 
@@ -177,7 +208,11 @@ func main() {
 		WriteBufferSize:    8 * 1024,
 		ReadTimeout:        10e9,               // 10s
 		WriteTimeout:       30e9,               // 30s (replay submit can be large)
-		MaxRequestBodySize: 2 * 1024 * 1024,    // 2MB max body (RLE log is tiny anyway)
+		// 250MB — big enough for admin replay-binary uploads (Godot .exe export
+		// can be 100MB+). Public routes (submit etc.) validate their own much
+		// smaller size limits after parsing, so this only raises the hard
+		// connection-level ceiling, not what any given route actually accepts.
+		MaxRequestBodySize: 250 * 1024 * 1024,
 		ReduceMemoryUsage:  true,               // reduce GC pressure under high concurrency
 		TCPKeepalive:       true,
 		Logger:             log.Default(),
@@ -202,8 +237,23 @@ func corsMiddleware(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 
 		// CORS for API endpoints only
 		if len(path) > 8 && path[:8] == "/backend" {
-			ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
-			ctx.Response.Header.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			if strings.HasPrefix(path, "/backend/admin") {
+				// Admin routes use a session cookie (handlers/admin_session.go)
+				// instead of an Authorization header, so credentialed
+				// cross-origin requests need an explicit (not wildcard)
+				// Allow-Origin + Allow-Credentials — browsers refuse "*"
+				// together with credentials. Only matters when the admin app
+				// runs standalone in dev (ADMIN_PORT, not proxied through
+				// this backend); in production the proxy makes everything
+				// same-origin and this reflection is moot.
+				if origin := string(ctx.Request.Header.Peek("Origin")); origin != "" {
+					ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
+					ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
+				}
+			} else {
+				ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+			}
+			ctx.Response.Header.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 			ctx.Response.Header.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		}
 

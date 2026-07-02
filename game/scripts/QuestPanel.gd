@@ -140,7 +140,7 @@ func _build_ui() -> void:
 	hdr.add_theme_constant_override("separation", int(ref * 0.012))
 	hdr_mc.add_child(hdr)
 
-	hdr.add_child(UITheme.lucide_icon("zap", ic, Color(0.220, 0.130, 0.060)))
+	hdr.add_child(UITheme.lucide_icon("zap", ic, _COL_ICON))
 
 	var title_lbl := Label.new()
 	title_lbl.text = "DAILY QUESTS"
@@ -179,7 +179,7 @@ func _build_ui() -> void:
 	timer_row.add_theme_constant_override("separation", int(ref * 0.010))
 	timer_mc.add_child(timer_row)
 
-	timer_row.add_child(UITheme.lucide_icon("rotate-ccw", int(ref * 0.028), Color(0.440, 0.300, 0.180)))
+	timer_row.add_child(UITheme.lucide_icon("rotate-ccw", int(ref * 0.028), _COL_ICON))
 
 	_reset_lbl = Label.new()
 	_reset_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
@@ -297,6 +297,7 @@ func _build_quest_list() -> void:
 	var spacer := Control.new()
 	spacer.custom_minimum_size.y = int(ref * 0.02)
 	_list_root.add_child(spacer)
+	UITheme.set_scroll_passthrough(_list_root)
 
 
 ## Warm beige palette (matching screenshot)
@@ -306,6 +307,11 @@ const _COL_TEXT_BROWN  := Color(0.220, 0.130, 0.060)   # koyu kahve yazı
 const _COL_TEXT_MID    := Color(0.440, 0.300, 0.180)   # orta kahve (dim)
 const _COL_BAR_BG      := Color(0.780, 0.650, 0.500)   # bar arka planı
 const _COL_BAR_FILL    := Color(0.220, 0.620, 0.280)   # yeşil progress
+# Icon accent — matches LeaderboardPanel/StatsPanel's orange (_C_ORANGE there).
+# Icons here were tinted with _COL_TEXT_BROWN/_COL_TEXT_MID (near-black / dark
+# muted brown) instead of this accent, which is why they read as "black" next
+# to Leaderboard's icons.
+const _COL_ICON        := Color(0.780, 0.380, 0.120)
 
 func _make_quest_card(q: Dictionary, ref: float) -> Control:
 	var completed  : bool   = q.get("completed", false)
@@ -351,7 +357,7 @@ func _make_quest_card(q: Dictionary, ref: float) -> Control:
 	vbox.add_child(top)
 
 	var q_icon_name := "check-circle" if is_claimed else "target"
-	var q_icon_col  := _COL_BAR_FILL if is_claimed else _COL_TEXT_MID
+	var q_icon_col  := _COL_BAR_FILL if is_claimed else _COL_ICON
 	top.add_child(UITheme.lucide_icon(q_icon_name, ic, q_icon_col))
 
 	var desc_lbl := Label.new()

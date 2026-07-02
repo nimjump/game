@@ -14,8 +14,26 @@ const UITheme := preload("res://scripts/UITheme.gd")
 var BACKEND_URL : String = ApiConfig.base_url()
 
 var _started    := false
+
+# ── Server update-mode status (polled) ──────────────────────────────
+# When the admin panel puts the game into update mode, the server flips
+# update_active on (either immediately — "force" — or automatically once
+# the current weekly leaderboard period ends — "normal"). While active,
+# starting a NEW game is blocked and a toast is shown instead; anyone
+# already mid-run is left alone. See backend/handlers/server.go
+# handleDeveloperModeGet + backend/game/appconfig.go.
+var _update_active  := false
+var _update_message := "Game updating. Please check back shortly — thanks for your patience!"
+var _status_poll_timer : Timer = null
+const _STATUS_POLL_SEC := 25.0
+
 var _muted      := false
 var _volume     := 1.0
+# iOS never supports the Vibration API (Safari/WKWebView have no navigator.vibrate,
+# and it's never coming — Apple has no plans to implement it). Detected once at
+# startup so the settings toggle can be shown-but-disabled instead of a toggle
+# that silently does nothing when tapped.
+var _is_ios     := false
 var _char_index := 0
 var _vibration  := true
 var _save_timer : SceneTreeTimer = null  # debounce: coalesce rapid _save_settings calls
@@ -69,6 +87,7 @@ var _ui_root  : Control
 var _char_lbl : Label
 
 var _settings_popup    : Control
+var _settings_rebuilding := false  # re-entrancy guard for _rebuild_settings_if_open()
 var _nick_overlay      : Control   # tam ekran nickname düzenleme overlay'i
 var _sound_toggle      : CheckButton
 var _volume_slider     : HSlider
@@ -107,6 +126,8 @@ const _TEX_TORCH_ON_B := preload("res://assets/pack/torch_on_b.png")
 
 # ── Backend state ──────────────────────────────────────────────────
 var _play_btn      : Button = null   # PLAY button reference
+var _vs_btn        : Button = null   # VS button reference (opens VSPanel)
+var _vs_panel      : CanvasLayer = null
 var _backend_ok    : bool   = true   # no longer used for ping — always true
 var _ping_retry_timer: SceneTreeTimer = null  # auto-retry handle
 var _torch_rects   : Array  = []     # [left_torch, right_torch] TextureRect nodes
@@ -212,6 +233,17 @@ func _ready() -> void:
 
 	_setup_audio()
 
+	# iOS detection (web only) — Safari/WKWebView never implement navigator.vibrate(),
+	# and Godot's own Input.vibrate_handheld() is a no-op on the HTML5/web export
+	# regardless of OS (engine limitation, not fixable from project code). So on iOS
+	# the vibration toggle is shown but permanently disabled instead of silently
+	# doing nothing when the player taps it.
+	if OS.has_feature("web"):
+		_is_ios = bool(JavaScriptBridge.eval(
+			"/iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream", true))
+		if _is_ios:
+			_vibration = false
+
 	# Web: JS listener for touch tracking (always set up for tap mode)
 	if OS.has_feature("web"):
 		JavaScriptBridge.eval("""
@@ -293,6 +325,7 @@ func _ready() -> void:
 	# Don't wait for Nimiq — start game immediately, Nimiq loads in background
 	_load_settings()
 	_build_game()
+	_start_status_poll()
 	_build_start_ui()
 	_init_game()
 	_apply_audio_settings()
@@ -753,7 +786,7 @@ func _sync_panels() -> void:
 	var has_wallet : bool   = nimiq_address != ""
 	var authed     : bool   = token != ""
 
-	for panel in [_leaderboard_panel, _quest_panel, _stats_panel]:
+	for panel in [_leaderboard_panel, _quest_panel, _stats_panel, _vs_panel]:
 		if not is_instance_valid(panel): continue
 		if panel.has_method("set_has_wallet"):     panel.call("set_has_wallet", has_wallet)
 		if panel.has_method("set_player_id"):      panel.call("set_player_id", pid)
@@ -802,8 +835,15 @@ func _on_auth_failed(reason: String) -> void:
 		_nimiq_bridge.auth_verified  = false
 		_nimiq_bridge.auth_attempted = true
 	_sync_panels()
-	if (reason == "no_provider" or reason.begins_with("no_provider") or reason == "user_rejected") and not _started:
-		print("[MAIN] no_provider/rejected — starting game without wallet")
+	# Any auth failure — including offline/network errors (challenge_fetch_failed,
+	# verify_failed_*, challenge_parse_failed, etc.) — must still let the player
+	# play. Previously only "no_provider"/"user_rejected" started the game, so
+	# a player with no internet connection got stuck waiting forever on the
+	# challenge request instead of playing offline. Auth just stays unverified;
+	# leaderboard/replay submission stays blocked (server needs a valid token
+	# for those), but the game itself always opens.
+	if not _started:
+		print("[MAIN] auth failed (%s) — starting game without wallet" % reason)
 		_started = true
 		_block_lb_replay = true
 		if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
@@ -942,16 +982,18 @@ func _on_viewport_resized() -> void:
 		return
 	_resize_timer = null
 	# UI'ı teardown + rebuild
+	# determinism-ok (whole block): viewport-resize UI rebuild — only reachable via
+	# vp.size_changed, which is never connected/fired during --server-replay/--server-worker.
 	if is_instance_valid(_ui_layer):
-		_ui_layer.free()
+		_ui_layer.free()  # determinism-ok: viewport-resize rebuild, never fires headless
 		_ui_layer = null
 	_ui_root        = null
 	_settings_popup = null
 	_bottom_bar     = null
 	_play_btn       = null
-	if is_instance_valid(_quest_panel):      _quest_panel.free();      _quest_panel = null
-	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.free(); _leaderboard_panel = null
-	if is_instance_valid(_stats_panel):      _stats_panel.free();      _stats_panel = null
+	if is_instance_valid(_quest_panel):      _quest_panel.free();      _quest_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
+	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.free(); _leaderboard_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
+	if is_instance_valid(_stats_panel):      _stats_panel.free();      _stats_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	_build_start_ui()
 
 
@@ -1396,7 +1438,7 @@ func _build_game() -> void:
 	var _nodes_to_free := [_hud, _ui_layer, _gm, _player, _replay_bar,
 		_quest_panel, _leaderboard_panel, _stats_panel]
 	for node in _nodes_to_free:
-		if is_instance_valid(node): node.free()
+		if is_instance_valid(node): node.free()  # determinism-ok: client-only UI teardown, never runs in --server-replay/--server-worker (those return before _build_game() is ever called)
 	_hud = null; _ui_layer = null; _gm = null; _player = null
 	_replay_bar = null; _quest_panel = null; _leaderboard_panel = null; _stats_panel = null
 	_powerup_row = null
@@ -1404,7 +1446,7 @@ func _build_game() -> void:
 	for child in get_children().duplicate():
 		if child is CanvasLayer:
 			if child != _landscape_overlay and child != _calib_layer:
-				child.free()
+				child.free()  # determinism-ok: same _build_game() UI teardown, client-only
 	# ─────────────────────────────────────────────────────────────────────────
 	# Start Nimiq poll only on first call (_poll_started flag blocks second call)
 	if _nimiq_bridge and not _nimiq_bridge._poll_started:
@@ -1690,7 +1732,7 @@ func _build_game() -> void:
 		["res://assets/hud/platform_icon.png",  "P",  "0",  "PLATFORMS"],
 		["res://assets/hud/skull_icon.png",     "K",  "0",  "KILLS"    ],
 		["res://assets/items/nimiq_hexagon_item.png", "C", "0",  "COINS"    ],
-		["res://assets/hud/lightning_icon.png", "X", "1x", "COMBO"    ],
+		["res://assets/hud/lightning_icon.png", "X", "1x", "BEST COMBO"],
 	]
 
 	var _stat_val_nodes : Array[Label] = []
@@ -2113,12 +2155,25 @@ func _build_start_ui() -> void:
 	right_btn.pressed.connect(func(): _change_char(1))
 	sel_pc.add_child(right_btn)
 
-	# ── PLAY and Settings buttons ────────────────────
+	# ── PLAY, VS and Settings buttons ────────────────────
 	var btn_w       := _p(0.72)
 	var play_h      := int(_p(0.105))
 	var set_h       := int(_p(0.080))
+	var vs_h        := int(_p(0.080))
 	var gap         := int(_p(0.018))
-	var base_bottom := -int(_ph(0.18))
+
+	# Centre the PLAY/VS/Settings block in the space between the character
+	# selector's bottom edge (the arrow row above) and the bottom nav bar's
+	# top edge, so the gap above the block equals the gap below it —
+	# instead of a fixed offset from the screen edge that left them uneven.
+	var sel_bottom_abs     : float = _vh * 0.5 + sel_pc.offset_bottom
+	var bottom_bar_h       : float = _vh * 0.09  # must match _build_bottom_bar()'s bar_h formula
+	var bottom_bar_top_abs : float = _vh - bottom_bar_h
+	var block_h            : float = play_h + gap + vs_h + gap + set_h
+	var avail_h             : float = bottom_bar_top_abs - sel_bottom_abs
+	var equal_margin        : float = maxf((avail_h - block_h) * 0.5, 0.0)
+	var block_top_abs       : float = sel_bottom_abs + equal_margin
+	var base_bottom := int(block_top_abs + block_h - _vh)
 
 	# Settings — bottom
 	var settings_btn := Button.new()
@@ -2135,8 +2190,22 @@ func _build_start_ui() -> void:
 	UITheme.apply_ghost_button(settings_btn)
 	_ui_root.add_child(settings_btn)
 
+	# VS — between Play and Settings ("play'in altında")
+	_vs_btn = Button.new()
+	_vs_btn.text = "VS"
+	_vs_btn.add_theme_font_size_override("font_size", int(_p(0.080)))
+	_vs_btn.custom_minimum_size = Vector2(btn_w, vs_h)
+	_vs_btn.anchor_left   = 0.5; _vs_btn.anchor_right  = 0.5
+	_vs_btn.anchor_top    = 1.0; _vs_btn.anchor_bottom = 1.0
+	_vs_btn.offset_left   = -btn_w * 0.5
+	_vs_btn.offset_right  =  btn_w * 0.5
+	_vs_btn.offset_bottom = base_bottom - set_h - gap
+	_vs_btn.offset_top    = base_bottom - set_h - gap - vs_h
+	_vs_btn.pressed.connect(_open_vs_panel)
+	UITheme.apply_ghost_button(_vs_btn)
+	_ui_root.add_child(_vs_btn)
 
-	# PLAY — above settings
+	# PLAY — above VS
 	_play_btn = Button.new()
 	_play_btn.disabled = false
 	_play_btn.text = "PLAY"
@@ -2146,8 +2215,8 @@ func _build_start_ui() -> void:
 	_play_btn.anchor_top    = 1.0; _play_btn.anchor_bottom = 1.0
 	_play_btn.offset_left   = -btn_w * 0.5
 	_play_btn.offset_right  =  btn_w * 0.5
-	_play_btn.offset_bottom = base_bottom - set_h - gap
-	_play_btn.offset_top    = base_bottom - set_h - gap - play_h
+	_play_btn.offset_bottom = base_bottom - set_h - gap - vs_h - gap
+	_play_btn.offset_top    = base_bottom - set_h - gap - vs_h - gap - play_h
 	_play_btn.pressed.connect(_on_play_pressed)
 	UITheme.apply_play_button(_play_btn)
 	_ui_root.add_child(_play_btn)
@@ -2179,14 +2248,19 @@ func _build_start_ui() -> void:
 		# Buttons come up from below
 		_play_btn.offset_top    += int(_p(0.06))
 		_play_btn.offset_bottom += int(_p(0.06))
-		var _base := -int(_ph(0.18))
+		_vs_btn.offset_top       += int(_p(0.06))
+		_vs_btn.offset_bottom    += int(_p(0.06))
+		var _base := base_bottom  # same equal-margin position computed above, not a fixed screen offset
 		var _set_h2 := int(_p(0.080))
+		var _vs_h2  := int(_p(0.080))
 		var _play_h2 := int(_p(0.105))
 		var _gap2 := int(_p(0.018))
 		intro.tween_property(settings_btn, "offset_top",    _base - _set_h2,              0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 		intro.tween_property(settings_btn, "offset_bottom", _base,                         0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(_play_btn, "offset_top",    _base - _set_h2 - _gap2 - _play_h2, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(_play_btn, "offset_bottom", _base - _set_h2 - _gap2,             0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_vs_btn, "offset_top",    _base - _set_h2 - _gap2 - _vs_h2,   0.37).set_delay(0.14).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_vs_btn, "offset_bottom", _base - _set_h2 - _gap2,            0.37).set_delay(0.14).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_play_btn, "offset_top",    _base - _set_h2 - _gap2 - _vs_h2 - _gap2 - _play_h2, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_play_btn, "offset_bottom", _base - _set_h2 - _gap2 - _vs_h2 - _gap2,            0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
 	# ── Idle animations (start after intro) ──────────────────
 	await get_tree().create_timer(0.25).timeout
@@ -2220,6 +2294,7 @@ func _build_start_ui() -> void:
 	_build_settings_popup()
 	_build_bottom_bar()
 	_build_quest_panel()
+	_check_vsroom_deeplink()
 
 
 # ─────────────────────────────────────────────────────
@@ -2379,6 +2454,78 @@ func _on_tab_pressed(tab_id: String) -> void:
 			if is_instance_valid(_leaderboard_panel): _leaderboard_panel.show_panel()
 		"stats":
 			if is_instance_valid(_stats_panel):      _stats_panel.show_panel()
+
+
+## Invite link support — "?vsroom=<id>" in the URL (see backend vsRoomInviteURL).
+## Someone who clicks a shared VS link lands here, gets the VS panel opened
+## straight to that room's detail/join view instead of the empty room list.
+func _check_vsroom_deeplink() -> void:
+	if not OS.has_feature("web"): return
+	var url_raw = JavaScriptBridge.eval("window.location.search", true)
+	if url_raw == null: return
+	var url_str := str(url_raw)
+	var idx := url_str.find("vsroom=")
+	if idx < 0: return
+	var room_id := url_str.substr(idx + 7).split("&")[0]
+	if room_id == "": return
+	_open_vs_panel()
+	if is_instance_valid(_vs_panel) and _vs_panel.has_method("open_room"):
+		_vs_panel.call("open_room", room_id)
+
+
+## VS Rooms — async 1v1 challenge panel, opened from the main-menu VS button.
+func _open_vs_panel() -> void:
+	_start_bgm_if_needed()
+	if _started: return
+	if not is_instance_valid(_vs_panel):
+		_build_vs_panel()
+	_vs_panel.call("show_panel")
+
+
+func _build_vs_panel() -> void:
+	_vs_panel = CanvasLayer.new()
+	_vs_panel.set_script(load("res://scripts/VSPanel.gd"))
+	_vs_panel.layer = 16   # above quest/stats/leaderboard (15)
+	add_child(_vs_panel)
+	var pid := nimiq_address if nimiq_address != "" else nimiq_device_id
+	_vs_panel.call("setup", pid)
+	_vs_panel.connect("play_requested", _start_vs_round)
+	_vs_panel.connect("replay_requested", func(seed: int, log: PackedByteArray, char_idx: int, nick: String, player_seed: int):
+		if _started: return
+		_block_lb_replay = false
+		await _start_replay(seed, log, char_idx, "vs", player_seed)
+	)
+	_sync_panels()
+
+
+## Called by VSPanel when the player presses "Play" on their side of a room.
+## seed_str: the room's fixed seed (decimal string, int64-safe) — BOTH sides
+## of a VS match play this exact same seed, never a locally-random one.
+func _start_vs_round(room_id: String, role: String, seed_str: String) -> void:
+	if _started: return
+
+	if _auth_token == "":
+		print("[VS] play pressed — not signed in, requesting auth")
+		if is_instance_valid(_nimiq_bridge) and not _nimiq_bridge.auth_verified:
+			_nimiq_bridge._do_sign_auth()
+		var _conn_s := _nimiq_bridge.connect("auth_success", func(_t, _p):
+			_start_vs_round(room_id, role, seed_str)
+		, CONNECT_ONE_SHOT)
+		return
+
+	_started = true
+	_block_lb_replay = true
+	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
+	if is_instance_valid(_stats_panel):       _stats_panel.hide_panel()
+	if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
+	if is_instance_valid(_vs_panel):          _vs_panel.hide_panel()
+
+	if is_instance_valid(_gm):
+		_gm.set("vs_room_id", room_id)
+		_gm.set("vs_role",    role)
+
+	var seed_val : int = int(seed_str)
+	_do_start_game(seed_val)
 
 
 func _build_quest_panel() -> void:
@@ -2835,6 +2982,16 @@ func _build_settings_popup() -> void:
 	vib_toggle.toggled.connect(func(p: bool): _vibration = p; _save_settings())
 	vib_row.add_child(vib_toggle)
 
+	# iOS: Safari/WKWebView has no Vibration API and never will — show the
+	# toggle (so the setting isn't mysteriously missing) but lock it off
+	# instead of letting the player turn on something that can't ever work.
+	if _is_ios:
+		vib_toggle.button_pressed = false
+		vib_toggle.disabled       = true
+		vib_toggle.modulate.a     = 0.45
+		vib_lbl.modulate.a        = 0.45
+		vib_lbl.text              = "Vibration (unavailable on iOS)"
+
 	_control_mode = "tap"
 
 	# ── Background Selection ───────────────────────
@@ -3015,7 +3172,7 @@ func _build_settings_popup() -> void:
 			if _ls_exp != null: _eff_exp = int(_ls_exp)
 		if _eff_exp > 0:
 			var exp_lbl := Label.new()
-			var now_unix := int(Time.get_unix_time_from_system())
+			var now_unix := int(Time.get_unix_time_from_system())  # determinism-ok: UI countdown label only
 			var remaining := _eff_exp - now_unix
 			var exp_text := ""
 			if remaining <= 0:
@@ -3070,7 +3227,7 @@ func _build_settings_popup() -> void:
 		UITheme.apply_label(nick_status, S_MID, int(_p(0.022)))
 		acc_vbox.add_child(nick_status)
 
-		if _nickname_cooldown_end > 0 and Time.get_unix_time_from_system() < _nickname_cooldown_end:
+		if _nickname_cooldown_end > 0 and Time.get_unix_time_from_system() < _nickname_cooldown_end:  # determinism-ok: UI-only cooldown check
 			var cd_dt := Time.get_datetime_dict_from_unix_time(_nickname_cooldown_end)
 			nick_status.text = "Can change after %02d.%02d.%04d" % [cd_dt.day, cd_dt.month, cd_dt.year]
 			nick_edit_btn.disabled = true
@@ -3243,9 +3400,27 @@ func _open_settings() -> void:
 func _rebuild_settings_if_open() -> void:
 	if not is_instance_valid(_settings_popup) or not _settings_popup.visible:
 		return
+	# FREEZE/LEAK FIX: this function awaits a frame before tearing down and
+	# rebuilding the ENTIRE settings popup (dozens of Control/StyleBox nodes).
+	# It's called from several auth/bridge callbacks (_on_nimiq_ready,
+	# _on_auth_success, _on_auth_failed, _on_auth_expired) that can legitimately
+	# fire more than once in quick succession. Without this guard, a second call
+	# arriving while the first is still paused on `await process_frame` would
+	# pass the same visibility check, then BOTH calls would queue_free() the
+	# (still-valid-until-end-of-frame) popup and build a brand new one — the
+	# first rebuild's new popup gets silently overwritten/orphaned by the
+	# second, leaking a full Control tree instead of freeing it. Repeated
+	# often enough (each open + each auth ping) this is exactly the kind of
+	# thing that shows up as "sometimes when I open a menu it stutters/freezes"
+	# over a long session. The guard makes overlapping calls just skip instead
+	# of racing.
+	if _settings_rebuilding:
+		return
+	_settings_rebuilding = true
 	# Wait one frame so bridge state is fully written before reading
 	await get_tree().process_frame
 	if not is_instance_valid(_settings_popup) or not _settings_popup.visible:
+		_settings_rebuilding = false
 		return
 	_sync_panels()
 	_settings_popup.queue_free()
@@ -3253,6 +3428,7 @@ func _rebuild_settings_if_open() -> void:
 	_build_settings_popup()
 	_settings_popup.visible = true
 	_settings_popup.modulate.a = 1.0
+	_settings_rebuilding = false
 
 func _open_nick_overlay() -> void:
 	if is_instance_valid(_nick_overlay):
@@ -3438,42 +3614,18 @@ func _open_nick_overlay() -> void:
 		le.grab_focus()
 		le.caret_column = le.text.length()
 
-	# ── Klavye yükseklik takibi — panel yukarı kaymasın ────────────
-	# Godot 4 web/mobile'da sanal klavye açıldığında viewport küçülür.
-	# _on_viewport_resized bunu artık engeller, ancak ek güvence olarak
-	# LineEdit focus olduğunda panel anchor'ını %0-50 bant içinde bırakıyoruz
-	# (zaten _open_nick_overlay'de anchor_top=0.05, anchor_bottom=0.55 ile sabitlenmiş).
-	# Eğer native DisplayServer klavye yüksekliği verebiliyorsa (Godot 4.3+),
-	# paneli ona göre pozisyonla.
-	if is_instance_valid(pc) and is_instance_valid(_nick_overlay):
-		le.focus_entered.connect(func():
-			# Web: sanal klavye yüksekliğini JS'den al, paneli yukarı taşı
-			if OS.has_feature("web"):
-				await get_tree().create_timer(0.35).timeout   # klavye animasyon bekleme
-				if not is_instance_valid(pc): return
-				var kb_h : float = 0.0
-				var raw = JavaScriptBridge.eval(
-					"(window.visualViewport ? (window.innerHeight - window.visualViewport.height) : 0)", true)
-				if raw != null: kb_h = clampf(float(raw), 0.0, _vh * 0.6)
-				if kb_h > 20.0:
-					# Klavye alan _vh'nin altındaki kısmı kaplıyor — panel görünür alanda kalsın
-					var available_h := _vh - kb_h
-					var panel_h     := pc.size.y if pc.size.y > 10.0 else _vh * 0.50
-					var top_y       := (available_h - panel_h) * 0.5
-					top_y = clampf(top_y, _vh * 0.02, available_h - panel_h - _vh * 0.02)
-					pc.anchor_top    = top_y / _vh
-					pc.anchor_bottom = (top_y + panel_h) / _vh
-					pc.offset_top    = 0.0
-					pc.offset_bottom = 0.0
-		)
-		le.focus_exited.connect(func():
-			# Klavye kapandı — anchor'ı orijinal konuma geri getir
-			if is_instance_valid(pc):
-				pc.anchor_top    = 0.05
-				pc.anchor_bottom = 0.55
-				pc.offset_top    = 0.0
-				pc.offset_bottom = 0.0
-		)
+	# ── Klavye yükseklik takibi ─────────────────────────────────────
+	# FIX: this used to also fetch the keyboard height from JS and subtract
+	# it from _vh a SECOND time on focus — but _on_viewport_resized() already
+	# shrinks _vh to the post-keyboard viewport height the moment the OS
+	# resizes it (see the "KLAVYE AÇILINCA VIEWPORT KÜÇÜLME SORUNU" block
+	# above). Subtracting kb_h again double-counted the keyboard, producing
+	# a tiny/negative available_h and scrambling the panel's position —
+	# exactly the "keyboard opens, screen shrinks, everything goes haywire"
+	# bug. The panel is anchored with percentages (anchor_top=0.05,
+	# anchor_bottom=0.55, set below), which Godot already re-lays-out
+	# automatically against whatever the CURRENT viewport size is on every
+	# resize — no manual repositioning code is needed at all.
 
 
 func _close_settings() -> void:
@@ -3586,7 +3738,7 @@ func _on_play_pressed() -> void:
 	# Clear token if 1 day until expiry — proactive re-auth
 	# nimiq_expires_at getter reads bridge.auth_expires_at directly — always fresh
 	if _auth_token != "" and nimiq_expires_at > 0:
-		var remaining := nimiq_expires_at - int(Time.get_unix_time_from_system())
+		var remaining := nimiq_expires_at - int(Time.get_unix_time_from_system())  # determinism-ok: UI-only auth countdown
 		if remaining < 86400:
 			print("[MAIN] token expires in %ds (<1 day) — forcing re-auth" % remaining)
 			_on_auth_expired()
@@ -3826,7 +3978,46 @@ func _start_vs_game() -> void:
 		_gm.call("vs_start")
 
 
-func _do_start_game() -> void:
+## Polls /backend/developer-mode periodically for update_active. Doesn't
+## block anything by itself — _do_start_game() checks the cached flag.
+func _start_status_poll() -> void:
+	if not OS.has_feature("web"): return
+	_check_server_status()
+	_status_poll_timer = Timer.new()
+	_status_poll_timer.wait_time = _STATUS_POLL_SEC
+	_status_poll_timer.autostart = true
+	_status_poll_timer.timeout.connect(_check_server_status)
+	add_child(_status_poll_timer)
+
+
+func _check_server_status() -> void:
+	var http := HTTPRequest.new()
+	http.timeout = 8.0
+	add_child(http)
+	http.request_completed.connect(func(result, code, _h, body):
+		http.queue_free()
+		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+			return  # offline/unreachable — keep last known state, don't flip anything
+		var j := JSON.new()
+		if j.parse(body.get_string_from_utf8()) != OK:
+			return
+		var d : Dictionary = j.get_data()
+		_update_active = bool(d.get("update_active", false))
+		var msg := str(d.get("update_message", ""))
+		if msg != "":
+			_update_message = msg
+	)
+	http.request(BACKEND_URL + "/backend/developer-mode")
+
+
+func _do_start_game(forced_seed: int = 0) -> void:
+	if _update_active:
+		print("[MAIN] start blocked — game is in update mode")
+		var inst := Toast.get_instance()
+		if inst != null:
+			inst.show_toast(_update_message, Toast.Kind.WARN)
+		return
+
 	var tw := create_tween()
 	if tw:
 		tw.tween_property(_ui_root, "modulate:a", 0.0, 0.35)
@@ -3850,8 +4041,24 @@ func _do_start_game() -> void:
 					_player.call("reset_to_idle")
 				if is_instance_valid(_gm):
 					_gm.set("_game_over", false)
-					_gm.call("_start_session")
+					_gm.call("_start_session", forced_seed)
 		)
+
+
+## Vibration wrapper — Godot's Input.vibrate_handheld() is a confirmed no-op on
+## the HTML5/web export (engine limitation: godotengine/godot#96985), so on web
+## we call the browser's navigator.vibrate() directly instead. This actually
+## works on Android (Chrome / Chromium-based WebView, API 19+) but can NEVER
+## work on iOS (Safari/WKWebView have no Vibration API at all) — _is_ios is
+## checked first so we don't even attempt it there.
+func _do_vibrate(ms: int) -> void:
+	if not _vibration or _is_ios:
+		return
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval(
+			"try { if (navigator.vibrate) navigator.vibrate(%d); } catch(e) {}" % ms, true)
+	else:
+		Input.vibrate_handheld(ms)
 
 
 func _change_char(dir: int) -> void:
@@ -3867,8 +4074,7 @@ func _on_lives_changed(lives: int) -> void:
 	# Damage sound + vibration when lives decrease
 	if lives < _prev_lives and _started:
 		play_damage_sound()
-		if _vibration:
-			Input.vibrate_handheld(120)   # 120 ms short pulse
+		_do_vibrate(120)   # 120 ms short pulse
 	_prev_lives = lives
 
 	for i in _life_icons.size():
@@ -3889,8 +4095,7 @@ func _on_lives_changed(lives: int) -> void:
 func show_game_over(p_score: int, p_best: int, p_stats: Dictionary = {}) -> void:
 	print("[GAME_OVER] show_game_over called score=%d best=%d" % [p_score, p_best])
 	# Death vibration — longer pulse
-	if _vibration:
-		Input.vibrate_handheld(400)
+	_do_vibrate(400)
 
 	if is_instance_valid(_score_display):
 		_score_display.show_number(p_score)

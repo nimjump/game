@@ -1,17 +1,12 @@
 "use client";
 import Link from "next/link";
 import { useState } from "react";
-import { retryReplay, adminSessionAction, type Session, type SessionAction } from "@/lib/api";
+import { retryReplay, adminSessionAction, saveGoldenReplay, type Session, type SessionAction } from "@/lib/api";
 import NimiqAvatar from "@/components/NimiqAvatar";
 
 function fmt(ts: number) {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString("en-GB");
-}
-function fmtDur(sec: number) {
-  if (!sec) return "—";
-  const m = Math.floor(sec / 60), s = sec % 60;
-  return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 function scoreDiff(s: Session) {
   if (!s.submitted_at || s.client_score === 0) return "—";
@@ -21,7 +16,6 @@ function scoreDiff(s: Session) {
 
 interface Props {
   sessions: Session[];
-  showDuration?: boolean;
   onSearch: (q: string) => void;
   onSearchSubmit: (q: string) => void;
   searchValue: string;
@@ -50,7 +44,7 @@ function Confirm({ msg, onOk, onCancel }: { msg: string; onOk: () => void; onCan
 }
 
 export default function SessionsTab({
-  sessions, showDuration, onSearch, onSearchSubmit, searchValue, onActionDone,
+  sessions, onSearch, onSearchSubmit, searchValue, onActionDone,
 }: Props) {
   const [rowState, setRowState] = useState<Record<string, "loading" | "ok" | "err">>({});
   const [rowMsg,   setRowMsg]   = useState<Record<string, string>>({});
@@ -84,6 +78,18 @@ export default function SessionsTab({
     const { id, action } = conf;
     setConf(null);
     doAction(id, action);
+  };
+
+  const pinGolden = async (sessionId: string) => {
+    const label = window.prompt("Label for this golden replay (e.g. \"bunny3, mystery box heavy\"):", "");
+    if (label === null) return; // cancelled
+    set(sessionId, "loading");
+    try {
+      await saveGoldenReplay(sessionId, label.trim());
+      set(sessionId, "ok", "📌 pinned as golden");
+    } catch (e) {
+      set(sessionId, "err", String(e instanceof Error ? e.message : e));
+    }
   };
 
   return (
@@ -122,7 +128,6 @@ export default function SessionsTab({
                 <th>Server</th>
                 <th>Diff</th>
                 <th>Ticks</th>
-                {showDuration && <th>Duration</th>}
                 <th>Date</th>
                 <th>Actions</th>
               </tr>
@@ -159,8 +164,6 @@ export default function SessionsTab({
                         <span className="badge badge-red" style={{ fontSize: 10 }}>⚠ {s.reason?.split(":")[0] ?? "flagged"}</span>}
                       {s.state === "completed" && !s.flagged &&
                         <span className="badge badge-green" style={{ fontSize: 10 }}>✓ OK</span>}
-                      {s.state === "active" &&
-                        <span className="badge badge-green" style={{ fontSize: 10 }}>🎮 Active</span>}
                       {s.state === "pending" &&
                         <span className="badge badge-yellow" style={{ fontSize: 10 }}>⏳</span>}
                       {isReplayFailed &&
@@ -172,9 +175,6 @@ export default function SessionsTab({
                     </td>
                     <td style={{ color: isFlagged ? "var(--red)" : "var(--text-muted)", fontSize: 12 }}>{scoreDiff(s)}</td>
                     <td style={{ color: "var(--text-muted)", fontSize: 12 }}>{s.ticks.toLocaleString()}</td>
-                    {showDuration && (
-                      <td style={{ color: "var(--green)", fontWeight: 600 }}>{fmtDur(s.elapsed_sec ?? 0)}</td>
-                    )}
                     <td style={{ color: "var(--text-muted)", fontSize: 11 }}>
                       {s.submitted_at ? fmt(s.submitted_at) : fmt(s.created_at)}
                     </td>
@@ -188,6 +188,15 @@ export default function SessionsTab({
                             <Link href={`/replay/${s.session_id}`}>
                               <button className="btn" style={{ fontSize: 11, padding: "2px 7px" }}>▶</button>
                             </Link>
+                          )}
+                          {/* Pin as golden replay — only makes sense for a clean completed run */}
+                          {s.state === "completed" && !s.flagged && s.has_log !== false && (
+                            <button className="btn" disabled={busy}
+                              style={{ fontSize: 11, padding: "2px 7px" }}
+                              title="Pin as golden replay (determinism self-test)"
+                              onClick={() => pinGolden(s.session_id)}>
+                              📌
+                            </button>
                           )}
                           {/* Flagged/failed actions */}
                           {(isFlagged || isReplayFailed) && (

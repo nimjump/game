@@ -30,7 +30,7 @@ const DECOY_NAMES  := ["GameManager","Player","ScoreNode","SeedManager",
 func setup(gm: Node, player: Node) -> void:
 	_gm     = gm
 	_player = player
-	_mask   = randi() | 1   # never 0
+	_mask   = randi() | 1   # never 0  # determinism-ok: obfuscation-only, never sent to server / never replayed
 
 	_obfuscate_node_names()
 	_spawn_decoys()
@@ -84,9 +84,9 @@ func _spawn_decoys() -> void:
 		var d := Node.new()
 		d.name = DECOY_NAMES[i % DECOY_NAMES.size()]
 		# Fake script on decoy — returns meaningless values when accessed externally
-		d.set_meta("score", randi_range(0, 9999))
-		d.set_meta("seed",  randi_range(0, 2147483647))
-		d.set_meta("session_id", "decoy_%d" % randi())
+		d.set_meta("score", randi_range(0, 9999))  # determinism-ok: fake honeypot value, decoy node
+		d.set_meta("seed",  randi_range(0, 2147483647))  # determinism-ok: fake honeypot value
+		d.set_meta("session_id", "decoy_%d" % randi())  # determinism-ok: fake honeypot value
 		parent.add_child(d)
 		_decoys.append(d)
 
@@ -94,8 +94,8 @@ func _spawn_decoys() -> void:
 func _shuffle_decoys() -> void:
 	for d in _decoys:
 		if is_instance_valid(d):
-			d.set_meta("score", randi_range(0, 9999))
-			d.set_meta("seed",  randi_range(0, 2147483647))
+			d.set_meta("score", randi_range(0, 9999))  # determinism-ok: fake honeypot value
+			d.set_meta("seed",  randi_range(0, 2147483647))  # determinism-ok: fake honeypot value
 
 ## Initialize masked values.
 func _mask_values() -> void:
@@ -107,7 +107,7 @@ func _random_name() -> String:
 	const chars := "abcdefghijklmnopqrstuvwxyz0123456789"
 	var s := "_"
 	for i in range(12):
-		s += chars[randi() % chars.length()]
+		s += chars[randi() % chars.length()]  # determinism-ok: random decoy node name, cosmetic obfuscation
 	return s
 
 var _shuffle_frame : int = 0

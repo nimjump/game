@@ -274,6 +274,10 @@ func (s *Store) QueueReward(playerID string, amountNIM float64, reason string) (
 //   "quest_claim:q_daily_score"                    → "NimJump: Quest reward +5.00 NIM"
 //   "leaderboard:weekly:2026-06-24:rank1"          → "NimJump: Weekly leaderboard #1 +18.00 NIM"
 //   "leaderboard:daily:2026-06-24:rank3"           → "NimJump: Daily leaderboard #3 +3.00 NIM"
+//   "vsroom:<id>:win"                              → "NimJump: VS win +9.50 NIM"
+//   "vsroom:<id>:split"                            → "NimJump: VS tie split +4.75 NIM"
+//   "vsroom:<id>:forfeit"                          → "NimJump: VS forfeit win +9.50 NIM"
+//   "vsroom:<id>:refund"                           → "NimJump: VS refund +5.00 NIM"
 //   anything else                                  → "NimJump: Reward +X.XX NIM"
 func buildMemo(amountNIM float64, reason string) string {
 	nim := fmt.Sprintf("+%.2f NIM", amountNIM)
@@ -282,6 +286,19 @@ func buildMemo(amountNIM float64, reason string) string {
 	switch {
 	case len(parts) >= 2 && parts[0] == "quest_claim":
 		return truncate64("NimJump: Quest reward " + nim)
+
+	case len(parts) >= 3 && parts[0] == "vsroom":
+		kind := parts[2]
+		label := map[string]string{
+			"win":     "VS win",
+			"split":   "VS tie split",
+			"forfeit": "VS forfeit win",
+			"refund":  "VS refund",
+		}[kind]
+		if label == "" {
+			label = "VS"
+		}
+		return truncate64(fmt.Sprintf("NimJump: %s %s", label, nim))
 
 	case len(parts) >= 2 && parts[0] == "leaderboard":
 		periodType := parts[1] // "daily" or "weekly"

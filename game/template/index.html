@@ -31,6 +31,15 @@
   </style>
   $GODOT_HEAD_INCLUDE
   <link rel="icon" type="image/png" href="assets/icon/ico.png">
+  <!-- Nimiq Pay (and other mini-app hosts / "add to home screen" flows) don't
+       parse this page's <head> for the favicon link above — they read the
+       icon from a Web App Manifest instead, same convention the W3C MiniApp
+       Manifest spec inherits from PWAs. Without this, the game works fine in
+       a normal browser tab (favicon shows there) but shows no icon inside
+       Nimiq Pay's mini-app list. -->
+  <link rel="manifest" href="manifest.json">
+  <link rel="apple-touch-icon" href="assets/icon/ico.png">
+  <meta name="theme-color" content="#242424">
 
   <!-- ── DEV MODE ──────────────────────────────────────────────────────────────
        Add ?dev to URL to enable debug overlay, FPS counter, and verbose logs.
@@ -139,7 +148,15 @@
 
     function _effVol(bus) {
       if (_busMute[bus] || _busMute.Master) return 0;
-      return Math.max(0, Math.min(1, (_busVol[bus]||1) * (_busVol.Master||1)));
+      // BUG FIX: "x || 1" treats a real 0 (slider dragged all the way down —
+      // fully muted) as "unset" and silently snaps it back to full volume 1.
+      // _busVol always has real defaults seeded above, so there's no actual
+      // "unset" case to guard against — use the stored value as-is.
+      var b = _busVol[bus];
+      var m = _busVol.Master;
+      if (typeof b !== 'number' || isNaN(b)) b = 1;
+      if (typeof m !== 'number' || isNaN(m)) m = 1;
+      return Math.max(0, Math.min(1, b * m));
     }
     function _reg(name, url, bus, loop) {
       var a = new Audio();

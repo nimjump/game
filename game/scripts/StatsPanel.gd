@@ -123,7 +123,7 @@ func _build_ui() -> void:
 	hdr.alignment = BoxContainer.ALIGNMENT_CENTER
 	hdr_mc.add_child(hdr)
 
-	hdr.add_child(UITheme.lucide_icon("bar-chart-2", int(ref * 0.038), _C_BROWN))
+	hdr.add_child(UITheme.lucide_icon("bar-chart-2", int(ref * 0.038), _C_ORANGE))
 
 	var title := Label.new()
 	title.text = "STATISTICS"
@@ -339,6 +339,11 @@ func _build_ui() -> void:
 	for s in stats_defs:
 		var card := PanelContainer.new()
 		card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		# Safety net: label no longer wraps/clips itself (single line, natural
+		# width) — clip_contents makes the card border crop it cleanly instead
+		# of spilling into the next card, on the off chance a label+bigger-icon
+		# combo is wider than the card on a narrow screen.
+		card.clip_contents = true
 		var card_st := StyleBoxFlat.new()
 		card_st.bg_color = _C_CARD
 		card_st.border_color = _C_BORDER
@@ -356,20 +361,32 @@ func _build_ui() -> void:
 
 		var icon_row := HBoxContainer.new()
 		icon_row.add_theme_constant_override("separation", int(ref * 0.008))
+		# Pinned to the card's top-left corner (not centered) — SHRINK_BEGIN
+		# makes the row hug its own content width instead of stretching, and
+		# anchors that compact block to the left edge instead of the middle.
+		icon_row.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
 		cv.add_child(icon_row)
 
-		# Lucide icon — UITheme ile çizilir, renk garantili
-		var icon_rect := UITheme.lucide_icon(s["icon"], ic_s, _C_ORANGE)
+		# Lucide icon — UITheme ile çizilir, renk garantili. A bit bigger than
+		# before (1.045 → 1.35x) per request, still keyed off `ref` so it
+		# scales the same way across screen sizes.
+		var icon_rect := UITheme.lucide_icon(s["icon"], int(ic_s * 1.35), _C_ORANGE)
 		icon_row.add_child(icon_rect)
 
 		var lbl := Label.new()
 		lbl.text = s["label"]
-		lbl.clip_text = true
-		UITheme.apply_label(lbl, _C_MID, int(ref * 0.022))
+		lbl.clip_text = false
+		lbl.autowrap_mode = TextServer.AUTOWRAP_OFF   # single line, no wrap — was the vertical-text bug
+		# 0.026 matches the standard secondary/caption label size used across
+		# QuestPanel/LeaderboardPanel (most common size in the codebase) —
+		# 0.017 was inconsistent with the rest of the UI and unreadably small.
+		UITheme.apply_label(lbl, _C_MID, int(ref * 0.026))
 		icon_row.add_child(lbl)
 
 		var val_lbl := Label.new()
 		val_lbl.text = "0"
+		val_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		val_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		UITheme.apply_label(val_lbl, _C_ORANGE, fs_v)
 		cv.add_child(val_lbl)
 		_stat_labels[s["key"]] = val_lbl
@@ -427,6 +444,8 @@ func _build_ui() -> void:
 	UITheme.apply_label(tx_loading, _C_MID, int(ref * 0.026))
 	tx_loading.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	_reward_root.add_child(tx_loading)
+
+	UITheme.set_scroll_passthrough(_outer_vbox)
 
 
 func _add_cap_bar(vbox: VBoxContainer, pct: float, earned: int, cap_max: int, ref: float, is_full: bool) -> void:
@@ -676,7 +695,7 @@ func _on_stats_response(_result: int, response_code: int, _headers: PackedString
 		var pct     : float = clampf(earned / maxf(cap_max, 1.0), 0.0, 1.0)
 
 		if _stat_labels.has("cap_reset") and reset_at > 0:
-			var now_ts    : int = int(Time.get_unix_time_from_system())
+			var now_ts    : int = int(Time.get_unix_time_from_system())  # determinism-ok: UI "resets in Xh" label only
 			var secs_left : int = reset_at - now_ts
 			if secs_left > 3600:
 				_stat_labels["cap_reset"].text = "Resets in %dh" % (secs_left / 3600)
@@ -712,6 +731,7 @@ func _on_rewards_response(_result: int, response_code: int, _headers: PackedStri
 		UITheme.apply_label(err_lbl, _C_MID, int(minf(minf(get_viewport().get_visible_rect().size.x, get_viewport().get_visible_rect().size.y), GameConstants.VW) * 0.026))
 		err_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		_reward_root.add_child(err_lbl)
+		UITheme.set_scroll_passthrough(_outer_vbox)
 		return
 	var json := JSON.new()
 	if json.parse(body.get_string_from_utf8()) != OK:
@@ -736,6 +756,7 @@ func _build_rewards(rewards: Array) -> void:
 		UITheme.apply_label(lbl, _C_MID, int(ref * 0.026))
 		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		_reward_root.add_child(lbl)
+		UITheme.set_scroll_passthrough(_outer_vbox)
 		return
 
 	for rw in rewards:
@@ -807,6 +828,8 @@ func _build_rewards(rewards: Array) -> void:
 		sep_r.add_theme_color_override("color", _C_SEP)
 		_reward_root.add_child(sep_r)
 
+	UITheme.set_scroll_passthrough(_outer_vbox)
+
 
 func _build_recent(games: Array) -> void:
 	if not is_instance_valid(_recent_root):
@@ -824,6 +847,7 @@ func _build_recent(games: Array) -> void:
 		UITheme.apply_label(lbl, _C_MID, int(ref * 0.026))
 		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		_recent_root.add_child(lbl)
+		UITheme.set_scroll_passthrough(_outer_vbox)
 		return
 
 	for i in games.size():
@@ -899,6 +923,8 @@ func _build_recent(games: Array) -> void:
 			spacer.custom_minimum_size = Vector2(int(ref * 0.056), 0)
 			spacer.size_flags_horizontal = Control.SIZE_SHRINK_END
 			row.add_child(spacer)
+
+	UITheme.set_scroll_passthrough(_outer_vbox)
 
 
 # ---------------------------------------------------------------------------

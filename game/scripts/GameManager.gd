@@ -109,6 +109,11 @@ var _shake_timer    := 0.0
 var _shake_strength := 0.0
 
 var session_id      : String = ""
+# ── VS Rooms — set by Main._start_vs_round() right before _start_session(),
+# cleared after the submit body is built so a normal solo run right after a
+# VS match never gets mistakenly tagged. Empty vs_room_id = normal solo play.
+var vs_room_id      : String = ""
+var vs_role         : String = ""   # "creator" or "opponent"
 # ── MITM protection — one-time keys from prefetch ────────────────────
 
 # ── Quest counters (reset each match, printed as QUEST_RESULT on replay end) ──
@@ -692,10 +697,10 @@ func _simulate_gm_tick() -> void:
 				_after_delta_marker = false
 				_replay_tick_count += 1
 				if _replay_tick_count == 1:
-					_last_tick_ms = Time.get_ticks_msec()
+					_last_tick_ms = Time.get_ticks_msec()  # determinism-ok: only feeds the 0xFF delta-marker bytes, which server RLE decode skips over entirely (never affects simulation)
 				# Her 60 tick'te delta marker yaz
 				elif _replay_tick_count % 60 == 0:
-					var now_ms : int = Time.get_ticks_msec()
+					var now_ms : int = Time.get_ticks_msec()  # determinism-ok: see above, skipped bytes on decode
 					var tick_delta : int = clampi(now_ms - _last_tick_ms, 0, 65535)
 					_last_tick_ms = now_ms
 					_replay_log.append(0xFF)
@@ -2085,15 +2090,31 @@ func _ls_set_str(key: String, val: String) -> void:
 	JavaScriptBridge.eval("localStorage.setItem('%s','%s')" % [key, val], true)
 
 
-func _start_session() -> void:
+## forced_seed: used by VS Rooms — both sides of a match MUST play the exact
+## same seed, provided by the server at room-create time (see Main._vs_room_seed).
+## When set, skips local entropy generation entirely and just derives a
+## session_id from it via _make_local_session_id (still locally unique, but
+## game_seed itself is no longer random — that's the whole point of a VS match).
+func _start_session(forced_seed: int = 0) -> void:
+	if forced_seed != 0:
+		game_seed  = forced_seed & 0x7FFFFFFFFFFFFFFF
+		session_id = _make_local_session_id(game_seed)
+		print("[GM] _start_session VS forced_seed=%d session=%s" % [game_seed, session_id])
+		_init_game_from_seed()
+		return
+
 	# ── OFFLINE SEED: 128-bit entropy, fully local, zero server contact at play time ──
 	# hi and lo are independent 64-bit halves; game_seed = hi ^ lo (positive 63-bit).
 	# session_id = hex(hi) + hex(lo) = 32-char hex sent to server on submit.
 	# Birthday collision probability after 2M games ≈ 1/10^22 — mathematically impossible.
-	var t_usec : int = Time.get_ticks_usec()
-	var t_unix : int = Time.get_unix_time_from_system()
-	var rh1 : int = randi(); var rh2 : int = randi()
-	var rl1 : int = randi(); var rl2 : int = randi()
+	# determinism-ok: this generates game_seed itself (the ONE non-deterministic
+	# input allowed), runs once client-side before any replay recording starts.
+	# Everything downstream reads from _rng which is seeded from game_seed — none
+	# of this ever runs again during server replay.
+	var t_usec : int = Time.get_ticks_usec()  # determinism-ok
+	var t_unix : int = Time.get_unix_time_from_system()  # determinism-ok
+	var rh1 : int = randi(); var rh2 : int = randi()  # determinism-ok
+	var rl1 : int = randi(); var rl2 : int = randi()  # determinism-ok
 	var hi  : int = ((rh1 << 32) | (rh2 & 0xFFFFFFFF)) ^ t_usec
 	var lo  : int = ((rl1 << 32) | (rl2 & 0xFFFFFFFF)) ^ t_unix
 	if hi == 0: hi = t_usec | 0xBEEF0001
@@ -2108,7 +2129,7 @@ func _start_session() -> void:
 
 ## session_id = hex(hi) + hex(lo) — 32 hex chars, sent to server on submit
 func _make_local_session_id(seed_val: int) -> String:
-	var ts : int = Time.get_unix_time_from_system()
+	var ts : int = Time.get_unix_time_from_system()  # determinism-ok: session_id salt, not replayed
 	return "%016x%016x" % [seed_val & 0x7FFFFFFFFFFFFFFF, ts & 0x7FFFFFFFFFFFFFFF]
 
 ## All game-state reset logic (split out from old _apply_slot so replay can reuse it)
@@ -2831,7 +2852,7 @@ func _submit_session() -> void:
 		print("[SUBMIT] replay_log bytes=%d rle_decoded_ticks=%d recorded_ticks=%d player_seed=%d" % [_replay_log.size(), rle_ticks, _replay_tick_count, _replay_player_seed])
 
 	# ── Build submit payload — seed included, server verifies on receipt ──
-	var body := JSON.stringify({
+	var payload := {
 		"session":     session_id,
 		"seed":        str(game_seed),
 		"score":       score,
@@ -2842,8 +2863,17 @@ func _submit_session() -> void:
 		"nonce":       Time.get_unix_time_from_system() * 1000,
 		"replay_log":  replay_b64,
 		"player_seed": str(_replay_player_seed),
-	})
+		"client_version": GameVersion.CLIENT_VERSION,
+	}
+	if vs_room_id != "":
+		payload["vs_room_id"] = vs_room_id
+		payload["vs_role"]    = vs_role
+		print("[SUBMIT] tagging as VS room=%s role=%s" % [vs_room_id, vs_role])
+	var body := JSON.stringify(payload)
 	_send_submit_with_retry(session_id, body)
+	# One-shot tag — a solo run right after a VS match must not inherit it.
+	vs_room_id = ""
+	vs_role    = ""
 
 
 ## Payload ready — write to localStorage FIRST, THEN send.
@@ -2891,6 +2921,13 @@ func _send_submit_with_retry(sid: String, body: String) -> void:
 			print("[GM] submit 401 — no auth, keeping in queue until signed in")
 			_notify_auth_expired()
 			_ensure_retry_timer()
+		elif code == 409 and _b != null and _b.get_string_from_utf8().find("version_mismatch") != -1:
+			# Server rejected this replay because our client build is out of
+			# date compared to the server's configured replay version.
+			print("[GM] submit 409 version_mismatch — dropping sid=%s" % sid.left(8))
+			_pending_remove(sid)
+			Toast.get_instance().show_toast(
+				"Your game version is out of date. Please refresh the page to update.", Toast.Kind.WARN)
 		elif code >= 400 and code < 500:
 			# 400/403/409 etc. — permanent rejection, drop
 			print("[GM] submit %d — permanent rejection, dropping sid=%s" % [code, sid.left(8)])

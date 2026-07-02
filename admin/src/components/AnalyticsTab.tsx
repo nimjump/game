@@ -259,7 +259,7 @@ export default function AnalyticsTab() {
                 <tr><th>Player</th><th>Amount</th><th>Reason</th><th>Sent At</th><th>Tx</th></tr>
               </thead>
               <tbody>
-                {recent_payments.map(r => <PaymentRow key={r.id} r={r} />)}
+                {recent_payments.slice(0, 5).map(r => <PaymentRow key={r.id} r={r} />)}
               </tbody>
             </table>
           )}

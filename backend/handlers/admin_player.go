@@ -177,16 +177,14 @@ func (s *Server) handleAdminPlayer(ctx *fasthttp.RequestCtx) {
 	}
 
 	// ── Leaderboard rank ─────────────────────────────────────────────────────
-	dailyRank, weeklyRank, alltimeRank := 0, 0, 0
+	// (all-time removed from the admin panel — daily/weekly only)
+	dailyRank, weeklyRank := 0, 0
 	dailyPeriod, weeklyPeriod := game.CurrentPeriods()
 	if entries, err := s.Store.GetLeaderboardPaged("daily", dailyPeriod, 0, 0, playerID); err == nil {
 		for _, e := range entries { if e.PlayerID == playerID { dailyRank = e.Rank; break } }
 	}
 	if entries, err := s.Store.GetLeaderboardPaged("weekly", weeklyPeriod, 0, 0, playerID); err == nil {
 		for _, e := range entries { if e.PlayerID == playerID { weeklyRank = e.Rank; break } }
-	}
-	if entries, err := s.Store.GetLeaderboardPaged("alltime", "", 0, 0, playerID); err == nil {
-		for _, e := range entries { if e.PlayerID == playerID { alltimeRank = e.Rank; break } }
 	}
 
 	// ── Reward history ────────────────────────────────────────────────────────
@@ -211,7 +209,6 @@ func (s *Server) handleAdminPlayer(ctx *fasthttp.RequestCtx) {
 		"leaderboard": map[string]any{
 			"daily_rank":   dailyRank,
 			"weekly_rank":  weeklyRank,
-			"alltime_rank": alltimeRank,
 			"daily_period": dailyPeriod,
 			"weekly_period": weeklyPeriod,
 		},

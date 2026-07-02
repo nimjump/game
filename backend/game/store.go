@@ -16,7 +16,63 @@ const keyDevMode = "cfg:developer_mode"
 
 type Store struct{ db *badger.DB }
 
-func NewStore(db *badger.DB) *Store { return &Store{db: db} }
+// globalStore — set once by NewStore(). There is only ever one Store in
+// this app; this lets a handful of free functions that don't carry a
+// *Store reference (ArchiveFailedReplay, called from deep inside the
+// worker pool) still reach the DB. Everything else should keep taking a
+// *Store parameter/receiver as normal — this is a narrow exception, not
+// a pattern to copy.
+var globalStore *Store
+
+func NewStore(db *badger.DB) *Store {
+	s := &Store{db: db}
+	globalStore = s
+	return s
+}
+
+// clearPrefix — deletes every key under the given prefix, batching the
+// deletes so a very large category can't blow past Badger's per-transaction
+// size limit.
+func (s *Store) clearPrefix(prefix string) (int, error) {
+	var keys [][]byte
+	err := s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.PrefetchValues = false
+		opts.Prefix = []byte(prefix)
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.Valid(); it.Next() {
+			k := make([]byte, len(it.Item().Key()))
+			copy(k, it.Item().Key())
+			keys = append(keys, k)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	deleted := 0
+	const batchSize = 1000
+	for i := 0; i < len(keys); i += batchSize {
+		end := i + batchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batch := keys[i:end]
+		err = s.db.Update(func(txn *badger.Txn) error {
+			for _, k := range batch {
+				if derr := txn.Delete(k); derr == nil {
+					deleted++
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return deleted, err
+		}
+	}
+	return deleted, nil
+}
 
 // GetDeveloperMode — returns whether developer mode is currently enabled
 func (s *Store) GetDeveloperMode() bool {
@@ -206,4 +262,49 @@ func (s *Store) Delete(sessionID string) error {
 	return s.db.Update(func(txn *badger.Txn) error {
 		return txn.Delete(key(sessionID))
 	})
+}
+
+// ClearAllReplayLogs — wipes the replay log (and replay error) off every
+// session, but keeps the session itself — score, state, quest totals,
+// rewards already paid out, everything else stays intact. Used by the
+// admin "Remove All Replays" button when pushing a new client/replay
+// binary, so old replay logs (recorded against the old build) don't
+// linger around no longer matching anything.
+func (s *Store) ClearAllReplayLogs() (int, error) {
+	var ids []string
+	err := s.db.View(func(txn *badger.Txn) error {
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		pfx := []byte("s:")
+		for it.Seek(pfx); it.ValidForPrefix(pfx); it.Next() {
+			_ = it.Item().Value(func(v []byte) error {
+				var sess models.Session
+				if err := json.Unmarshal(v, &sess); err != nil {
+					return nil
+				}
+				if sess.Log != "" {
+					ids = append(ids, sess.SessionID)
+				}
+				return nil
+			})
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	cleared := 0
+	for _, id := range ids {
+		sess, gerr := s.Get(id)
+		if gerr != nil || sess == nil {
+			continue
+		}
+		sess.Log = ""
+		sess.ReplayError = ""
+		if serr := s.Save(sess); serr == nil {
+			cleared++
+		}
+	}
+	return cleared, nil
 }

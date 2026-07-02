@@ -12,39 +12,33 @@ function fmt(ts: number) {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString("en-GB");
 }
+function fmtGB(bytes: number) {
+  return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
+}
+
+function UsageBar({ label, used, total }: { label: string; used: number; total: number }) {
+  const pct = total > 0 ? Math.min(100, (used / total) * 100) : 0;
+  const color = pct > 90 ? "var(--red)" : pct > 75 ? "var(--yellow)" : "var(--green)";
+  return (
+    <div style={{ flex: 1, minWidth: 200 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, marginBottom: 4 }}>
+        <span style={{ color: "var(--text-muted)" }}>{label}</span>
+        <span style={{ fontWeight: 600 }}>
+          {total > 0 ? `${fmtGB(used)} / ${fmtGB(total)} (${pct.toFixed(0)}%)` : "n/a"}
+        </span>
+      </div>
+      <div style={{ background: "var(--surface2)", borderRadius: 4, height: 8 }}>
+        <div style={{ background: color, borderRadius: 4, height: 8, width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
 
 interface Props { ov: Overview; }
 
 export default function OverviewTab({ ov }: Props) {
   return (
-    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
-
-      {/* Currently playing */}
-      <div className="card">
-        <div style={{ padding: "12px 16px", borderBottom: "1px solid var(--border)", fontWeight: 600, fontSize: 13 }}>
-          🎮 Currently playing ({(ov.active_sessions ?? []).length})
-        </div>
-        {(ov.active_sessions ?? []).length === 0 ? (
-          <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)", fontSize: 13 }}>No active sessions</div>
-        ) : (
-          <table>
-            <thead><tr><th>Player</th><th>Duration</th></tr></thead>
-            <tbody>
-              {(ov.active_sessions ?? []).map((s: Session) => (
-                <tr key={s.session_id}>
-                  <td>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <NimiqAvatar address={s.player_id} size={26} />
-                      <span style={{ fontSize: 12 }}>{s.nickname || (s.player_id ? s.player_id.slice(0, 12) + "…" : "—")}</span>
-                    </div>
-                  </td>
-                  <td style={{ color: "var(--green)", fontWeight: 600 }}>{fmtDur(s.elapsed_sec ?? 0)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+    <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
 
       {/* Recent sessions */}
       <div className="card">
@@ -105,10 +99,21 @@ export default function OverviewTab({ ov }: Props) {
         <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--text-muted)" }}>
           ⬆ {fmtDur(ov.system.uptime_sec)} &nbsp;·&nbsp;
           {ov.system.goroutines}g &nbsp;·&nbsp;
-          {ov.system.heap_mb}MB &nbsp;·&nbsp;
+          {ov.system.heap_mb}MB heap &nbsp;·&nbsp;
           {ov.system.cpu_count}cpu
         </span>
       </div>
+
+      {/* Server resources — RAM + disk */}
+      {ov.resources && (ov.resources.ram_total_bytes > 0 || ov.resources.disk_total_bytes > 0) && (
+        <div className="card" style={{ gridColumn: "1 / -1", padding: "12px 20px" }}>
+          <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 10 }}>🖥 Server Resources</div>
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
+            <UsageBar label="RAM" used={ov.resources.ram_used_bytes} total={ov.resources.ram_total_bytes} />
+            <UsageBar label={`Disk (DB_PATH volume)`} used={ov.resources.disk_used_bytes} total={ov.resources.disk_total_bytes} />
+          </div>
+        </div>
+      )}
 
     </div>
   );

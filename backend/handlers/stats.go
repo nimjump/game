@@ -250,8 +250,19 @@ func (s *Server) handleLeaderboard(ctx *fasthttp.RequestCtx) {
 		entries = []game.LBEntry{}
 	}
 
-	log.Printf("[LEADERBOARD] period_type=%s period=%s offset=%d limit=%d count=%d",
-		periodType, period, offset, limit, len(entries))
+	// enabled — daily/weekly can be turned off from the admin panel; alltime
+	// is always on. Client uses this to decide whether to show the tab.
+	appCfg := s.Store.GetAppConfig()
+	enabled := true
+	switch periodType {
+	case "daily":
+		enabled = appCfg.DailyLeaderboardEnabled
+	case "weekly":
+		enabled = appCfg.WeeklyLeaderboardEnabled
+	}
+
+	log.Printf("[LEADERBOARD] period_type=%s period=%s offset=%d limit=%d count=%d enabled=%v",
+		periodType, period, offset, limit, len(entries), enabled)
 
 	writeJSON(ctx, 200, map[string]any{
 		"entries":     entries,
@@ -260,6 +271,7 @@ func (s *Server) handleLeaderboard(ctx *fasthttp.RequestCtx) {
 		"limit":       limit,
 		"offset":      offset,
 		"count":       len(entries),
+		"enabled":     enabled,
 	})
 }
 

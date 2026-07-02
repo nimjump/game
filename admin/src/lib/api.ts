@@ -1,6 +1,18 @@
 export const BASE     = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8080";
 export const GAME_URL = process.env.NEXT_PUBLIC_GAME_URL   ?? "https://nimjump.io";
 
+// Every call below goes through this instead of the global fetch, so the
+// admin session cookie (see backend/handlers/admin_session.go) always gets
+// sent — including in dev, where this app runs standalone on ADMIN_PORT and
+// BASE points at a different origin (the backend's PORT). In production the
+// proxy makes both same-origin, where this is a no-op (cookies already go
+// out by default), but it doesn't hurt there either.
+const rawFetch: typeof globalThis.fetch =
+  typeof window !== "undefined" ? window.fetch.bind(window) : globalThis.fetch;
+function fetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  return rawFetch(input, { credentials: "include", ...init });
+}
+
 export interface Session {
   session_id: string;
   seed: string;
@@ -66,6 +78,12 @@ export interface Overview {
     uptime_sec: number;
     cpu_count: number;
   };
+  resources?: {
+    ram_total_bytes: number;
+    ram_used_bytes: number;
+    disk_total_bytes: number;
+    disk_used_bytes: number;
+  };
   active_sessions: Session[];
   recent_sessions: Session[];
   server_time: number;
@@ -120,8 +138,10 @@ export async function fetchClientLogs(level?: string): Promise<{ logs: ClientLog
   return { logs: data.logs ?? [], total: data.total ?? (data.logs?.length ?? 0) };
 }
 
-export async function deleteClientLogs(): Promise<void> {
-  await fetch(`${BASE}/backend/admin/client-logs`, { method: "DELETE" });
+export async function deleteClientLogs(): Promise<{ ok: boolean; deleted: number }> {
+  const r = await fetch(`${BASE}/backend/admin/client-logs`, { method: "DELETE" });
+  if (!r.ok) throw new Error("delete client logs failed");
+  return r.json();
 }
 
 export async function fetchFailedReplays(): Promise<FailedReplay[]> {
@@ -131,16 +151,37 @@ export async function fetchFailedReplays(): Promise<FailedReplay[]> {
   return data.sessions ?? [];
 }
 
-export async function retryReplay(sessionId: string): Promise<void> {
-  await fetch(`${BASE}/backend/admin/replay-retry/${sessionId}`, { method: "POST" });
+export interface ReplayRetryResult {
+  ok: boolean;
+  session_id?: string;
+  server_score?: number;
+  client_score?: number;
+  flagged?: boolean;
+  reason?: string;
+  error?: string;
+}
+
+// Deliberately does NOT throw on a non-2xx response (e.g. sim_error,
+// no_replay_log) — callers branch on `res.ok`/`res.reason`/`res.error`
+// themselves, same pattern as adminSessionAction below.
+export async function retryReplay(sessionId: string): Promise<ReplayRetryResult> {
+  const r = await fetch(`${BASE}/backend/admin/replay-retry/${sessionId}`, { method: "POST" });
+  const data = await r.json().catch(() => ({}));
+  return data as ReplayRetryResult;
 }
 
 export type SessionAction = "approve" | "unflag" | "reject" | "retry";
 
 export interface SessionActionResult {
   ok: boolean;
-  message?: string;
+  action?: string;
+  session_id?: string;
+  state?: string;
+  reason?: string;
+  flagged?: boolean;
   server_score?: number;
+  message?: string;
+  error?: string;
 }
 
 export async function adminSessionAction(
@@ -157,9 +198,11 @@ export async function adminSessionAction(
   return data as SessionActionResult;
 }
 
+// Matches questOut in backend/handlers/admin_player.go — id/type, not
+// quest_id/name; "description" is the only display label the backend sends.
 export interface PlayerQuest {
-  quest_id: string;
-  name: string;
+  id: string;
+  type: string;
   description: string;
   target: number;
   progress: number;
@@ -168,10 +211,13 @@ export interface PlayerQuest {
   reward_nim: number;
 }
 
+// Matches game.DailyCapStats's JSON tags (backend/game/daily_earn_cap.go).
 export interface DailyCapStats {
-  earned_today: number;
+  daily_earned: number;
   daily_cap: number;
-  remaining: number;
+  daily_cap_remaining: number;
+  daily_cap_reset_at: number;
+  daily_cap_full: boolean;
 }
 
 export interface PendingReward {
@@ -185,20 +231,47 @@ export interface PendingReward {
   tx_hash?: string;
 }
 
+// Matches the map[string]any built by handleAdminPlayer in
+// backend/handlers/admin_player.go — session fields here are a subset of
+// Session (this endpoint builds its own trimmed sessionOut shape, not the
+// full Session type used elsewhere).
+export interface PlayerProfileSession {
+  session_id: string;
+  state: string;
+  client_score: number;
+  server_score: number;
+  ticks: number;
+  char: number;
+  flagged: boolean;
+  reason?: string;
+  replay_error?: string;
+  submitted_at: number;
+  has_log: boolean;
+}
+
 export interface PlayerProfile {
   player_id: string;
   nickname: string;
-  total_sessions: number;
-  total_score: number;
+  cooldown_end: number;
+  stats: {
+    best_score: number;
+    total_games: number;
+    total_ticks: number;
+    total_kills: number;
+    total_platforms: number;
+  };
   daily_cap: DailyCapStats;
   quests: PlayerQuest[];
+  quest_nim_today: number;
+  quest_nim_claimed: number;
   leaderboard: {
-    daily?: { rank: number; score: number };
-    weekly?: { rank: number; score: number };
-    alltime?: { rank: number; score: number };
+    daily_rank?: number;
+    weekly_rank?: number;
+    daily_period?: string;
+    weekly_period?: string;
   };
-  recent_sessions: Session[];
-  reward_history: PendingReward[];
+  recent_sessions: PlayerProfileSession[];
+  rewards: PendingReward[];
 }
 
 export async function searchPlayer(q: string): Promise<PlayerProfile | null> {
@@ -221,10 +294,15 @@ export interface LeaderboardResponse {
   period_type: string;
   period: string;
   entries: LBEntry[];
+  enabled?: boolean;
 }
 
+// Backend expects "period_type", not "type" (see handleLeaderboard in
+// backend/handlers/stats.go) — using the wrong param name meant this
+// silently always fell back to the daily leaderboard, regardless of
+// which tab was selected.
 export async function fetchLeaderboard(periodType: string, limit = 100): Promise<LeaderboardResponse> {
-  const r = await fetch(`${BASE}/backend/leaderboard?type=${periodType}&limit=${limit}`, { cache: "no-store" });
+  const r = await fetch(`${BASE}/backend/leaderboard?period_type=${periodType}&limit=${limit}`, { cache: "no-store" });
   if (!r.ok) throw new Error("leaderboard fetch failed");
   return r.json();
 }
@@ -316,4 +394,379 @@ export async function fetchPlayersList(): Promise<PlayersListResponse> {
   const r = await fetch(`${BASE}/backend/admin/players`, { cache: "no-store" });
   if (!r.ok) throw new Error("players list fetch failed");
   return r.json();
+}
+
+// ── App config: leaderboard toggles, update mode, replay version ───────────────
+
+export interface AppConfig {
+  daily_leaderboard_enabled: boolean;
+  weekly_leaderboard_enabled: boolean;
+  update_mode: "off" | "force" | "normal";
+  update_active: boolean;
+  update_scheduled_week?: string;
+  replay_version: number;
+}
+
+export async function fetchAppConfig(): Promise<AppConfig> {
+  const r = await fetch(`${BASE}/backend/admin/config`, { cache: "no-store" });
+  if (!r.ok) throw new Error("config fetch failed");
+  return r.json();
+}
+
+export async function saveAppConfig(patch: Partial<{
+  daily_leaderboard_enabled: boolean;
+  weekly_leaderboard_enabled: boolean;
+  replay_version: number;
+}>): Promise<AppConfig> {
+  const r = await fetch(`${BASE}/backend/admin/config`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!r.ok) throw new Error("config save failed");
+  return r.json();
+}
+
+export async function setUpdateMode(mode: "off" | "force" | "normal"): Promise<AppConfig> {
+  const r = await fetch(`${BASE}/backend/admin/update-mode`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode }),
+  });
+  if (!r.ok) throw new Error("update-mode failed");
+  return r.json();
+}
+
+export async function completeUpdate(): Promise<AppConfig> {
+  const r = await fetch(`${BASE}/backend/admin/update-complete`, { method: "POST" });
+  if (!r.ok) throw new Error("update-complete failed");
+  return r.json();
+}
+
+export async function clearAllReplays(): Promise<{ ok: boolean; sessions_cleared: number; archive_deleted: number }> {
+  const r = await fetch(`${BASE}/backend/admin/replays/clear-all`, { method: "POST" });
+  if (!r.ok) throw new Error("clear-all-replays failed");
+  return r.json();
+}
+
+// ── Replay verifier binary (upload / status) ────────────────────────────────────
+
+export interface ReplayBinaryFile {
+  name: string;
+  size: number;
+  modified_at: number;
+}
+
+export interface ReplayBinaryStatus {
+  dir: string;
+  healthy: boolean;
+  binary: string;
+  files: ReplayBinaryFile[];
+}
+
+export async function fetchReplayBinaryStatus(): Promise<ReplayBinaryStatus> {
+  const r = await fetch(`${BASE}/backend/admin/replay-binary`, { cache: "no-store" });
+  if (!r.ok) throw new Error("replay-binary status fetch failed");
+  return r.json();
+}
+
+// ── Database tab ─────────────────────────────────────────────────────────────
+
+export interface DBCategory {
+  key: string;
+  prefix: string;
+  label: string;
+  description: string;
+  dangerous: boolean;
+  count: number;
+}
+
+export async function fetchDatabaseOverview(): Promise<DBCategory[]> {
+  const r = await fetch(`${BASE}/backend/admin/database`, { cache: "no-store" });
+  if (!r.ok) throw new Error("database overview fetch failed");
+  const data = await r.json();
+  return data.categories ?? [];
+}
+
+export async function clearDatabaseCategory(category: string): Promise<{ ok: boolean; deleted: number }> {
+  const r = await fetch(`${BASE}/backend/admin/database/clear`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ category }),
+  });
+  if (!r.ok) throw new Error("clear category failed");
+  return r.json();
+}
+
+export interface FailedReplayEntry {
+  id: string;
+  session_id?: string;
+  seed?: string;
+  char: number;
+  category: string;
+  reason?: string;
+  extra?: Record<string, unknown>;
+  archived_at: number;
+  has_log: boolean;
+}
+
+export async function fetchFailedReplayArchive(): Promise<FailedReplayEntry[]> {
+  const r = await fetch(`${BASE}/backend/admin/failed-replay-archive`, { cache: "no-store" });
+  if (!r.ok) throw new Error("failed-replay archive fetch failed");
+  const data = await r.json();
+  return data.entries ?? [];
+}
+
+export function failedReplayDownloadUrl(id: string): string {
+  return `${BASE}/backend/admin/failed-replay-archive/${encodeURIComponent(id)}/download`;
+}
+
+export async function uploadReplayBinary(file: File, stage = false): Promise<{ ok: boolean; file: string; size: number; dir: string; staged: boolean }> {
+  const form = new FormData();
+  form.append("file", file);
+  if (stage) form.append("stage", "1");
+  const r = await fetch(`${BASE}/backend/admin/replay-binary`, { method: "POST", body: form });
+  if (!r.ok) {
+    let msg = "upload failed";
+    try { const d = await r.json(); msg = d.error || msg; } catch {}
+    throw new Error(msg);
+  }
+  return r.json();
+}
+
+// ── Deploy tab: scheduled Cloudflare Pages / replay binary jobs ─────────────────
+
+export interface DeployStatus {
+  cloudflare_configured: boolean;
+  cloudflare_project: string;
+  cloudflare_export_dir: string;
+  cloudflare_branch: string;
+  staged_binary: string;
+  has_staged_binary: boolean;
+}
+
+export async function fetchDeployStatus(): Promise<DeployStatus> {
+  const r = await fetch(`${BASE}/backend/admin/deploy/status`, { cache: "no-store" });
+  if (!r.ok) throw new Error("deploy status fetch failed");
+  return r.json();
+}
+
+export type DeployTrigger = "now" | "at" | "daily_lb_end" | "weekly_lb_end";
+
+export interface DeployJob {
+  id: string;
+  trigger: DeployTrigger;
+  run_at: number;
+  activate_replay_binary: boolean;
+  deploy_cloudflare: boolean;
+  new_replay_version?: number;
+  status: "pending" | "running" | "done" | "failed" | "cancelled";
+  log?: string[];
+  error?: string;
+  created_at: number;
+  started_at?: number;
+  finished_at?: number;
+}
+
+export async function scheduleDeployJob(params: {
+  trigger: DeployTrigger;
+  at_unix?: number;
+  activate_replay_binary: boolean;
+  deploy_cloudflare: boolean;
+  new_replay_version?: number;
+}): Promise<DeployJob> {
+  const r = await fetch(`${BASE}/backend/admin/deploy/schedule`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(params),
+  });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || "schedule failed");
+  return data;
+}
+
+export async function fetchDeployJobs(): Promise<DeployJob[]> {
+  const r = await fetch(`${BASE}/backend/admin/deploy/jobs`, { cache: "no-store" });
+  if (!r.ok) throw new Error("deploy jobs fetch failed");
+  const data = await r.json();
+  return data.jobs ?? [];
+}
+
+export async function cancelDeployJob(id: string): Promise<void> {
+  const r = await fetch(`${BASE}/backend/admin/deploy/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || "cancel failed");
+}
+
+// ── Golden replays: determinism regression tests (backend/game/golden_replay.go) ──
+
+export interface GoldenReplay {
+  id: string;
+  label: string;
+  source_session?: string;
+  seed: number;
+  char: number;
+  expected_score: number;
+  expected_ticks: number;
+  saved_at: number;
+}
+
+export interface GoldenReplayResult {
+  id: string;
+  label: string;
+  pass: boolean;
+  expected_score: number;
+  actual_score: number;
+  expected_ticks: number;
+  actual_ticks: number;
+  error?: string;
+}
+
+export interface GoldenSelfTestResponse {
+  results: GoldenReplayResult[];
+  total: number;
+  failed: number;
+  pass: boolean;
+}
+
+export async function fetchGoldenReplays(): Promise<{ goldens: GoldenReplay[]; count: number }> {
+  const r = await fetch(`${BASE}/backend/admin/golden-replays`, { cache: "no-store" });
+  if (!r.ok) throw new Error("golden replays fetch failed");
+  return r.json();
+}
+
+export async function saveGoldenReplay(sessionId: string, label: string): Promise<{ ok: boolean }> {
+  const r = await fetch(`${BASE}/backend/admin/golden-replays`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, label }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || "save failed");
+  return data;
+}
+
+export async function deleteGoldenReplay(id: string): Promise<{ ok: boolean }> {
+  const r = await fetch(`${BASE}/backend/admin/golden-replays/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+  if (!r.ok) throw new Error("delete failed");
+  return r.json();
+}
+
+export async function runGoldenSelfTest(): Promise<GoldenSelfTestResponse> {
+  const r = await fetch(`${BASE}/backend/admin/golden-replays/self-test`, { method: "POST" });
+  if (!r.ok) throw new Error("self-test failed");
+  return r.json();
+}
+
+// ── Static determinism lint (backend/game/determinism_lint.go) ─────────────
+
+export interface DeterminismFinding {
+  file: string;
+  line: number;
+  rule: string;
+  severity: "warn" | "info";
+  message: string;
+  snippet: string;
+}
+
+export interface DeterminismLintResponse {
+  findings: DeterminismFinding[];
+  total: number;
+  warnings: number;
+  clean: boolean;
+}
+
+export async function fetchDeterminismLint(): Promise<DeterminismLintResponse> {
+  const r = await fetch(`${BASE}/backend/admin/determinism-lint`, { cache: "no-store" });
+  if (!r.ok) throw new Error("determinism lint failed");
+  return r.json();
+}
+
+// ── VS Rooms: async 1v1 challenge (backend/game/vsroom.go) ─────────────────
+
+export interface VSRoom {
+  id: string;
+  seed: string;
+  entry_nim: number;
+  is_private: boolean;
+  creator_id: string;
+  creator_nickname: string;
+  creator_paid: boolean;
+  creator_pay_tx?: string;
+  creator_score?: number;
+  creator_session?: string;
+  creator_played_at?: number;
+  opponent_id?: string;
+  opponent_nickname?: string;
+  opponent_paid: boolean;
+  opponent_pay_tx?: string;
+  opponent_score?: number;
+  opponent_session?: string;
+  opponent_played_at?: number;
+  status: string;
+  winner_id?: string;
+  payout_nim?: number;
+  fee_nim?: number;
+  payout_tx_hash?: string;
+  payout_tx_hash_2?: string;
+  settled_at?: number;
+  created_at: number;
+  expires_at: number;
+}
+
+export async function fetchVSRooms(): Promise<{ rooms: VSRoom[] }> {
+  const r = await fetch(`${BASE}/backend/admin/vs-rooms`, { cache: "no-store" });
+  if (!r.ok) throw new Error("vs rooms fetch failed");
+  const data = await r.json();
+  return { rooms: data.rooms || [] };
+}
+
+export async function sweepVSRooms(): Promise<{ ok: boolean }> {
+  const r = await fetch(`${BASE}/backend/admin/vs-rooms/sweep`, { method: "POST" });
+  if (!r.ok) throw new Error("sweep failed");
+  return r.json();
+}
+
+export async function reconcileVSPayments(): Promise<{ ok: boolean }> {
+  const r = await fetch(`${BASE}/backend/admin/vs-rooms/reconcile-payments`, { method: "POST" });
+  if (!r.ok) throw new Error("reconcile failed");
+  return r.json();
+}
+
+export async function cancelVSRoomAdmin(id: string): Promise<{ ok: boolean; room: VSRoom }> {
+  const r = await fetch(`${BASE}/backend/admin/vs-rooms/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || "cancel failed");
+  return data;
+}
+
+// ── Auth (session-cookie login, see backend/handlers/admin_session.go) ─────
+
+export async function adminLogin(username: string, password: string): Promise<void> {
+  const r = await fetch(`${BASE}/backend/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || "login_failed");
+}
+
+export async function adminLogout(): Promise<void> {
+  await fetch(`${BASE}/backend/admin/logout`, { method: "POST" });
+}
+
+export async function adminMe(): Promise<boolean> {
+  try {
+    const r = await fetch(`${BASE}/backend/admin/me`, { cache: "no-store" });
+    if (!r.ok) return false;
+    const data = await r.json();
+    return !!data.authenticated;
+  } catch {
+    return false;
+  }
 }

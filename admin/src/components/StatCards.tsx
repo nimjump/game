@@ -1,7 +1,6 @@
 "use client";
 import type { Overview } from "@/lib/api";
-
-type Tab = "overview" | "active" | "completed" | "flagged" | "all" | "failed_replays" | "logs";
+import type { Tab } from "@/app/page";
 
 interface Props {
   ov: Overview;

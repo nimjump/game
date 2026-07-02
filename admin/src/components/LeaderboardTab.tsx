@@ -3,12 +3,13 @@ import { useEffect, useState } from "react";
 import { fetchLeaderboard, type LBEntry } from "@/lib/api";
 import NimiqAvatar from "@/components/NimiqAvatar";
 
-type Period = "daily" | "weekly" | "alltime";
+type Period = "daily" | "weekly";
 
 export default function LeaderboardTab() {
   const [period,  setPeriod]  = useState<Period>("daily");
   const [entries, setEntries] = useState<LBEntry[]>([]);
   const [label,   setLabel]   = useState("");
+  const [enabled, setEnabled] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState("");
 
@@ -18,6 +19,7 @@ export default function LeaderboardTab() {
       const res = await fetchLeaderboard(p, 100);
       setEntries(res.entries ?? []);
       setLabel(res.period || p);
+      setEnabled(res.enabled ?? true);
     } catch (e: unknown) {
       setError(String(e instanceof Error ? e.message : e));
     } finally {
@@ -31,7 +33,7 @@ export default function LeaderboardTab() {
     <div>
       {/* Period selector */}
       <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
-        {(["daily", "weekly", "alltime"] as Period[]).map(p => (
+        {(["daily", "weekly"] as Period[]).map(p => (
           <button key={p}
             className={period === p ? "btn btn-active" : "btn"}
             onClick={() => setPeriod(p)}
@@ -46,6 +48,9 @@ export default function LeaderboardTab() {
           <span style={{ alignSelf: "center", fontSize: 12, color: "var(--text-muted)" }}>
             Period: {label}
           </span>
+        )}
+        {!enabled && (
+          <span className="badge badge-yellow">⚠ {period} leaderboard is disabled (System tab)</span>
         )}
       </div>
 

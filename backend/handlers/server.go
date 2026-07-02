@@ -35,31 +35,82 @@ func (s *Server) Register(r *router.Router) {
 		return s.rl.Middleware(h, isAuthed)
 	}
 
-	// Admin endpoints bypass rate limiting (only you use these)
-	r.GET("/backend/developer-mode",            s.handleDeveloperModeGet)
-	r.POST("/backend/admin/developer-mode",     s.handleDeveloperModeSet)
-	r.POST("/backend/admin/prizes",            s.handleAdminSetPrizes)
-	r.POST("/backend/admin/snapshot",          s.handleAdminSnapshot)
-	r.POST("/backend/admin/nimiq-config",      s.handleAdminNimiqConfig)
-	r.GET("/backend/admin/nimiq-config",       s.handleAdminNimiqConfigGet)
-	r.GET("/backend/admin/nimiq-balance",      s.handleAdminNimiqBalance)
-	r.GET("/backend/admin/rewards",            s.handleAdminRewards)
-	r.POST("/backend/admin/rewards/retry",     s.handleAdminRetryRewards)
-	r.POST("/backend/admin/test-telegram",     s.handleAdminTestTelegram)
-	r.GET("/backend/admin/devices",             s.handleAdminDevices)
-	r.GET("/backend/admin/devices/{device_id}", s.handleAdminDevice)
-	r.POST("/backend/admin/test-replay",        s.handleAdminTestReplay)
-	r.GET("/backend/admin/overview",            s.handleAdminOverview)
-	r.GET("/backend/admin/sessions",            s.handleAdminSessions)
-	r.GET("/backend/admin/worker-status",       s.handleAdminWorkerStatus)
-	r.POST("/backend/admin/replay-retry/{session_id}", s.handleAdminReplayRetry)
-	r.GET("/backend/admin/client-logs",              s.handleAdminClientLogs)
-	r.DELETE("/backend/admin/client-logs",           s.handleAdminDeleteClientLogs)
-	r.GET("/backend/admin/replay-failed",            s.handleAdminReplayFailed)
-	r.GET("/backend/admin/player",                   s.handleAdminPlayer)
-	r.GET("/backend/admin/players",                  s.handleAdminPlayersList)
-	r.POST("/backend/admin/session/{session_id}",    s.handleAdminSessionPatch)
-	r.GET("/backend/admin/analytics",               s.handleAdminAnalytics)
+	// Admin login — no auth required to reach these (this IS the auth).
+	r.POST("/backend/admin/login",  s.handleAdminLogin)
+	r.POST("/backend/admin/logout", s.handleAdminLogout)
+	r.GET("/backend/admin/me",      s.handleAdminMe)
+
+	// Admin endpoints — exposed to the public internet, so every one of
+	// these is protected by a session cookie (see admin_session.go; set
+	// via POST /backend/admin/login, checked against ADMIN_USERNAME /
+	// ADMIN_PASSWORD). They bypass rate limiting (only admins use these).
+	r.GET("/backend/developer-mode",            s.handleDeveloperModeGet) // public, read-only — no auth needed
+	r.POST("/backend/admin/developer-mode",     s.requireAdminSession(s.handleDeveloperModeSet))
+	r.POST("/backend/admin/prizes",            s.requireAdminSession(s.handleAdminSetPrizes))
+	r.POST("/backend/admin/snapshot",          s.requireAdminSession(s.handleAdminSnapshot))
+	r.POST("/backend/admin/nimiq-config",      s.requireAdminSession(s.handleAdminNimiqConfig))
+	r.GET("/backend/admin/nimiq-config",       s.requireAdminSession(s.handleAdminNimiqConfigGet))
+	r.GET("/backend/admin/nimiq-balance",      s.requireAdminSession(s.handleAdminNimiqBalance))
+	r.GET("/backend/admin/rewards",            s.requireAdminSession(s.handleAdminRewards))
+	r.POST("/backend/admin/rewards/retry",     s.requireAdminSession(s.handleAdminRetryRewards))
+	r.POST("/backend/admin/test-telegram",     s.requireAdminSession(s.handleAdminTestTelegram))
+	r.GET("/backend/admin/devices",             s.requireAdminSession(s.handleAdminDevices))
+	r.GET("/backend/admin/devices/{device_id}", s.requireAdminSession(s.handleAdminDevice))
+	r.POST("/backend/admin/test-replay",        s.requireAdminSession(s.handleAdminTestReplay))
+	r.GET("/backend/admin/overview",            s.requireAdminSession(s.handleAdminOverview))
+	r.GET("/backend/admin/sessions",            s.requireAdminSession(s.handleAdminSessions))
+	r.GET("/backend/admin/worker-status",       s.requireAdminSession(s.handleAdminWorkerStatus))
+	r.POST("/backend/admin/replay-retry/{session_id}", s.requireAdminSession(s.handleAdminReplayRetry))
+	r.GET("/backend/admin/client-logs",              s.requireAdminSession(s.handleAdminClientLogs))
+	r.DELETE("/backend/admin/client-logs",           s.requireAdminSession(s.handleAdminDeleteClientLogs))
+	r.GET("/backend/admin/replay-failed",            s.requireAdminSession(s.handleAdminReplayFailed))
+	r.GET("/backend/admin/player",                   s.requireAdminSession(s.handleAdminPlayer))
+	r.GET("/backend/admin/players",                  s.requireAdminSession(s.handleAdminPlayersList))
+	r.POST("/backend/admin/session/{session_id}",    s.requireAdminSession(s.handleAdminSessionPatch))
+	r.GET("/backend/admin/analytics",               s.requireAdminSession(s.handleAdminAnalytics))
+
+	// App config — leaderboard on/off, update mode, replay version, replay binary upload
+	r.GET("/backend/admin/config",                  s.requireAdminSession(s.handleAdminGetConfig))
+	r.POST("/backend/admin/config",                 s.requireAdminSession(s.handleAdminSetConfig))
+	r.POST("/backend/admin/update-mode",            s.requireAdminSession(s.handleAdminSetUpdateMode))
+	r.POST("/backend/admin/update-complete",        s.requireAdminSession(s.handleAdminCompleteUpdate))
+	r.POST("/backend/admin/replays/clear-all",      s.requireAdminSession(s.handleAdminClearAllReplays))
+	r.GET("/backend/admin/replay-binary",           s.requireAdminSession(s.handleAdminReplayBinaryStatus))
+	r.POST("/backend/admin/replay-binary",          s.requireAdminSession(s.handleAdminReplayBinaryUpload))
+
+	// Database tab — key-prefix category overview/clear + failed-replay archive
+	r.GET("/backend/admin/database",                s.requireAdminSession(s.handleAdminDatabaseOverview))
+	r.POST("/backend/admin/database/clear",         s.requireAdminSession(s.handleAdminDatabaseClear))
+	r.GET("/backend/admin/failed-replay-archive",   s.requireAdminSession(s.handleAdminFailedReplayArchiveList))
+	r.GET("/backend/admin/failed-replay-archive/{id}/download", s.requireAdminSession(s.handleAdminFailedReplayArchiveDownload))
+
+	// Scheduled deploy jobs — Cloudflare Pages push + replay binary
+	// activation + version bump, triggered now/at-time/daily-lb-end/weekly-lb-end.
+	r.GET("/backend/admin/deploy/status",           s.requireAdminSession(s.handleAdminDeployStatus))
+	r.POST("/backend/admin/deploy/schedule",        s.requireAdminSession(s.handleAdminScheduleDeploy))
+	r.GET("/backend/admin/deploy/jobs",             s.requireAdminSession(s.handleAdminListDeployJobs))
+	r.POST("/backend/admin/deploy/jobs/{id}/cancel", s.requireAdminSession(s.handleAdminCancelDeployJob))
+
+	// Golden replays — pinned reference replays used to catch determinism
+	// regressions (a code/binary change silently altering simulation
+	// results) before they show up as real player flags.
+	r.GET("/backend/admin/golden-replays",             s.requireAdminSession(s.handleAdminGoldenList))
+	r.POST("/backend/admin/golden-replays",             s.requireAdminSession(s.handleAdminGoldenSave))
+	r.POST("/backend/admin/golden-replays/delete",      s.requireAdminSession(s.handleAdminGoldenDelete))
+	r.POST("/backend/admin/golden-replays/self-test",   s.requireAdminSession(s.handleAdminGoldenSelfTest))
+
+	// Static determinism lint — scans game/scripts/*.gd for known
+	// determinism-breaking patterns (bare RNG, wall-clock time, hard free(),
+	// array mutation during iteration). See backend/game/determinism_lint.go.
+	r.GET("/backend/admin/determinism-lint",            s.requireAdminSession(s.handleAdminDeterminismLint))
+
+	// Admin panel UI — reverse-proxied to the Next.js admin app (runs
+	// separately, see admin/.env for ADMIN_PORT). Same session-cookie gate,
+	// but redirects to /admin/login on failure instead of returning JSON.
+	// Path prefix comes from ADMIN_BASE_PATH — must match admin/next.config.js.
+	base := adminBasePath()
+	r.ANY(base, s.requireAdminSessionPage(s.handleAdminProxy))
+	r.ANY(base+"/{filepath:*}", s.requireAdminSessionPage(s.handleAdminProxy))
 
 	// Public endpoint'ler — rate limitli
 	r.GET("/backend/auth/challenge",            rl(s.handleAuthChallenge))
@@ -88,9 +139,22 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/rewards/history",           rl(s.handleRewardHistory))
 	r.POST("/backend/client-log",               rl(s.handleClientLog))
 
-	// VS — real-time 1v1
+	// VS — real-time 1v1 (legacy, dormant — kept in case it's revived)
 	r.POST("/backend/vs/join",                  rl(s.handleVSJoin))
 	r.GET("/backend/vs/ws/{room_id}",           s.handleVSWebSocket)  // no rate-limit — WS upgrade
+
+	// VS Rooms — async 1v1 challenge with optional NIM entry fee
+	r.POST("/backend/vsroom/create",            rl(s.handleVSRoomCreate))
+	r.GET("/backend/vsroom/mine",               rl(s.handleVSRoomMine))
+	r.GET("/backend/vsroom/open",               rl(s.handleVSRoomOpen))
+	r.GET("/backend/vsroom/{id}",               rl(s.handleVSRoomGet))
+	r.POST("/backend/vsroom/{id}/join",         rl(s.handleVSRoomJoin))
+	r.POST("/backend/vsroom/{id}/pay",          rl(s.handleVSRoomConfirmPayment))
+	r.POST("/backend/vsroom/{id}/cancel",       rl(s.handleVSRoomCancel))
+	r.GET("/backend/admin/vs-rooms",                     s.requireAdminSession(s.handleAdminVSRooms))
+	r.POST("/backend/admin/vs-rooms/sweep",              s.requireAdminSession(s.handleAdminVSRoomsSweep))
+	r.POST("/backend/admin/vs-rooms/reconcile-payments", s.requireAdminSession(s.handleAdminVSRoomsReconcile))
+	r.POST("/backend/admin/vs-rooms/{id}/cancel",        s.requireAdminSession(s.handleAdminVSRoomCancel))
 }
 
 // StartBackgroundServices — starts retry loop, balance monitor, and the
@@ -98,16 +162,28 @@ func (s *Server) Register(r *router.Router) {
 func (s *Server) StartBackgroundServices() {
 	s.Store.StartRetryLoop()
 	s.Store.StartBalanceMonitor()
+	s.Store.StartUpdateScheduler()
+	s.Store.StartDeployJobScheduler()
+	s.Store.StartVSRoomSweep()
+	s.Store.StartVSPaymentReconciler()
 	StartCloudflareIPRefresher()
-	log.Printf("[STARTUP] background services started (retry loop + balance monitor + cloudflare ip refresher)")
+	log.Printf("[STARTUP] background services started (retry loop + balance monitor + update scheduler + deploy job scheduler + vs room sweep + vs payment reconciler + cloudflare ip refresher)")
 }
 
-// GET /bj/developer-mode — returns current dev mode status (public, read-only)
+// GET /backend/developer-mode — public, read-only status endpoint. Also
+// carries the update-mode flag (client polls this to know whether starting
+// a new game should be blocked) and the leaderboard on/off flags.
 func (s *Server) handleDeveloperModeGet(ctx *fasthttp.RequestCtx) {
 	on := s.Store.GetDeveloperMode()
+	cfg := s.Store.GetAppConfig()
 	writeJSON(ctx, 200, map[string]any{
-		"developer_mode": on,
-		"message":        "We're currently updating the game. Come back soon!",
+		"developer_mode":              on,
+		"message":                     "We're currently updating the game. Come back soon!",
+		"update_active":               cfg.UpdateActive,
+		"update_message":              "Game updating. Please check back shortly — thanks for your patience!",
+		"daily_leaderboard_enabled":   cfg.DailyLeaderboardEnabled,
+		"weekly_leaderboard_enabled":  cfg.WeeklyLeaderboardEnabled,
+		"replay_version":              cfg.ReplayVersion,
 	})
 }
 
@@ -252,6 +328,9 @@ type submitReq struct {
 	Nonce      float64 `json:"nonce"`
 	ReplayLog  string  `json:"replay_log"`
 	PlayerSeed string  `json:"player_seed"`
+	ClientVersion int  `json:"client_version"` // must match AppConfig.ReplayVersion or submit is rejected
+	VSRoomID   string  `json:"vs_room_id,omitempty"` // set when this play is one side of a VS room match
+	VSRole     string  `json:"vs_role,omitempty"`    // "creator" or "opponent"
 }
 
 func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
@@ -287,9 +366,62 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// ── VS room binding sanity check ─────────────────────────────────────────
+	// If this submission claims to be one side of a VS room match, verify the
+	// room exists, the seed matches the room's seed (so nobody can submit an
+	// unrelated normal run as their VS entry), and the authed player is
+	// actually the participant claimed by vs_role.
+	if req.VSRoomID != "" {
+		room, rerr := s.Store.GetVSRoom(req.VSRoomID)
+		if rerr != nil || room == nil {
+			writeErr(ctx, 404, "vs_room_not_found")
+			return
+		}
+		if room.Seed != req.Seed {
+			log.Printf("[SUBMIT] vs_room seed mismatch room=%s room_seed=%s submit_seed=%s", req.VSRoomID, room.Seed, req.Seed)
+			writeErr(ctx, 400, "vs_room_seed_mismatch")
+			return
+		}
+		switch req.VSRole {
+		case "creator":
+			if room.CreatorID != authedPlayer {
+				writeErr(ctx, 403, "vs_role_mismatch")
+				return
+			}
+		case "opponent":
+			if room.OpponentID != authedPlayer {
+				writeErr(ctx, 403, "vs_role_mismatch")
+				return
+			}
+		default:
+			writeErr(ctx, 400, "bad_vs_role")
+			return
+		}
+	}
+
+	// ── Version check ─────────────────────────────────────────────────────────
+	// Client and server replay version must match exactly. Mismatch means
+	// this submit came from an old client build (or an old/stale replay
+	// binary is running server-side) — silently reject, don't save, don't
+	// simulate. Logged as a client-log entry so it shows up in the admin
+	// panel under the player's activity ("version_mismatch").
+	appCfg := s.Store.GetAppConfig()
+	if req.ClientVersion != appCfg.ReplayVersion {
+		log.Printf("[SUBMIT] version_mismatch session=%s client_version=%d expected=%d player=%s ip=%s",
+			sid8, req.ClientVersion, appCfg.ReplayVersion, authedPlayer, ip)
+		_ = s.Store.UpsertClientLog("warn", "version_mismatch", authedPlayer, ip, "")
+		writeErr(ctx, 409, "version_mismatch")
+		return
+	}
+
 	// ── Seed duplicate check ─────────────────────────────────────────────────
 	// First-seen: claim it. Already claimed: reject.
-	if s.Store.SeedExists(gameSeed) {
+	// VS room matches are the one deliberate exception — both participants
+	// play the SAME seed by design, so this is skipped for vs_room_id
+	// submissions (already validated above: seed must match the room's own
+	// seed, and the authed player must be the exact participant for vs_role,
+	// so at most 2 legitimate submissions can ever exist for that seed).
+	if req.VSRoomID == "" && s.Store.SeedExists(gameSeed) {
 		log.Printf("[SUBMIT] seed_already_used session=%s seed=%d ip=%s", sid8, gameSeed, ip)
 		writeErr(ctx, 409, "seed_already_used")
 		return
@@ -378,7 +510,7 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 
 	// Replay simulation (background)
 	if !flagged {
-		go func(sessionID, playerID string, clientScore int, log64 string, seed int64, charIdx int, playerSeed int64, ticks int) {
+		go func(sessionID, playerID string, clientScore int, log64 string, seed int64, charIdx int, playerSeed int64, ticks int, vsRoomID, vsRole string) {
 			log.Printf("[REPLAY_SIM] queued session=%s seed=%d b64=%d ticks=%d", sessionID[:8], seed, len(log64), ticks)
 			result := game.SimulateReplayWithRetry(sessionID, log64, seed, charIdx, playerSeed, ticks)
 
@@ -431,6 +563,16 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 			log.Printf("[REPLAY_SIM] done session=%s server_score=%d flagged=%v",
 				sessionID[:8], result.ServerScore, simFlagged)
 
+			// ── VS room score reporting ──────────────────────────────────────
+			// Only the server-verified score is ever trusted here — a flagged
+			// (client/server mismatch or anti-cheat) submission never counts
+			// toward a VS match.
+			if !simFlagged && vsRoomID != "" {
+				if _, verr := s.Store.UpdateVSRoomScore(vsRoomID, vsRole, result.ServerScore, sessionID); verr != nil {
+					log.Printf("[VSROOM] score update failed room=%s role=%s session=%s err=%v", vsRoomID, vsRole, sessionID[:8], verr)
+				}
+			}
+
 			if !simFlagged && result.QuestHasResult && playerID != "" {
 				quests, qerr := s.Store.GetOrCreatePlayerQuests(playerID)
 				if qerr == nil {
@@ -455,7 +597,7 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 					}
 				}
 			}
-		}(req.Session, authedPlayer, req.Score, replayLog, gameSeed, req.Char, parsedPlayerSeed, req.Ticks)
+		}(req.Session, authedPlayer, req.Score, replayLog, gameSeed, req.Char, parsedPlayerSeed, req.Ticks, req.VSRoomID, req.VSRole)
 	}
 
 	writeJSON(ctx, 200, map[string]any{

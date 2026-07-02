@@ -505,60 +505,24 @@ func (p *workerPool) processJobs(w *godotWorker) {
 // replay binary'sine ver (önce base64 decode et), --seed/--char/--player-seed
 // de aynı dosyadan oku.
 
-const failedReplayDirName = "failed_replays"
+// NOTE: the failed-replay archive used to be a folder of JSON files on
+// disk (failed_replays/). It now lives in BadgerDB instead — see
+// game/failed_replay_store.go for ArchiveFailedReplay, ListFailedReplays,
+// ClearFailedReplays, ArchiveFailedReplayDefaultDir. Downloadable from the
+// admin panel's Database tab.
 
-// failedReplayDir — JOB_DIR/failed_replays, yoksa oluşturur.
-// Worker pool zaten bir jobDir kullanıyor (os.TempDir()); server.go tarafındaki
-// score-mismatch çağrıları da aynı kökü kullanır (ArchiveFailedReplayDefaultDir).
-func failedReplayDir(jobDir string) string {
-	dir := filepath.Join(jobDir, failedReplayDirName)
-	_ = os.MkdirAll(dir, 0755)
-	return dir
-}
-
-// ArchiveFailedReplayDefaultDir — jobDir bilmeyen çağıranlar (server.go gibi)
-// için worker pool ile aynı kökü kullanır, böylece tüm arşiv tek klasörde toplanır.
-func ArchiveFailedReplayDefaultDir() string {
-	return GetWorkerPool().jobDir
-}
-
-// ArchiveFailedReplay — public API. logB64 doğrudan base64 (zaten elindeyse hex'e
-// çevirmene gerek yok). category örn: "worker_timeout", "worker_cancelled",
-// "worker_died", "score_mismatch".
-func ArchiveFailedReplay(jobDir string, sessionID, seed string, charIdx int, playerSeed string, logB64, category, reason string, extra map[string]any) {
-	entry := map[string]any{
-		"session_id":   sessionID,
-		"seed":         seed,
-		"char":         charIdx,
-		"player_seed":  playerSeed,
-		"log_base64":   logB64,
-		"category":     category,
-		"reason":       reason,
-		"archived_at":  time.Now().Format(time.RFC3339),
+// RestartAllWorkers — restarts every persistent Godot worker so they pick
+// up a newly uploaded binary (see admin replay-binary upload). Reuses the
+// same sequential kill used by the daily restart.
+func RestartAllWorkers() {
+	p := GetWorkerPool()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	log.Printf("[WORKER_POOL] restart requested (new replay binary uploaded)")
+	for _, w := range p.workers {
+		p.killWorker(w)
+		time.Sleep(1 * time.Second)
 	}
-	for k, v := range extra {
-		entry[k] = v
-	}
-
-	data, err := json.MarshalIndent(entry, "", "  ")
-	if err != nil {
-		log.Printf("[FAILED_REPLAY_ARCHIVE] marshal error session=%s: %v", sessionID, err)
-		return
-	}
-
-	dir := failedReplayDir(jobDir)
-	idTag := sessionID
-	if idTag == "" {
-		idTag = "job"
-	}
-	fname := fmt.Sprintf("%s_%s_%d.json", category, idTag, time.Now().UnixNano())
-	outPath := filepath.Join(dir, fname)
-	if err := os.WriteFile(outPath, data, 0644); err != nil {
-		log.Printf("[FAILED_REPLAY_ARCHIVE] write error session=%s: %v", sessionID, err)
-		return
-	}
-	log.Printf("[FAILED_REPLAY_ARCHIVE] saved category=%s session=%s seed=%s reason=%q -> %s",
-		category, sessionID, seed, reason, outPath)
 }
 
 // archiveFailedReplay — internal helper used by runJob (worker pool tarafı).

@@ -202,12 +202,12 @@ def find_template_folder() -> pathlib.Path:
 
 def copy_template_extras(export_folder: pathlib.Path, template_folder: pathlib.Path):
     """
-    Copies _headers and assets/ from game/template into the export
-    folder, overwriting whatever is already there.
+    Copies _headers, manifest.json, and assets/ from game/template into the
+    export folder, overwriting whatever is already there.
     """
     if not template_folder.is_dir():
         print(f"Template folder not found: {template_folder.resolve()}")
-        print("  Skipping _headers/assets copy — check the game/template path.")
+        print("  Skipping _headers/manifest.json/assets copy — check the game/template path.")
         return
 
     headers_src = template_folder / "_headers"
@@ -217,6 +217,19 @@ def copy_template_extras(export_folder: pathlib.Path, template_folder: pathlib.P
         print(f"  copied _headers → {headers_dst}")
     else:
         print(f"  no _headers found in {template_folder.resolve()}, skipped")
+
+    # manifest.json — Web App Manifest, used by Nimiq Pay's mini-app list
+    # (and any "add to home screen" flow) to source the game's icon. index.html
+    # links this via <link rel="manifest">; that link only works if the file
+    # actually made it into the export folder, hence copying it here same as
+    # _headers/assets.
+    manifest_src = template_folder / "manifest.json"
+    if manifest_src.is_file():
+        manifest_dst = export_folder / "manifest.json"
+        shutil.copyfile(manifest_src, manifest_dst)
+        print(f"  copied manifest.json → {manifest_dst}")
+    else:
+        print(f"  no manifest.json found in {template_folder.resolve()}, skipped")
 
     assets_src = template_folder / "assets"
     if assets_src.is_dir():

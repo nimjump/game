@@ -134,7 +134,7 @@ func _try_restore_session() -> void:
 		# Network error / timeout — backend unreachable, do not touch token
 		if result != HTTPRequest.RESULT_SUCCESS or code == 0:
 			var stored_exp : int = int(str(JavaScriptBridge.eval("parseInt(localStorage.getItem('nj_auth_exp') || '0', 10)", true)))
-			var now_unix   : int = int(Time.get_unix_time_from_system())
+			var now_unix   : int = int(Time.get_unix_time_from_system())  # determinism-ok: auth token expiry check, not gameplay
 			if stored_exp > now_unix + 60:
 				# Not expired — trust token offline, mark so poll() skips _do_sign_auth
 				auth_token      = str(token)
@@ -157,7 +157,7 @@ func _try_restore_session() -> void:
 					var restored_token    : String = str(token)
 					var restored_pid      : String = str(d.get("player_id", pid))
 					var restored_exp      : int    = int(d.get("expires_at", 0))
-					var now_unix          : int    = int(Time.get_unix_time_from_system())
+					var now_unix          : int    = int(Time.get_unix_time_from_system())  # determinism-ok: auth token expiry check, not gameplay
 					var secs_left         : int    = restored_exp - now_unix
 					auth_token      = restored_token
 					auth_player_id  = restored_pid

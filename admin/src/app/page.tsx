@@ -1,7 +1,9 @@
 "use client";
 import { useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
 import {
   fetchOverview, fetchAdminSessions, fetchClientLogs, fetchFailedReplays,
+  adminMe, adminLogout,
   type Session, type Overview, type ClientLogEntry, type FailedReplay,
 } from "@/lib/api";
 import StatCards        from "@/components/StatCards";
@@ -9,28 +11,33 @@ import OverviewTab      from "@/components/OverviewTab";
 import SessionsTab      from "@/components/SessionsTab";
 import FailedReplaysTab from "@/components/FailedReplaysTab";
 import ClientLogsTab    from "@/components/ClientLogsTab";
-import PlayerSearchTab  from "@/components/PlayerSearchTab";
 import PlayersListTab   from "@/components/PlayersListTab";
 import LeaderboardTab   from "@/components/LeaderboardTab";
 import AnalyticsTab     from "@/components/AnalyticsTab";
+import SystemTab        from "@/components/SystemTab";
+import DatabaseTab      from "@/components/DatabaseTab";
+import DeployTab        from "@/components/DeployTab";
+import VSRoomsTab       from "@/components/VSRoomsTab";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 export type Tab =
-  | "overview" | "active" | "completed" | "flagged" | "all"
-  | "failed_replays" | "logs" | "players" | "players_search" | "leaderboard" | "analytics";
+  | "overview" | "completed" | "flagged" | "all"
+  | "failed_replays" | "logs" | "players" | "leaderboard" | "analytics" | "vsrooms" | "system" | "database" | "deploy";
 
 const TAB_LABELS: [Tab, string][] = [
   ["overview",        "Overview"],
   ["analytics",       "Analytics"],
-  ["active",          "Active"],
   ["completed",       "Completed"],
   ["flagged",         "Flagged"],
   ["failed_replays",  "Failed"],
   ["all",             "All Sessions"],
   ["leaderboard",     "Leaderboard"],
+  ["vsrooms",         "VS Rooms"],
   ["players",         "Players"],
-  ["players_search",  "Player Search"],
   ["logs",            "Logs"],
+  ["system",          "System"],
+  ["database",        "Database"],
+  ["deploy",          "Deploy"],
 ];
 
 function fmtDur(sec: number) {
@@ -38,8 +45,12 @@ function fmtDur(sec: number) {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
+const SELF_CONTAINED_TABS: Tab[] = ["players", "leaderboard", "analytics", "vsrooms", "system", "database", "deploy"];
+
 // ── Page ───────────────────────────────────────────────────────────────────────
 export default function AdminPage() {
+  const router = useRouter();
+  const [authChecked, setAuthChecked] = useState(false);
   const [tab,         setTab]         = useState<Tab>("overview");
   const [overview,    setOverview]    = useState<Overview | null>(null);
   const [sessions,    setSessions]    = useState<Session[]>([]);
@@ -52,6 +63,24 @@ export default function AdminPage() {
   const [error,       setError]       = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
 
+  // ── Auth guard ───────────────────────────────────────────────────────────────
+  // The backend proxy already redirects unauthenticated requests to
+  // /admin/login before they ever reach this page (see
+  // requireAdminSessionPage in backend/handlers/admin_session.go). This is
+  // a second check for when the admin app is running standalone in dev
+  // (npm run dev on ADMIN_PORT, not behind the proxy), where that gate
+  // doesn't apply.
+  useEffect(() => {
+    adminMe().then(authed => {
+      if (!authed) router.replace("/login");
+      else setAuthChecked(true);
+    });
+  }, [router]);
+
+  function handleLogout() {
+    adminLogout().finally(() => router.replace("/login"));
+  }
+
   // ── Loaders ──────────────────────────────────────────────────────────────────
   const loadOverview = useCallback(() => {
     setLoading(true); setError("");
@@ -63,7 +92,7 @@ export default function AdminPage() {
 
   const loadSessions = useCallback((t: Tab, q?: string) => {
     const stateMap: Record<string, string | undefined> = {
-      active: "active", completed: "completed", flagged: "flagged", all: undefined,
+      completed: "completed", flagged: "flagged", all: undefined,
     };
     setLoading(true); setError("");
     fetchAdminSessions(stateMap[t], q || undefined)
@@ -93,14 +122,11 @@ export default function AdminPage() {
     if (tab === "overview")       return loadOverview();
     if (tab === "logs")           return loadLogs(logLevel);
     if (tab === "failed_replays") return loadFailed();
-    if (tab === "players")        return; // self-contained
-    if (tab === "players_search") return; // self-contained
-    if (tab === "leaderboard")    return; // self-contained
-    if (tab === "analytics")      return; // self-contained
+    if (SELF_CONTAINED_TABS.includes(tab)) return; // self-contained
     loadSessions(tab, search);
   }, [tab, logLevel, search, loadOverview, loadLogs, loadFailed, loadSessions]);
 
-  useEffect(() => { refresh(); }, [tab]); // eslint-disable-line
+  useEffect(() => { if (authChecked) refresh(); }, [tab, authChecked]); // eslint-disable-line
 
   // ── Auto-refresh overview every 5s ───────────────────────────────────────────
   useEffect(() => {
@@ -109,7 +135,15 @@ export default function AdminPage() {
     return () => clearInterval(id);
   }, [autoRefresh, tab, loadOverview]);
 
-  const isSessions = ["active", "completed", "flagged", "all"].includes(tab);
+  const isSessions = ["completed", "flagged", "all"].includes(tab);
+
+  if (!authChecked) {
+    return (
+      <main style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ color: "var(--text-muted)", fontSize: 13 }}>Loading…</span>
+      </main>
+    );
+  }
 
   return (
     <main style={{ maxWidth: 1200, margin: "0 auto", padding: "24px 16px" }}>
@@ -133,6 +167,7 @@ export default function AdminPage() {
             Auto-refresh
           </label>
           <button className="btn" onClick={refresh}>Refresh</button>
+          <button className="btn" onClick={handleLogout}>Log out</button>
         </div>
       </div>
 
@@ -154,13 +189,13 @@ export default function AdminPage() {
       </div>
 
       {/* ── Status ── */}
-      {loading && tab !== "players" && tab !== "players_search" && tab !== "leaderboard" && tab !== "analytics" && (
+      {loading && !SELF_CONTAINED_TABS.includes(tab) && (
         <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>
       )}
       {error && <div style={{ padding: 16, color: "var(--red)", fontSize: 13 }}>{error}</div>}
 
       {/* ── Tab content ── */}
-      {(tab === "players" || tab === "players_search" || tab === "leaderboard" || tab === "analytics" || !loading) && (
+      {(SELF_CONTAINED_TABS.includes(tab) || !loading) && (
         <>
           {tab === "overview" && overview && (
             <OverviewTab ov={overview} />
@@ -184,10 +219,6 @@ export default function AdminPage() {
             <PlayersListTab />
           )}
 
-          {tab === "players_search" && (
-            <PlayerSearchTab />
-          )}
-
           {tab === "leaderboard" && (
             <LeaderboardTab />
           )}
@@ -196,10 +227,25 @@ export default function AdminPage() {
             <AnalyticsTab />
           )}
 
+          {tab === "vsrooms" && (
+            <VSRoomsTab />
+          )}
+
+          {tab === "system" && (
+            <SystemTab />
+          )}
+
+          {tab === "database" && (
+            <DatabaseTab />
+          )}
+
+          {tab === "deploy" && (
+            <DeployTab />
+          )}
+
           {isSessions && (
             <SessionsTab
               sessions={sessions}
-              showDuration={tab === "active"}
               searchValue={search}
               onSearch={q => setSearch(q)}
               onSearchSubmit={q => loadSessions(tab, q)}
