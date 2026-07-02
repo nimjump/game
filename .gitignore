@@ -34,3 +34,7 @@ Thumbs.db
 # --- replay build ---
 *.TMP
 *.tmp
+
+
+# --- replay build ---
+*.pck

@@ -389,7 +389,10 @@ func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int
 	}
 	log.Printf("[REPLAY_SIM] raw_bytes=%d rle_decoded_ticks=%d seed=%d player_seed=%d", len(raw), rleDecodedTicks, seed, playerSeed)
 
-	if err := os.WriteFile(logFile, raw, 0600); err != nil {
+	// 0644 (not 0600): same reasoning as replay_worker.go's job file — when
+	// this process is root, the Godot child is dropped to an unprivileged
+	// user (privdrop_unix.go) and needs to actually be able to read this.
+	if err := os.WriteFile(logFile, raw, 0644); err != nil {
 		return nil, fmt.Errorf("log dosyasi yazilamadi: %w", err)
 	}
 
@@ -420,6 +423,12 @@ func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int
 		"PULSE_SERVER=",                // prevent PulseAudio connection attempt
 		"ALSA_CARD=",                   // prevent ALSA device probe
 	)
+
+	// Same root→unprivileged-user drop as the persistent worker pool (see
+	// privdrop_unix.go / replay_worker.go) — this one-shot path is used by
+	// the admin panel's manual replay re-verify, so it needs the identical
+	// protection against Godot hanging when started as root.
+	applyPrivDrop(cmd, crashLogDir)
 
 	var stdoutBuf, stderrBuf strings.Builder
 	cmd.Stdout = &stdoutBuf

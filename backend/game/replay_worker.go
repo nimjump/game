@@ -352,6 +352,15 @@ func (p *workerPool) startProcess(w *godotWorker) error {
 		"PULSE_SERVER=",
 	)
 
+	// If this Go process itself is running as root, drop the Godot child to
+	// an unprivileged user (see privdrop_unix.go) — Godot's headless engine
+	// can hang indefinitely as root and never print its READY line, which
+	// is exactly the "worker READY timeout" failure mode. Also loosens the
+	// permissions on the per-worker crash/user-data dir so the now
+	// different-uid child can still write into a directory this (root)
+	// process just created.
+	applyPrivDrop(cmd, crashDir, p.jobDir)
+
 	// stdout → pipe; okuma goroutine'i READY satırını arar, geri kalanını loglar
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
@@ -565,9 +574,14 @@ func (p *workerPool) runJob(w *godotWorker, jobMsg workerPoolJob, jobNum int) (*
 		return nil, fmt.Errorf("marshal: %w", err)
 	}
 
-	// Atomik yazma: önce .tmp, sonra rename
+	// Atomik yazma: önce .tmp, sonra rename.
+	// 0644 (not 0600): when this Go process is root, the Godot child that
+	// reads this file has been dropped to an unprivileged user (see
+	// privdrop_unix.go) and would get a permission-denied read on a 0600
+	// file owned by root. It's transient replay-log data in a scratch temp
+	// dir, not a secret, so world-readable here is fine.
 	tmpFile := jobFile + ".tmp"
-	if err := os.WriteFile(tmpFile, data, 0600); err != nil {
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return nil, fmt.Errorf("write job file: %w", err)
 	}
 	if err := os.Rename(tmpFile, jobFile); err != nil {
