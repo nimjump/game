@@ -23,6 +23,23 @@ var _restore_network_failed := false  # true = offline restore, don't trigger re
 var auth_attempted := false
 var auth_expires_at : int = 0   # unix timestamp
 
+# _do_sign_auth() can be triggered from several independent places at once —
+# the PLAY button, the Settings "Connect" button, VS round start, AND
+# NimiqBridge's own auto-poll flow all call it directly (see Main.gd). Each
+# call fetches its OWN fresh challenge and calls NimiqJS.start_sign(), but
+# the wallet extension can only handle one signing request at a time — a
+# second concurrent call silently replaces/interferes with the first
+# in-flight one, so the FIRST caller's captured challenge ends up being
+# verified against a signature that was actually produced for the SECOND
+# challenge (or vice versa). The backend's challenge is also single-use
+# (deleted the instant it's looked up, success or fail — see
+# consumeChallenge() in backend/game/auth.go), so this mismatch surfaces as
+# a confusing, seemingly-random "challenge_not_found_or_expired" — the
+# already-consumed-by-the-OTHER-call-in-flight challenge. This flag makes
+# _do_sign_auth() a no-op while a sign attempt is already in progress,
+# instead of letting them race.
+var _signing_in_progress := false
+
 
 func _ready() -> void:
 	if OS.has_feature("web"):
@@ -209,11 +226,34 @@ func _try_restore_session() -> void:
 	http.request(BACKEND_URL + "/backend/auth/me?token=" + str(token).uri_encode())
 
 
+## Releases the _signing_in_progress lock and (optionally) emits auth_failed.
+## Every terminal point of the sign flow (success is handled separately in
+## _verify_with_backend, since it doesn't fail) must go through this so the
+## lock never gets stuck "true" after an error.
+func _fail_sign_auth(reason: String) -> void:
+	_signing_in_progress = false
+	auth_failed.emit(reason)
+
+
 ## Sign-based auth flow: get challenge → sign → verify → store token
 func _do_sign_auth() -> void:
-	print("[NimiqBridge] _do_sign_auth called auth_verified=%s addr=%s" % [str(auth_verified), nimiq_address.left(12)])
+	print("[NimiqBridge] _do_sign_auth called auth_verified=%s addr=%s in_progress=%s" % [str(auth_verified), nimiq_address.left(12), str(_signing_in_progress)])
 	if not OS.has_feature("web"): return
 	if auth_verified: return  # already logged in
+	if _signing_in_progress:
+		# A sign attempt (from ANY trigger — PLAY button, Settings Connect,
+		# VS round start, or NimiqBridge's own auto-flow, see Main.gd's
+		# several direct _do_sign_auth() call sites) is already in flight.
+		# Letting a second one start concurrently means TWO challenges get
+		# fetched but the wallet extension only handles one sign request at
+		# a time — the first caller's captured challenge ends up verified
+		# against a signature actually produced for the SECOND challenge,
+		# which the single-use backend challenge store (already consumed by
+		# whichever request got there first) then rejects as
+		# "challenge_not_found_or_expired". No-op instead of racing.
+		print("[NimiqBridge] sign already in progress — ignoring duplicate call")
+		return
+	_signing_in_progress = true
 
 	# 1. Get challenge
 	var http := HTTPRequest.new()
@@ -224,16 +264,16 @@ func _do_sign_auth() -> void:
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			push_warning("[NimiqBridge] Challenge fetch failed: %d" % code)
 			Toast.network_error("auth_challenge code=%d" % code)
-			auth_failed.emit("challenge_fetch_failed")
+			_fail_sign_auth("challenge_fetch_failed")
 			return
 		var j := JSON.new()
 		if j.parse(body.get_string_from_utf8()) != OK:
-			auth_failed.emit("challenge_parse_failed")
+			_fail_sign_auth("challenge_parse_failed")
 			return
 		var d : Dictionary = j.get_data()
 		var challenge : String = str(d.get("challenge", ""))
 		if challenge == "":
-			auth_failed.emit("empty_challenge")
+			_fail_sign_auth("empty_challenge")
 			return
 		# 2. Call window.nimiq.sign(challenge)
 		_sign_and_verify(challenge)
@@ -254,7 +294,7 @@ func _sign_and_verify(challenge: String) -> void:
 	if not sd.get("ok", false):
 		var err := str(sd.get("error", sd.get("err", "user_rejected")))
 		print("[NimiqBridge] Sign not completed: %s" % err)
-		auth_failed.emit(err)
+		_fail_sign_auth(err)
 		return
 
 	var pub_key   : String = str(sd.get("publicKey", ""))
@@ -276,20 +316,25 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 			push_warning("[NimiqBridge] Auth verify failed: %d" % code)
 			if code == 401:
 				auth_verified = false
+				# Intentional sequential retry (challenge was rejected, get a
+				# fresh one), not a race — release the lock first so this
+				# call isn't blocked by its own now-stale guard state.
+				_signing_in_progress = false
 				_do_sign_auth()
 				return
 			Toast.network_error("auth_verify code=%d" % code)
-			auth_failed.emit("verify_failed_%d" % code)
+			_fail_sign_auth("verify_failed_%d" % code)
 			return
 		var j := JSON.new()
 		if j.parse(body.get_string_from_utf8()) != OK:
-			auth_failed.emit("verify_parse_error")
+			_fail_sign_auth("verify_parse_error")
 			return
 		var d : Dictionary = j.get_data()
 		if not d.get("ok", false):
-			auth_failed.emit(str(d.get("error", "unknown")))
+			_fail_sign_auth(str(d.get("error", "unknown")))
 			return
 
+		_signing_in_progress = false
 		auth_token      = str(d.get("token", ""))
 		auth_player_id  = str(d.get("player_id", nimiq_address))
 		auth_expires_at = int(d.get("expires_at", 0))
