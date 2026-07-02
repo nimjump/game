@@ -18,6 +18,7 @@ import SystemTab        from "@/components/SystemTab";
 import DatabaseTab      from "@/components/DatabaseTab";
 import DeployTab        from "@/components/DeployTab";
 import VSRoomsTab       from "@/components/VSRoomsTab";
+import ErrorBoundary    from "@/components/ErrorBoundary";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 export type Tab =
@@ -195,8 +196,11 @@ export default function AdminPage() {
       {error && <div style={{ padding: 16, color: "var(--red)", fontSize: 13 }}>{error}</div>}
 
       {/* ── Tab content ── */}
+      {/* key={tab}: remounts the boundary on every tab switch, so a crash
+          in one tab doesn't keep showing the error fallback after
+          navigating to a different, healthy tab. */}
       {(SELF_CONTAINED_TABS.includes(tab) || !loading) && (
-        <>
+        <ErrorBoundary key={tab}>
           {tab === "overview" && overview && (
             <OverviewTab ov={overview} />
           )}
@@ -252,7 +256,7 @@ export default function AdminPage() {
               onActionDone={() => loadSessions(tab, search)}
             />
           )}
-        </>
+        </ErrorBoundary>
       )}
 
     </main>

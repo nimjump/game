@@ -493,7 +493,27 @@ export interface ReplayBinaryStatus {
 export async function fetchReplayBinaryStatus(): Promise<ReplayBinaryStatus> {
   const r = await fetch(`${BASE}/backend/admin/replay-binary`, { cache: "no-store" });
   if (!r.ok) throw new Error("replay-binary status fetch failed");
-  return r.json();
+  const data = await r.json();
+  // Defensive normalization: never trust the backend to always send an
+  // array here (e.g. an older backend build, or any future response-shape
+  // bug). Consumers of this type (SystemTab.tsx) call .length/.map() on
+  // `files` without a null check — a bare `null`/`undefined` from the API
+  // would throw a render exception with no error boundary, blanking the
+  // entire admin page. Normalizing here is the single choke point that
+  // guarantees `files` is always a real array no matter what the server did.
+  return { ...data, files: Array.isArray(data?.files) ? data.files : [] };
+}
+
+export async function deleteReplayBinaryFile(file: string): Promise<void> {
+  const r = await fetch(`${BASE}/backend/admin/replay-binary/delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    throw new Error(body?.error || "delete failed");
+  }
 }
 
 // ── Database tab ─────────────────────────────────────────────────────────────

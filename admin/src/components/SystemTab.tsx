@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   fetchAppConfig, saveAppConfig, setUpdateMode, completeUpdate, clearAllReplays,
-  fetchReplayBinaryStatus, uploadReplayBinary,
+  fetchReplayBinaryStatus, uploadReplayBinary, deleteReplayBinaryFile,
   fetchGoldenReplays, deleteGoldenReplay, runGoldenSelfTest, fetchDeterminismLint,
   type AppConfig, type ReplayBinaryStatus, type GoldenReplay, type GoldenReplayResult,
   type DeterminismFinding,
@@ -26,6 +26,7 @@ export default function SystemTab() {
   const [error,    setError]    = useState("");
   const [saving,   setSaving]   = useState(false);
   const [uploading,setUploading]= useState(false);
+  const [deletingFile, setDeletingFile] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
   const [versionInput, setVersionInput] = useState("1");
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -202,6 +203,20 @@ export default function SystemTab() {
     }
   }
 
+  async function doDeleteFile(name: string) {
+    if (!confirm(`Delete "${name}" from the servergames folder? If this is the active binary/pck, the worker pool restarts and games will fail to verify until a new one is uploaded.`)) return;
+    setDeletingFile(name);
+    try {
+      await deleteReplayBinaryFile(name);
+      const b = await fetchReplayBinaryStatus();
+      setBinary(b);
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setDeletingFile(null);
+    }
+  }
+
   if (loading) return <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>;
   if (error)   return <div style={{ padding: 16, color: "var(--red)" }}>{error}</div>;
   if (!cfg)    return null;
@@ -285,15 +300,25 @@ export default function SystemTab() {
               dir: {binary.dir} <br/>
               active binary: {binary.binary || "—"}
             </div>
-            {binary.files.length > 0 && (
+            {(binary.files ?? []).length > 0 && (
               <table style={{ marginBottom: 12 }}>
-                <thead><tr><th>File</th><th>Size</th><th>Modified</th></tr></thead>
+                <thead><tr><th>File</th><th>Size</th><th>Modified</th><th></th></tr></thead>
                 <tbody>
-                  {binary.files.map(f => (
+                  {(binary.files ?? []).map(f => (
                     <tr key={f.name}>
                       <td style={{ fontFamily: "monospace", fontSize: 11 }}>{f.name}</td>
                       <td style={{ fontSize: 11 }}>{fmtBytes(f.size)}</td>
                       <td style={{ fontSize: 11 }}>{fmtDate(f.modified_at)}</td>
+                      <td>
+                        <button
+                          className="btn"
+                          style={{ fontSize: 11, padding: "2px 8px", background: "var(--red)" }}
+                          disabled={deletingFile === f.name}
+                          onClick={() => doDeleteFile(f.name)}
+                        >
+                          {deletingFile === f.name ? "Deleting…" : "Delete"}
+                        </button>
+                      </td>
                     </tr>
                   ))}
                 </tbody>

@@ -119,7 +119,17 @@ func (s *Server) handleAdminReplayBinaryStatus(ctx *fasthttp.RequestCtx) {
 		Size       int64  `json:"size"`
 		ModifiedAt int64  `json:"modified_at"`
 	}
-	var files []fileInfo
+	// Initialized to an empty (non-nil) slice, not "var files []fileInfo" —
+	// a nil slice serializes to JSON as "files": null instead of "files":
+	// [], and the admin frontend (SystemTab.tsx) calls binary.files.length
+	// / .map() on it unguarded. When servergames/ doesn't exist yet (fresh
+	// install, before any replay binary has ever been uploaded),
+	// os.ReadDir errors out below and this stayed nil — sending "null" —
+	// which threw a render exception on the frontend and blanked the
+	// entire admin page (no error boundary catches it). Empty slice keeps
+	// the JSON shape consistent (always an array) regardless of whether
+	// the directory exists.
+	files := []fileInfo{}
 	if entries, err := os.ReadDir(dir); err == nil {
 		for _, e := range entries {
 			if e.IsDir() {
@@ -221,4 +231,66 @@ func (s *Server) handleAdminReplayBinaryUpload(ctx *fasthttp.RequestCtx) {
 		"dir":  dir,
 		"staged": false,
 	})
+}
+
+// POST /backend/admin/replay-binary/delete — body: {"file": "replay.pck"}.
+// Deletes a single file out of the live servergames dir (shown in the
+// System tab's file list). Uses POST+body instead of a DELETE verb/path
+// param, matching this codebase's existing convention (see
+// /backend/admin/golden-replays/delete) rather than introducing a new
+// pattern.
+func (s *Server) handleAdminReplayBinaryDelete(ctx *fasthttp.RequestCtx) {
+	var req struct {
+		File string `json:"file"`
+	}
+	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+		writeErr(ctx, 400, "bad_json")
+		return
+	}
+
+	// filepath.Base strips any directory components the caller might send
+	// (e.g. "../../etc/passwd" -> "passwd", "../.env" -> ".env") — combined
+	// with the equality check below, this makes it impossible to delete
+	// anything outside servergamesDir() no matter what "file" contains.
+	req.File = strings.TrimSpace(req.File)
+	name := filepath.Base(req.File)
+	if name == "" || name == "." || name == "/" {
+		writeErr(ctx, 400, "missing_file")
+		return
+	}
+	// If filepath.Base() changed anything, req.File contained a path
+	// separator (e.g. "../../etc/passwd", "sub/dir/file") — reject
+	// outright rather than silently sanitizing, so a buggy/malicious
+	// client gets a clear error instead of quietly deleting a same-named
+	// file it didn't ask for. This, combined with joining only against
+	// servergamesDir() below, makes it impossible to delete anything
+	// outside that one directory.
+	if name != req.File {
+		writeErr(ctx, 400, "invalid_filename")
+		return
+	}
+
+	dir := game.ServerGamesDir()
+	target := filepath.Join(dir, name)
+
+	if _, err := os.Stat(target); err != nil {
+		writeErr(ctx, 404, "not_found")
+		return
+	}
+	if err := os.Remove(target); err != nil {
+		log.Printf("[ADMIN] replay-binary delete failed (%s): %v", target, err)
+		writeErr(ctx, 500, "delete_failed")
+		return
+	}
+
+	// The cached binary path (and the persistent worker pool, which has
+	// this same binary open/running) may now point at a file that no
+	// longer exists — reset so the next resolve re-checks from scratch,
+	// and restart workers so they don't keep running against a binary
+	// whose backing file was just deleted out from under them.
+	game.ResetBinaryCache()
+	go game.RestartAllWorkers()
+
+	log.Printf("[ADMIN] replay-binary file deleted: %s", target)
+	writeJSON(ctx, 200, map[string]any{"ok": true, "file": name})
 }

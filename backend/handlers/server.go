@@ -77,6 +77,7 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/admin/replays/clear-all",      s.requireAdminSession(s.handleAdminClearAllReplays))
 	r.GET("/backend/admin/replay-binary",           s.requireAdminSession(s.handleAdminReplayBinaryStatus))
 	r.POST("/backend/admin/replay-binary",          s.requireAdminSession(s.handleAdminReplayBinaryUpload))
+	r.POST("/backend/admin/replay-binary/delete",   s.requireAdminSession(s.handleAdminReplayBinaryDelete))
 
 	// Database tab — key-prefix category overview/clear + failed-replay archive
 	r.GET("/backend/admin/database",                s.requireAdminSession(s.handleAdminDatabaseOverview))

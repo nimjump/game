@@ -31,6 +31,7 @@ import (
 	"os/exec"
 	"os/user"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 )
@@ -99,5 +100,46 @@ func applyPrivDrop(cmd *exec.Cmd, dataDirs ...string) {
 		if err := os.Chmod(dir, 0777); err != nil {
 			log.Printf("[PRIVDROP] chmod 0777 failed for %s: %v", dir, err)
 		}
+	}
+
+	// HOME (and friends) is otherwise inherited from the root parent process
+	// (typically HOME=/root), which "nobody" (or whatever GODOT_WORKER_USER
+	// is) has no permission to read/write into. Even in --headless mode,
+	// Godot's engine can try to touch a config/cache dir under $HOME before
+	// it ever gets to loading the project's .pck — if that fails, the whole
+	// startup can abort in a way that surfaces as a confusing, unrelated-
+	// looking "couldn't load project data / is the .pck missing?" error
+	// instead of a clear permission-denied one. Point HOME (and the XDG
+	// equivalents, which Godot/glib prefer when set) at the first data dir
+	// passed in (already made world-writable above) so there's always
+	// somewhere the dropped-privilege user can actually write.
+	if len(dataDirs) > 0 && dataDirs[0] != "" {
+		home := dataDirs[0]
+		// Strip any existing HOME/XDG_* entries first (inherited from the
+		// root parent's os.Environ()) before appending our override.
+		// getenv() on Linux/glibc returns the FIRST matching entry in the
+		// environ array, not the last — so simply appending a new HOME=...
+		// after an inherited HOME=/root would be silently ignored by the
+		// child. Filtering the old ones out first guarantees our value wins.
+		overrideKeys := []string{"HOME=", "XDG_CONFIG_HOME=", "XDG_CACHE_HOME=", "XDG_DATA_HOME="}
+		filtered := cmd.Env[:0:0]
+		for _, e := range cmd.Env {
+			skip := false
+			for _, k := range overrideKeys {
+				if strings.HasPrefix(e, k) {
+					skip = true
+					break
+				}
+			}
+			if !skip {
+				filtered = append(filtered, e)
+			}
+		}
+		cmd.Env = append(filtered,
+			"HOME="+home,
+			"XDG_CONFIG_HOME="+home,
+			"XDG_CACHE_HOME="+home,
+			"XDG_DATA_HOME="+home,
+		)
 	}
 }
