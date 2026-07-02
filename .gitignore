@@ -30,3 +30,7 @@ Thumbs.db
 .env
 .env.local
 *.pem
+
+# --- replay build ---
+*.TMP
+*.tmp
