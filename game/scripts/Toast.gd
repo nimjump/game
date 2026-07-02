@@ -258,31 +258,48 @@ func _reposition_all(animate: bool = true) -> void:
 func _spawn_toast(msg: String, kind: int) -> void:
 	var col := _kind_color(kind)
 
+	# Genişliği ÖNCE hesapla — label'a SIZE_EXPAND_FILL ile "boşluğu doldur"
+	# demek yerine (bu, container'ın kendi auto-fit mantığıyla çakışıp kartın
+	# tüm ekranı kaplamasına sebep oldu) label'a doğrudan bir maksimum
+	# genişlik veriyoruz, wrap o sabit genişliğe göre oluyor. Kesin/öngörülebilir.
+	var icon_sz    := int(_vh(0.026))
+	var margin_x   := int(_vw(0.045))
+	var sep        := int(_vw(0.025))
+	var w := _stack_width()
+	var lbl_max_w := maxf(w - margin_x * 2.0 - icon_sz - sep, _vw(0.20))
+
 	var card := PanelContainer.new()
 	card.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	card.top_level = true   # kendi pozisyonunu parent layout'undan bağımsız tutar
+	card.custom_minimum_size = Vector2.ZERO
 	_apply_warm_panel_style(card, 14, 2)
 
 	var mc := MarginContainer.new()
-	mc.add_theme_constant_override("margin_left",   int(_vw(0.045)))
-	mc.add_theme_constant_override("margin_right",  int(_vw(0.045)))
+	mc.add_theme_constant_override("margin_left",   margin_x)
+	mc.add_theme_constant_override("margin_right",  margin_x)
 	mc.add_theme_constant_override("margin_top",    int(_vh(0.014)))
 	mc.add_theme_constant_override("margin_bottom", int(_vh(0.014)))
 	card.add_child(mc)
 
 	var row := HBoxContainer.new()
 	row.alignment = BoxContainer.ALIGNMENT_CENTER
-	row.add_theme_constant_override("separation", int(_vw(0.025)))
+	row.add_theme_constant_override("separation", sep)
 	mc.add_child(row)
 
-	row.add_child(UITheme.lucide_icon(_kind_icon(kind), int(_vh(0.026)), col))
+	row.add_child(UITheme.lucide_icon(_kind_icon(kind), icon_sz, col))
 
 	var lbl := Label.new()
 	lbl.text = msg
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	lbl.autowrap_mode = TextServer.AUTOWRAP_OFF
-	lbl.clip_text = false
+	# FIX: was AUTOWRAP_OFF + clip_text=false — a long message just rendered
+	# past the card's right edge instead of wrapping. A prior attempt used
+	# SIZE_EXPAND_FILL to make the label claim the row's width, but that made
+	# the card's own Container auto-fit blow up to cover the whole screen
+	# instead. Giving the label an explicit custom_minimum_size.x instead is
+	# the reliable way to force wrapping at a known, bounded width.
+	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lbl.custom_minimum_size.x = lbl_max_w
 	UITheme.apply_label(lbl, _C_BROWN, int(_vh(0.020)))
 	row.add_child(lbl)
 
@@ -290,7 +307,6 @@ func _spawn_toast(msg: String, kind: int) -> void:
 
 	# Genişliği biz veriyoruz (üst-ortada, sabit referans genişliği),
 	# yüksekliği içerik belirliyor (PanelContainer kendi min-size'ına göre).
-	var w := _stack_width()
 	var vp_w := _viewport_size().x
 	card.position.x = (vp_w - w) * 0.5
 	card.size.x = w

@@ -28,6 +28,37 @@
       color:#e0e0e0; font-family:'Noto Sans','Droid Sans',Arial,sans-serif;
       line-height:1.3; margin:0 2rem; overflow:hidden; padding:1rem; text-align:center; z-index:1;
     }
+
+    /* ── PORTRAIT LOCK ─────────────────────────────────────────────────────
+       Game is portrait-only. The Screen Orientation API (screen.orientation.
+       lock) only works inside an installed/fullscreen PWA on the browsers
+       that support it at all (mostly Android Chrome) — plain mobile Safari
+       tabs can't be force-locked via JS. So instead of relying on JS lock
+       (which silently fails on iOS and leaves the canvas resizing/rotating
+       with all the side effects that caused — toasts, panels, anchors going
+       stale), this uses a pure-CSS media query: whenever the viewport is
+       wider than it is tall on a touch device, hide the game canvas entirely
+       and show a "rotate your phone" blocker instead. The canvas never sees
+       a landscape size at all, so none of the GDScript resize/orientation
+       code ever runs in landscape — nothing to go stale. */
+    #rotate-lock {
+      display:none;
+      position:fixed; inset:0; z-index:9999;
+      background:#000;
+      color:#e8d9c0;
+      flex-direction:column; align-items:center; justify-content:center;
+      font-family:'Noto Sans','Droid Sans',Arial,sans-serif;
+      text-align:center; padding:0 2rem;
+    }
+    #rotate-lock .icon { font-size:3rem; margin-bottom:1rem; }
+    /* pointer:coarse + hover:none = an actual touchscreen (phone/tablet),
+       not a desktop browser window that just happens to be wide — device-
+       width breakpoints are unreliable for this, pointer/hover capability
+       is the correct modern way to target "real mobile device" specifically. */
+    @media (orientation: landscape) and (pointer: coarse) and (hover: none) {
+      #rotate-lock { display:flex; }
+      #canvas, #status { display:none !important; }
+    }
   </style>
   $GODOT_HEAD_INCLUDE
   <link rel="icon" type="image/png" sizes="192x192" href="assets/icon/ico-192.png">
@@ -283,6 +314,29 @@
 
 <canvas id="canvas">Your browser does not support the canvas tag.</canvas>
 <noscript>Your browser does not support JavaScript.</noscript>
+
+<div id="rotate-lock">
+  <div class="icon">📱</div>
+  <div>Please rotate your phone back to portrait —<br>NimJump only plays upright.</div>
+</div>
+
+<!-- Best-effort real lock for browsers/PWA contexts that support it (mostly
+     Android Chrome when installed to home screen). Wrapped in try/catch —
+     silently does nothing where unsupported (e.g. plain iOS Safari tabs),
+     which is fine since the CSS #rotate-lock above covers those cases. -->
+<script data-cfasync="false">
+  (function () {
+    function tryLock() {
+      try {
+        if (screen.orientation && screen.orientation.lock) {
+          screen.orientation.lock('portrait').catch(function () {});
+        }
+      } catch (e) {}
+    }
+    tryLock();
+    document.addEventListener('visibilitychange', tryLock);
+  })();
+</script>
 
 <div id="status">
   <img id="status-splash" class="$GODOT_SPLASH_CLASSES" src="$GODOT_SPLASH" alt="">

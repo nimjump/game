@@ -193,6 +193,13 @@ var SPIDER_DETECT_Y  : float = 0.0
 var _spider_climbing := false
 var _spider_web_cd    := 0.0
 var _spider_web_line  : Line2D = null
+# BUG FIX: without this, the very next web-throw decision after landing could
+# pick the platform the spider JUST CAME FROM as the new target (only the
+# CURRENT platform was excluded, not the previous one) — looking exactly like
+# "shoots a web, climbs, then immediately shoots ANOTHER web and climbs right
+# back down" since that's often the closest/only reachable vertical neighbor
+# right after a jump. Tracked so that platform is excluded for one hop.
+var _spider_prev_platform : Node = null
 # Web throw: ip önce hedefe tam ulaşır, ÖRÜMCEK O SIRADA HAREKET ETMEZ —
 # ip ulaştıktan sonra tırmanma (_spider_climbing) başlar.
 var _spider_web_throwing       := false
@@ -525,7 +532,7 @@ func _special_setup() -> void:
 
 	# Cache computed constants (EN-04: avoid per-access multiplication)
 	WINGMAN_CHASE_RANGE = _vw * 0.30 * _diff_range_mult
-	WINGMAN_CHASE_SPEED = _vw * 0.38 * _diff_speed_mult
+	WINGMAN_CHASE_SPEED = _vw * 0.55 * _diff_speed_mult   # matched to BEE_CHASE_SPEED per request
 	SPIKEMAN_DETECT_X   = _vw * 0.20 * _diff_range_mult
 	SPIKEMAN_CHASE_SPEED= _vw * 0.28 * _diff_speed_mult
 	SPIKEBALL_AMPLITUDE = _vh * 0.07
@@ -578,7 +585,7 @@ func _special_setup() -> void:
 			if sf and sf.has_animation("fly"): _anim.play("fly")
 			elif sf: _anim.play(sf.get_animation_names()[0])
 			_wingman_chasing = false
-			_start_patrol(0.9)
+			_start_patrol(1.0)   # matched to BEE's patrol speed per request
 			_start_vertical_bob(10.0, 1.8)
 
 		EnemyType.SPIKEMAN:
@@ -1026,7 +1033,7 @@ func _wingman_ai(_delta: float) -> void:
 			_wingman_chasing = false
 			_move_cancel()
 			_move_to(Vector2(global_position.x, _start_y), 0.5, false, true, false, func():
-				_start_patrol_from(global_position.x, 0.9, true)
+				_start_patrol_from(global_position.x, 1.0, true)   # matched to BEE
 				_start_vertical_bob(10.0, 1.8)
 			)
 
@@ -1414,9 +1421,16 @@ func _spider_best_platform_vertical(candidates: Array) -> Node:
 
 # Jump to target platform Y, choose a sensible X point on top of the platform
 func _frog_jump_to_platform(target_plat: Node) -> void:
-	_frog_jumping  = true
-	_frog_jump_cd  = _rng_range(1.5, 2.6)  # slightly longer pause before next jump
-	_snap_disabled = true
+	_frog_jumping     = true
+	_frog_jump_cd     = _rng_range(1.5, 2.6)  # slightly longer pause before next jump
+	_snap_disabled    = true
+	# Mid-air the frog is still on the OLD `_platform` (it's only reassigned in
+	# the landing callback below), and simulate_tick() clamps global_position.x
+	# to `_platform`'s bounds every tick. Without disabling that clamp here,
+	# any jump landing outside the old platform's x-range gets yanked back to
+	# that platform's edge every frame — looking like a teleport instead of an
+	# arc. Same fix the spider web-climb already uses (_xclamp_disabled).
+	_xclamp_disabled  = true
 	_move_cancel()
 
 	if is_instance_valid(_anim):
@@ -1469,6 +1483,7 @@ func _frog_jump_to_platform(target_plat: Node) -> void:
 		_frog_cur_platform = target_plat
 		_platform          = target_plat
 		_snap_disabled     = false
+		_xclamp_disabled   = false
 		_frog_jumping      = false
 		_snap_dirty        = false
 		_snap_target_y     = land_y
@@ -2185,10 +2200,21 @@ func _spider_ai(_delta: float) -> void:
 		return
 
 	if _spider_climbing:
-		# Mid-climb — keep the web thread's loose end pinned to the spider.
+		# BUG FIX: this used to write pts[1] = global_position here — the exact
+		# same index the throw phase used for the growing tip (pts[1] went
+		# from_pos -> land_pos during the throw). The instant climbing starts,
+		# global_position is still from_pos (spider hasn't moved yet), so pts[1]
+		# snapped from the fully-extended land_pos straight back to from_pos —
+		# the taut web collapsed to a zero-length (invisible) line in one frame,
+		# then visibly "re-grew" as the spider actually climbed. That looked
+		# exactly like the web vanishing and a second one being thrown.
+		# Fix: pts[1] (the target end) stays fixed at land_pos — it was already
+		# reached during the throw — and pts[0] (the launch end) now tracks the
+		# spider instead, so the rope visibly shortens from below as it climbs,
+		# with no snap/collapse.
 		if is_instance_valid(_spider_web_line):
 			var pts := _spider_web_line.points
-			pts[1] = global_position
+			pts[0] = global_position
 			_spider_web_line.points = pts
 		return
 
@@ -2202,6 +2228,12 @@ func _spider_ai(_delta: float) -> void:
 		var in_reach   : bool = abs(dx) < SPIDER_DETECT_X and abs(dy) < SPIDER_DETECT_Y
 		if not same_level and in_reach:
 			var neighbors : Array = _spider_get_vertical_neighbors()
+			# Exclude the platform it just came from too, not just the current
+			# one — otherwise the next web-throw right after landing can pick
+			# the platform it left as the "new" target, looking like it
+			# immediately shoots a second web and climbs straight back down.
+			if is_instance_valid(_spider_prev_platform):
+				neighbors = neighbors.filter(func(pl): return pl != _spider_prev_platform)
 			if neighbors.size() > 0:
 				var best_plat : Node = _spider_best_platform_vertical(neighbors)
 				if best_plat != null and best_plat != _frog_cur_platform:
@@ -2220,7 +2252,14 @@ func _spider_ai(_delta: float) -> void:
 # does the spider start climbing along it, landing biased toward the player's
 # current X so it actually closes the gap.
 func _spider_web_jump_to(target_plat: Node) -> void:
-	_spider_web_cd    = _rng_range(2.0, 3.2)
+	# Longer cooldown (was 2.0-3.2s) — the old range meant the FULL throw+climb
+	# sequence (up to ~2.5s) could eat almost the whole cooldown, so a new
+	# web-throw could legitimately fire within a second of landing. Combined
+	# with the "don't re-target the platform just left" fix above, this gives
+	# a real, noticeable pause between web-throws instead of feeling like two
+	# webs back-to-back.
+	_spider_web_cd        = _rng_range(4.0, 6.0)
+	_spider_prev_platform = _frog_cur_platform
 	_snap_disabled    = true
 	_xclamp_disabled  = true   # mid-transit — don't get yanked back to the old platform
 	_stop_patrol()
@@ -2272,12 +2311,24 @@ func _spider_web_jump_to(target_plat: Node) -> void:
 	# the target during the throw phase, then (once climbing starts) its loose
 	# end tracks the spider as it climbs (see _spider_ai).
 	if not _is_headless:
+		# Safety: this spider should never have a leftover web line here (the
+		# throwing/climbing state guards in _spider_ai prevent re-entry while
+		# one is active), but if anything ever slips through, don't leak a
+		# second Line2D silently — instant-clear any stale one first so there
+		# is only ever one web thread per spider at a time.
+		if is_instance_valid(_spider_web_line):
+			_spider_web_line.queue_free()
+			_spider_web_line = null
 		var web_parent := get_parent()
 		if is_instance_valid(web_parent):
 			var web := Line2D.new()
 			web.width = maxf(3.0, _vw * 0.006)   # was maxf(1.5, vw*0.003) — too thin, per request
 			web.default_color = Color(0.92, 0.92, 0.95, 0.85)
-			web.z_index = 1
+			# Was z_index=1 — platforms render at z_index=5, so the web thread was
+			# drawn BEHIND every platform it passed through, making it vanish for
+			# most of the climb (spider itself is z_index=10, so it stayed visible,
+			# making it look like the web disappeared and a second one appeared).
+			web.z_index = 6
 			web.points = PackedVector2Array([from_pos, from_pos])
 			web_parent.add_child(web)
 			_spider_web_line = web

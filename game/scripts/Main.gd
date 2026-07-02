@@ -126,7 +126,6 @@ const _TEX_TORCH_ON_B := preload("res://assets/pack/torch_on_b.png")
 
 # ── Backend state ──────────────────────────────────────────────────
 var _play_btn      : Button = null   # PLAY button reference
-var _vs_btn        : Button = null   # VS button reference (opens VSPanel)
 var _vs_panel      : CanvasLayer = null
 var _backend_ok    : bool   = true   # no longer used for ping — always true
 var _ping_retry_timer: SceneTreeTimer = null  # auto-retry handle
@@ -927,6 +926,23 @@ var _last_vh_real   : float = 0.0   # klavye olmadan son gerçek yükseklik
 
 func _on_viewport_resized() -> void:
 	var vp    := get_viewport()
+
+	# ── KLAVYE AÇILIP KAPANMA DÖNGÜSÜ (flicker) FIX ──────────────────
+	# Bir LineEdit'e yazarken mobil klavye açılır → viewport küçülür →
+	# bu fonksiyon tetiklenir → _vw/_vh güncellenir → bağlı anchor'lar
+	# yeniden yerleşir → bazı tarayıcılarda bu yeniden-yerleşim, focus'taki
+	# input'un "görünür alandan çıktığını/taşındığını" sanıp klavyeyi
+	# KAPATIR → viewport büyür → bu fonksiyon TEKRAR tetiklenir → tekrar
+	# yeniden yerleşim → bazı durumlarda klavye TEKRAR açılır → sonsuz
+	# açılıp-kapanma döngüsü. Kesin çözüm: bir LineEdit gerçekten focus'ta
+	# iken hiçbir viewport-resize tepkisi VERME (ne _vw/_vh güncelle ne
+	# rebuild) — döngüyü tetikleyecek hiçbir tepki yoksa döngü oluşamaz.
+	# Focus bittiğinde (klavye kapanıp input'tan çıkıldığında) normal
+	# akış devam eder ve son gerçek boyuta tek seferde senkronize olur.
+	var focused := vp.gui_get_focus_owner()
+	if is_instance_valid(focused) and focused is LineEdit:
+		return
+
 	var new_w := vp.get_visible_rect().size.x
 	var new_h := vp.get_visible_rect().size.y
 
@@ -960,18 +976,6 @@ func _on_viewport_resized() -> void:
 	if _started:
 		return
 
-	# Bir panel (VS, Quest, Stats, Leaderboard) tüm ekranı kaplayarak açıkken
-	# alttaki ana menüyü yıkıp yeniden kurmanın hiçbir faydası yok — panel
-	# zaten üstünde duruyor, sadece riskli bir teardown/rebuild'i tetikliyordu.
-	# VS panelinde NIM tutar/davet linki gibi LineEdit'ler olduğu için klavye
-	# açılışı en çok orada resize tetikliyordu.
-	for panel in [_vs_panel, _quest_panel, _stats_panel, _leaderboard_panel]:
-		if is_instance_valid(panel) and panel.visible:
-			_vw  = new_w
-			_vh  = new_h
-			_ref = minf(minf(_vw, _vh), GameConstants.VW)
-			return
-
 	# Küçük boyut değişikliklerini yoksay (klavye, status bar vs.)
 	# Sadece gerçek yönelim değişikliği (genişlik/yükseklik yer değiştirdi) rebuild yap
 	var w_changed := absf(new_w - _last_vw_real) > 80.0
@@ -979,6 +983,30 @@ func _on_viewport_resized() -> void:
 	# Sadece W değişti ama H değişmediyse (portrait→landscape veya tersi)
 	# İkisi de değiştiyse gerçek resize sayılır
 	var is_real_resize := (w_changed and h_changed) or (w_changed and not h_changed)
+
+	# Bir panel (VS, Quest, Stats, Leaderboard) tüm ekranı kaplayarak açıkken
+	# alttaki ana menüyü yıkıp yeniden kurmak riskli (task #64'ün crash'i) —
+	# o yüzden hâlâ yapmıyoruz. AMA panelin kendi İÇİ (ikon/font/margin
+	# boyutları) sadece panel ilk açıldığında hesaplanan sabit `ref` değerini
+	# kullanıyor — döndürme gerçek bir yön değişikliğiyse (klavye değil) o
+	# `ref` artık yanlış, ve panel HİÇ yeniden kurulmadığı için bazı öğeler
+	# (anchor'lı pozisyonlar) doğru yerleşirken bazıları (sabit piksel boyut/
+	# font) eski haliyle takılı kalıyor — "bazıları güncelleniyor bazıları
+	# olmuyor" hatası tam bu. Güvenli çözüm: gerçek yön değişikliğinde açık
+	# paneli kapat (içeriği bozmadan) — kullanıcı sekmeye tekrar dokunduğunda
+	# panel sıfırdan, doğru ref ile kurulur. Küçük/klavye kaynaklı
+	# değişikliklerde panel açık kalır, sadece _vw/_vh güncellenir.
+	for panel in [_vs_panel, _quest_panel, _stats_panel, _leaderboard_panel]:
+		if is_instance_valid(panel) and panel.visible:
+			_vw  = new_w
+			_vh  = new_h
+			_ref = minf(minf(_vw, _vh), GameConstants.VW)
+			if is_real_resize and panel.has_method("hide_panel"):
+				panel.call("hide_panel")
+				_last_vw_real = new_w
+				_last_vh_real = new_h
+			return
+
 	if not is_real_resize:
 		return
 
@@ -1566,37 +1594,19 @@ func _build_game() -> void:
 	# ══ TOP RIGHT: Pause button ══════════════════════
 	var btn_sz := int(_p(0.088))
 
+	# Pause button removed per request — not a real feature in this game.
+	# _powerup_row used to reserve space to the LEFT of it (offset_right
+	# stopped short by btn_sz+margin); now it can use the full row width.
 	_powerup_row = HBoxContainer.new()
-	_powerup_row.add_theme_constant_override("separation", int(_p(0.010)))
+	_powerup_row.add_theme_constant_override("separation", int(_p(0.026)))
 	_powerup_row.anchor_left   = 0.0; _powerup_row.anchor_right  = 1.0
 	_powerup_row.anchor_top    = 0.0; _powerup_row.anchor_bottom = 0.0
 	_powerup_row.offset_left   = M
-	_powerup_row.offset_right  = -(btn_sz + M + int(_p(0.012)))
+	_powerup_row.offset_right  = -M
 	_powerup_row.offset_top    = M
 	_powerup_row.offset_bottom = M + btn_sz
 	_powerup_row.alignment     = BoxContainer.ALIGNMENT_END
 	hud_root.add_child(_powerup_row)
-
-	# Pause: TextureButton — uses Prinbles Square/Pause asset
-	var pause_btn := TextureButton.new()
-	pause_btn.custom_minimum_size = Vector2(btn_sz, btn_sz)
-	pause_btn.stretch_mode        = TextureButton.STRETCH_KEEP_ASPECT_CENTERED
-	pause_btn.ignore_texture_size = true
-	var pause_n : String = a.get("sq_pause_n", "")
-	var pause_h : String = a.get("sq_pause_h", "")
-	if ResourceLoader.exists(pause_n):
-		pause_btn.texture_normal  = load(pause_n)
-		pause_btn.texture_pressed = load(pause_n)
-	if ResourceLoader.exists(pause_h):
-		pause_btn.texture_hover   = load(pause_h)
-	pause_btn.pressed.connect(_open_settings)
-	pause_btn.anchor_left   = 1.0; pause_btn.anchor_right  = 1.0
-	pause_btn.anchor_top    = 0.0; pause_btn.anchor_bottom = 0.0
-	pause_btn.offset_right  = -M
-	pause_btn.offset_top    = M
-	pause_btn.offset_left   = -(btn_sz + M)
-	pause_btn.offset_bottom = M + btn_sz
-	hud_root.add_child(pause_btn)
 
 	# ══ BOTTOM LEFT: Life icons ══════════════════════
 	# PanelContainer auto-sizes to content — no manual calculation needed
@@ -2176,11 +2186,11 @@ func _build_start_ui() -> void:
 	right_btn.pressed.connect(func(): _change_char(1))
 	sel_pc.add_child(right_btn)
 
-	# ── PLAY, VS and Settings buttons ────────────────────
+	# ── PLAY and Settings buttons ────────────────────
+	# (VS button removed from the menu per request — system kept intact)
 	var btn_w       := _p(0.72)
 	var play_h      := int(_p(0.105))
 	var set_h       := int(_p(0.080))
-	var vs_h        := int(_p(0.080))
 	var gap         := int(_p(0.018))
 
 	# Centre the PLAY/VS/Settings block in the space between the character
@@ -2190,7 +2200,9 @@ func _build_start_ui() -> void:
 	var sel_bottom_abs     : float = _vh * 0.5 + sel_pc.offset_bottom
 	var bottom_bar_h       : float = _vh * 0.09  # must match _build_bottom_bar()'s bar_h formula
 	var bottom_bar_top_abs : float = _vh - bottom_bar_h
-	var block_h            : float = play_h + gap + vs_h + gap + set_h
+	# VS button removed from the menu (system/panel kept, just no entry point
+	# here) — block height no longer reserves space for it.
+	var block_h            : float = play_h + gap + set_h
 	var avail_h             : float = bottom_bar_top_abs - sel_bottom_abs
 	var equal_margin        : float = maxf((avail_h - block_h) * 0.5, 0.0)
 	var block_top_abs       : float = sel_bottom_abs + equal_margin
@@ -2211,22 +2223,12 @@ func _build_start_ui() -> void:
 	UITheme.apply_ghost_button(settings_btn)
 	_ui_root.add_child(settings_btn)
 
-	# VS — between Play and Settings ("play'in altında")
-	_vs_btn = Button.new()
-	_vs_btn.text = "VS"
-	_vs_btn.add_theme_font_size_override("font_size", int(_p(0.080)))
-	_vs_btn.custom_minimum_size = Vector2(btn_w, vs_h)
-	_vs_btn.anchor_left   = 0.5; _vs_btn.anchor_right  = 0.5
-	_vs_btn.anchor_top    = 1.0; _vs_btn.anchor_bottom = 1.0
-	_vs_btn.offset_left   = -btn_w * 0.5
-	_vs_btn.offset_right  =  btn_w * 0.5
-	_vs_btn.offset_bottom = base_bottom - set_h - gap
-	_vs_btn.offset_top    = base_bottom - set_h - gap - vs_h
-	_vs_btn.pressed.connect(_open_vs_panel)
-	UITheme.apply_ghost_button(_vs_btn)
-	_ui_root.add_child(_vs_btn)
+	# VS button removed from the main menu per request — the whole VS system
+	# (VSManager, VSPanel, _open_vs_panel/_build_vs_panel/_start_vs_game, deep
+	# links via _open_vs_room, etc.) stays fully intact, there's just no
+	# button here to open it anymore.
 
-	# PLAY — above VS
+	# PLAY — above Settings
 	_play_btn = Button.new()
 	_play_btn.disabled = false
 	_play_btn.text = "PLAY"
@@ -2236,8 +2238,8 @@ func _build_start_ui() -> void:
 	_play_btn.anchor_top    = 1.0; _play_btn.anchor_bottom = 1.0
 	_play_btn.offset_left   = -btn_w * 0.5
 	_play_btn.offset_right  =  btn_w * 0.5
-	_play_btn.offset_bottom = base_bottom - set_h - gap - vs_h - gap
-	_play_btn.offset_top    = base_bottom - set_h - gap - vs_h - gap - play_h
+	_play_btn.offset_bottom = base_bottom - set_h - gap
+	_play_btn.offset_top    = base_bottom - set_h - gap - play_h
 	_play_btn.pressed.connect(_on_play_pressed)
 	UITheme.apply_play_button(_play_btn)
 	_ui_root.add_child(_play_btn)
@@ -2269,19 +2271,14 @@ func _build_start_ui() -> void:
 		# Buttons come up from below
 		_play_btn.offset_top    += int(_p(0.06))
 		_play_btn.offset_bottom += int(_p(0.06))
-		_vs_btn.offset_top       += int(_p(0.06))
-		_vs_btn.offset_bottom    += int(_p(0.06))
 		var _base := base_bottom  # same equal-margin position computed above, not a fixed screen offset
 		var _set_h2 := int(_p(0.080))
-		var _vs_h2  := int(_p(0.080))
 		var _play_h2 := int(_p(0.105))
 		var _gap2 := int(_p(0.018))
 		intro.tween_property(settings_btn, "offset_top",    _base - _set_h2,              0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 		intro.tween_property(settings_btn, "offset_bottom", _base,                         0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(_vs_btn, "offset_top",    _base - _set_h2 - _gap2 - _vs_h2,   0.37).set_delay(0.14).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(_vs_btn, "offset_bottom", _base - _set_h2 - _gap2,            0.37).set_delay(0.14).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(_play_btn, "offset_top",    _base - _set_h2 - _gap2 - _vs_h2 - _gap2 - _play_h2, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(_play_btn, "offset_bottom", _base - _set_h2 - _gap2 - _vs_h2 - _gap2,            0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_play_btn, "offset_top",    _base - _set_h2 - _gap2 - _play_h2, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_play_btn, "offset_bottom", _base - _set_h2 - _gap2,            0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
 	# ── Idle animations (start after intro) ──────────────────
 	await get_tree().create_timer(0.25).timeout
@@ -3172,12 +3169,38 @@ func _build_settings_popup() -> void:
 		info_col.add_theme_constant_override("separation", int(_p(0.004)))
 		av_row.add_child(info_col)
 
+		# Name + Edit button on one row — the separate "Display Name" section
+		# further down was redundant (this label already shows the live
+		# nickname/address, and updates the instant a new name is saved), so
+		# per request it's gone and Edit lives right next to the name instead.
+		var name_row := HBoxContainer.new()
+		name_row.add_theme_constant_override("separation", int(_p(0.010)))
+		info_col.add_child(name_row)
+
 		var lbl_lbl := Label.new()
 		var _eff_label : String = nimiq_label if nimiq_label != "" else (_bridge_pid.left(9) + "..." if _bridge_pid.length() > 9 else _bridge_pid)
 		var _display_preview : String = _player_nickname if _player_nickname != "" else _eff_label
 		lbl_lbl.text = _display_preview
+		lbl_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		lbl_lbl.clip_text = true
 		UITheme.apply_label(lbl_lbl, S_BROWN, int(_p(0.034)))
-		info_col.add_child(lbl_lbl)
+		name_row.add_child(lbl_lbl)
+
+		# Edit button — restored to its original size/solid style (was
+		# temporarily shrunk + made ghost-style, reverted per request).
+		var nick_edit_btn := Button.new()
+		nick_edit_btn.text = "Edit"
+		nick_edit_btn.add_theme_font_size_override("font_size", int(_p(0.028)))
+		nick_edit_btn.custom_minimum_size = Vector2(_p(0.22), _p(0.068))
+		_warm_btn_st(nick_edit_btn)
+		if _nickname_cooldown_end > 0 and Time.get_unix_time_from_system() < _nickname_cooldown_end:  # determinism-ok: UI-only cooldown check
+			var cd_dt := Time.get_datetime_dict_from_unix_time(_nickname_cooldown_end)
+			nick_edit_btn.disabled = true
+			nick_edit_btn.tooltip_text = "Can change after %02d.%02d.%04d" % [cd_dt.day, cd_dt.month, cd_dt.year]
+		nick_edit_btn.pressed.connect(func():
+			_open_nick_overlay()
+		)
+		name_row.add_child(nick_edit_btn)
 
 		# Full address — wrap it in two lines (NQ.. first half / second half)
 		var addr_lbl := Label.new()
@@ -3212,51 +3235,6 @@ func _build_settings_popup() -> void:
 				UITheme.apply_label(exp_lbl, S_MID, int(_p(0.020)))
 			exp_lbl.text = exp_text
 			acc_vbox.add_child(exp_lbl)
-
-		# ── Nickname section ──────────────────────────
-		var nick_sep := HSeparator.new()
-		nick_sep.add_theme_constant_override("separation", int(_p(0.008)))
-		acc_vbox.add_child(nick_sep)
-
-		var nick_hdr := Label.new()
-		nick_hdr.text = "Display Name"
-		UITheme.apply_label(nick_hdr, S_MID, int(_p(0.022)))
-		acc_vbox.add_child(nick_hdr)
-
-		# Mevcut nickname göster + "Edit" butonu — tıklayınca overlay açılır
-		var nick_row := HBoxContainer.new()
-		nick_row.add_theme_constant_override("separation", int(_p(0.008)))
-		acc_vbox.add_child(nick_row)
-
-		var nick_cur_lbl := Label.new()
-		nick_cur_lbl.text = _player_nickname if _player_nickname != "" else "(not set)"
-		nick_cur_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		nick_cur_lbl.clip_text = true
-		UITheme.apply_label(nick_cur_lbl, S_BROWN, int(_p(0.032)))
-		nick_row.add_child(nick_cur_lbl)
-
-		var nick_edit_btn := Button.new()
-		nick_edit_btn.text = "Edit"
-		nick_edit_btn.add_theme_font_size_override("font_size", int(_p(0.028)))
-		nick_edit_btn.custom_minimum_size = Vector2(_p(0.22), _p(0.068))
-		_warm_btn_st(nick_edit_btn)
-
-		# Cooldown info
-		var nick_status := Label.new()
-		nick_status.text = ""
-		nick_status.autowrap_mode = TextServer.AUTOWRAP_ARBITRARY
-		UITheme.apply_label(nick_status, S_MID, int(_p(0.022)))
-		acc_vbox.add_child(nick_status)
-
-		if _nickname_cooldown_end > 0 and Time.get_unix_time_from_system() < _nickname_cooldown_end:  # determinism-ok: UI-only cooldown check
-			var cd_dt := Time.get_datetime_dict_from_unix_time(_nickname_cooldown_end)
-			nick_status.text = "Can change after %02d.%02d.%04d" % [cd_dt.day, cd_dt.month, cd_dt.year]
-			nick_edit_btn.disabled = true
-
-		nick_edit_btn.pressed.connect(func():
-			_open_nick_overlay()
-		)
-		nick_row.add_child(nick_edit_btn)
 
 		# Disconnect button
 		if OS.has_feature("web"):
@@ -3466,6 +3444,7 @@ func _open_nick_overlay() -> void:
 
 	var dim := ColorRect.new()
 	dim.color = Color(0, 0, 0, 0.65)
+	dim.modulate.a = 0.0   # fades in below, instead of popping in instantly
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	_nick_overlay.add_child(dim)
@@ -3486,6 +3465,8 @@ func _open_nick_overlay() -> void:
 	pc_st.shadow_color = Color(0,0,0,0.3)
 	pc_st.shadow_size  = 12
 	pc.add_theme_stylebox_override("panel", pc_st)
+	pc.modulate.a = 0.0   # fades/scales in below — was popping in instantly with no animation
+	pc.scale      = Vector2(0.92, 0.92)
 	_nick_overlay.add_child(pc)
 
 	var vb := VBoxContainer.new()
@@ -3634,6 +3615,17 @@ func _open_nick_overlay() -> void:
 	if is_instance_valid(le):
 		le.grab_focus()
 		le.caret_column = le.text.length()
+
+	# Entrance animation — dim fades in, card fades + scales up from its
+	# own center. Runs after the layout frame above so pc.size is valid.
+	if is_instance_valid(pc):
+		pc.pivot_offset = pc.size * 0.5
+	var ov_tw := create_tween()
+	if ov_tw:
+		ov_tw.set_parallel(true)
+		ov_tw.tween_property(dim, "modulate:a", 1.0, 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+		ov_tw.tween_property(pc,  "modulate:a", 1.0, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+		ov_tw.tween_property(pc,  "scale", Vector2.ONE, 0.28).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
 	# ── Klavye yükseklik takibi ─────────────────────────────────────
 	# FIX: this used to also fetch the keyboard height from JS and subtract

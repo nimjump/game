@@ -55,8 +55,8 @@ var MAX_GAP      : float = 0.0
 var JETPACK_GAP : float = 9999.0
 
 const DIFFICULTY_RATE := 0.00012
-const ENEMY_BASE_PROB  := 0.28
-const ENEMY_MAX_PROB   := 0.60
+const ENEMY_BASE_PROB  := 0.25
+const ENEMY_MAX_PROB   := 0.40
 const ITEM_BASE_PROB   := 0.22
 const BROKEN_BASE_PROB := 0.05
 
@@ -363,9 +363,9 @@ func _load_all_textures() -> void:
 		"hurt": [_t(en+"bee/dead.png")],
 	}
 	_enemy_frames[Enemy.EnemyType.FLY] = {
-		"fly":  [_t(en+"fly/dead.png"), _t(en+"fly/move.png"),
-				 _t(en+"fly/dead.png"), _t(en+"fly/move.png")],
-		"hurt": [_t(en+"fly/idle.png")],
+		"fly":  [_t(en+"fly/idle.png"), _t(en+"fly/move.png"),
+				 _t(en+"fly/idle.png"), _t(en+"fly/move.png")],
+		"hurt": [_t(en+"fly/dead.png")],
 	}
 	_enemy_frames[Enemy.EnemyType.FROG] = {
 		"idle": [_t(en+"frog/idle.png")],
@@ -1862,14 +1862,23 @@ func _update_powerup_hud() -> void:
 	if not is_instance_valid(player): return
 	var _ptype : String = player.get("powerup_type")
 	var _ptmax : float  = 4.0 if _ptype == "wings" else 5.0
+	# BUG FIX: shield_timer was passed as player.get("powerup_timer") — the
+	# SAME jetpack/wings timer, copy-pasted by mistake. has_shield has no
+	# timer of its own in Player.gd at all (it's permanent until the player
+	# takes a hit, see Player.gd ~line 930), so the shield's HUD ring was
+	# literally ticking down in sync with whatever the flight powerup's
+	# remaining time happened to be — exactly the "one powerup's timer UI
+	# affects the other" symptom reported. Since shield has no real
+	# countdown, show it as a full/static ring (t_cur == t_max) instead.
+	const _SHIELD_TMAX := 1.0
 	main_node.call("update_powerup_hud",
 		player.get("is_powered_up"),
 		_ptype,
 		player.get("powerup_timer"),
 		_ptmax,
 		player.get("has_shield"),
-		player.get("powerup_timer"),
-		5.0,
+		_SHIELD_TMAX,
+		_SHIELD_TMAX,
 		player.get("_mirror_active"),
 		player.get("_mirror_timer"),
 		player.get("_eq_active"),
@@ -2164,6 +2173,43 @@ func _init_game_from_seed() -> void:
 	_game_over = false
 	highest_y  = 0
 	score      = 0
+
+	# BUG FIX: this function runs for EVERY new game start (normal PLAY from
+	# the main menu, not just "PLAY AGAIN" which does a full scene reload and
+	# gets a clean slate for free). It never reset the player's lives,
+	# powerups, or debuffs — so returning to the menu any way OTHER than
+	# "PLAY AGAIN" (e.g. after a normal game-over, or after a VS match) and
+	# starting a new game carried over whatever state the player died with:
+	# 0 lives, an active shield/boost/jetpack, mirror/earthquake/drunk debuffs
+	# still running, even leftover debug god_mode. There was already a
+	# `reset_for_lobby()` function written to do exactly this reset, but it
+	# was never called from anywhere in the whole codebase — dead code.
+	# Doing the reset right here instead guarantees it runs on every single
+	# path that starts a game, no matter how the player got back to the menu.
+	if is_instance_valid(player):
+		player.velocity = Vector2.ZERO
+		player.set("is_dead",          false)
+		player.set("has_shield",       false)
+		player.set("is_powered_up",    false)
+		player.set("powerup_timer",    0.0)
+		player.set("powerup_type",     "")
+		player.set("lives",            3)
+		player.set("_mirror_active",   false)
+		player.set("_mirror_timer",    0.0)
+		player.set("_drunk_active",    false)
+		player.set("_drunk_timer",     0.0)
+		player.set("_drunk_t",         0.0)
+		player.set("_eq_active",       false)
+		player.set("_eq_timer",        0.0)
+		player.set("_eq_debuff_timer", 0.0)
+		player.set("_eq_offset",       Vector2.ZERO)
+		player.set("_speed_boost",       false)
+		player.set("_jump_boost",        false)
+		player.set("_speed_boost_timer", 0.0)
+		player.set("_jump_boost_timer",  0.0)
+		player.set("_invincible",      0.0)
+		player.set("_hurt_flash",      0.0)
+		player.set("god_mode",         false)
 
 	_rng.seed       = game_seed
 	_shake_rng.seed = game_seed ^ 0xCAFEBABE
@@ -2741,9 +2787,10 @@ func reset_for_lobby() -> void:
 		player.set("_eq_timer",       0.0)
 		player.set("_eq_debuff_timer",0.0)
 		player.set("_eq_offset",      Vector2.ZERO)
-		player.set("_speed_boost",    false)
-		player.set("_jump_boost",     false)
-		player.set("_boost_timer",    0.0)
+		player.set("_speed_boost",       false)
+		player.set("_jump_boost",        false)
+		player.set("_speed_boost_timer", 0.0)  # was "_boost_timer" — stale name from before the timer-sharing fix
+		player.set("_jump_boost_timer",  0.0)
 		player.set("_invincible",     0.0)
 		player.set("_hurt_flash",     0.0)
 		player.set("god_mode",        false)
