@@ -129,6 +129,31 @@ func servergamesDir() string {
 	return "servergames"
 }
 
+// ensureReadableBySGDirUser — makes sure sgDir itself (a directory) and the
+// replay binary/pck inside it are traversable/readable/executable by
+// literally anyone. This matters specifically because of privdrop_unix.go:
+// when this Go process runs as root, spawned Godot workers are dropped to
+// an unprivileged user ("nobody" by default). If sgDir (or the files in it)
+// were created by an earlier run of this backend with a restrictive umask
+// (root commonly defaults to 077), the dropped-privilege worker can't even
+// traverse into the directory — which surfaces as a confusing Godot error
+// ("Couldn't load project data... Is the .pck file missing?") instead of a
+// clear permission-denied message, because Godot silently falls back
+// through its project-loading methods rather than reporting the real
+// reason opening the .pck failed. Safe to call unconditionally/often —
+// os.Chmod is a cheap syscall and this is not a hot path.
+func ensureReadableBySGDirUser(sgDir, binPath, pckPath string) {
+	if err := os.Chmod(sgDir, 0755); err != nil {
+		log.Printf("[REPLAY] chmod 0755 failed for dir %s: %v", sgDir, err)
+	}
+	if err := os.Chmod(binPath, 0755); err != nil {
+		log.Printf("[REPLAY] chmod 0755 failed for %s: %v", binPath, err)
+	}
+	if err := os.Chmod(pckPath, 0644); err != nil {
+		log.Printf("[REPLAY] chmod 0644 failed for %s: %v", pckPath, err)
+	}
+}
+
 // extractLinuxBinary — extracts ALL files from replay.zip into sgDir.
 // The zip contains the Linux binary ("replay") and its data file ("replay.pck").
 // Both must exist side-by-side for Godot to run.
@@ -141,6 +166,15 @@ func extractLinuxBinary(sgDir string) (string, error) {
 	binOK  := func() bool { _, e := os.Stat(binPath); return e == nil }()
 	pckOK  := func() bool { _, e := os.Stat(pckPath); return e == nil }()
 	if binOK && pckOK {
+		// Re-apply permissions even on the "already extracted" fast path.
+		// Files extracted by an OLDER version of this code (before the
+		// privilege-drop / umask fixes below existed) may still be sitting
+		// here with root-only permissions from a previous run — this
+		// unconditional re-chmod (bypasses umask, unlike the perm passed to
+		// WriteFile) guarantees a privilege-dropped Godot worker (see
+		// privdrop_unix.go) can always read/execute them, regardless of
+		// when/how they were originally written to disk.
+		ensureReadableBySGDirUser(sgDir, binPath, pckPath)
 		log.Printf("[REPLAY] already extracted: %s", binPath)
 		return binPath, nil
 	}
@@ -168,6 +202,15 @@ func extractLinuxBinary(sgDir string) (string, error) {
 		// Skip if already exists
 		if _, err := os.Stat(outPath); err == nil {
 			log.Printf("[REPLAY] already exists, skipping: %s", name)
+			// Same re-chmod as the fast-path above — a pre-existing file
+			// from an older run may still have root-only permissions.
+			perm := os.FileMode(0644)
+			if name == "replay" || !strings.Contains(name, ".") {
+				perm = 0755
+			}
+			if err := os.Chmod(outPath, perm); err != nil {
+				log.Printf("[REPLAY] chmod %o failed for %s: %v", perm, outPath, err)
+			}
 			if name == "replay" { foundBin = true }
 			continue
 		}
@@ -237,6 +280,17 @@ func godotBinary() string {
 			if runtime.GOOS != "windows" && strings.HasSuffix(c, ".exe") {
 				log.Printf("[REPLAY] skipping .exe on linux: %s", c)
 				continue
+			}
+			// THIS is the branch that actually runs for an already-extracted
+			// "replay" binary on every subsequent backend restart (the
+			// extractLinuxBinary() path below is only reached the very
+			// first time, before "replay"/"replay.pck" exist). Without this
+			// re-chmod, files left over from a run before the privilege-drop
+			// fix (privdrop_unix.go) existed would keep their old root-only
+			// permissions forever, breaking the dropped-privilege ("nobody")
+			// Godot worker on every subsequent start.
+			if filepath.Base(c) == "replay" {
+				ensureReadableBySGDirUser(sgDir, c, filepath.Join(sgDir, "replay.pck"))
 			}
 			_cachedBin = c
 			log.Printf("[REPLAY] binary found: %s (os=%s)", c, runtime.GOOS)
