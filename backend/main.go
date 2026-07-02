@@ -186,7 +186,19 @@ func main() {
 		staticHandler(ctx)
 	})
 
-	addr := "0.0.0.0:" + port
+	// BIND_HOST — defaults to 127.0.0.1 (localhost-only). This server sits
+	// behind a Cloudflare Tunnel (cloudflared connects out to this local
+	// port — no inbound port needs to be open on this machine at all), so
+	// there's no reason for the raw Go process itself to also be reachable
+	// directly from the network on 0.0.0.0. Binding to loopback only means
+	// nothing on this box can hit the backend (game API or admin panel)
+	// except through the tunnel. Override with BIND_HOST=0.0.0.0 if this
+	// ever needs to run without a tunnel/reverse proxy in front of it.
+	bindHost := os.Getenv("BIND_HOST")
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	addr := bindHost + ":" + port
 	log.Printf("[STARTUP] listening on http://%s", addr)
 
 	// Graceful shutdown
