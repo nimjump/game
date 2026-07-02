@@ -854,4 +854,4 @@ on failure" under the task's Settings tab) or a small wrapper like
 [NSSM](https://nssm.cc/) to install `nimjump-backend.exe` as a proper
 Windows service with restart-on-crash. The binary and `.env` setup are
 identical either way — only the "keep it running" mechanism changes.
-   
+
