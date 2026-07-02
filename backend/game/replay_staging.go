@@ -67,10 +67,9 @@ func ActivateStagedReplayBinary() (string, error) {
 	if err := os.MkdirAll(liveDir, 0755); err != nil {
 		return "", fmt.Errorf("mkdir live dir: %w", err)
 	}
-	// MkdirAll's perm is masked by the process umask (root commonly runs
-	// with umask 077) — explicit chmod bypasses that, so a privilege-dropped
-	// Godot worker (see privdrop_unix.go, only applies if this process is
-	// root) can actually traverse into this directory to read the binary/pck.
+	// MkdirAll's perm is masked by the process umask — explicit chmod
+	// bypasses that, so the Godot worker can actually traverse into this
+	// directory to read the binary/pck.
 	if err := os.Chmod(liveDir, 0755); err != nil {
 		fmt.Printf("[REPLAY_STAGING] chmod 0755 failed for %s: %v\n", liveDir, err)
 	}
@@ -86,7 +85,7 @@ func ActivateStagedReplayBinary() (string, error) {
 	}
 	// Same umask concern as above — this file (replay.zip, or a directly
 	// uploaded "replay" binary) must be world-readable+executable so the
-	// privilege-dropped worker can run it.
+	// worker can run it.
 	if err := os.Chmod(dstPath, 0755); err != nil {
 		fmt.Printf("[REPLAY_STAGING] chmod 0755 failed for %s: %v\n", dstPath, err)
 	}

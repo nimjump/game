@@ -158,14 +158,10 @@ func jobDirFromEnv() string {
 		return os.TempDir()
 	}
 
-	// os.MkdirAll's perm is masked by the process umask (root commonly
-	// defaults to 077), which can silently leave newly-created intermediate
-	// directories (e.g. ".../data" here, NOT just the final ".../replay-
-	// jobs" leaf) at 0700 — traversable only by root. A privilege-dropped
-	// Godot worker (privdrop_unix.go) then gets EACCES trying to chdir/open
-	// anything under such a directory, even though the leaf dir itself
-	// (chmod'd separately, see applyPrivDrop in startProcess below) is
-	// wide open. Walk every level THIS call actually created (stopping at
+	// os.MkdirAll's perm is masked by the process umask, which can silently
+	// leave newly-created intermediate directories (e.g. ".../data" here,
+	// NOT just the final ".../replay-jobs" leaf) more restrictive than
+	// requested. Walk every level THIS call actually created (stopping at
 	// existingBase, found above — never touching anything that already
 	// existed before this call) and force each one to 0755 explicitly,
 	// bypassing umask entirely (os.Chmod always sets the exact bits given).
@@ -410,15 +406,6 @@ func (p *workerPool) startProcess(w *godotWorker) error {
 		"PULSE_SERVER=",
 	)
 
-	// If this Go process itself is running as root, drop the Godot child to
-	// an unprivileged user (see privdrop_unix.go) — Godot's headless engine
-	// can hang indefinitely as root and never print its READY line, which
-	// is exactly the "worker READY timeout" failure mode. Also loosens the
-	// permissions on the per-worker crash/user-data dir so the now
-	// different-uid child can still write into a directory this (root)
-	// process just created.
-	applyPrivDrop(cmd, crashDir, p.jobDir)
-
 	// stdout → pipe; okuma goroutine'i READY satırını arar, geri kalanını loglar
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
@@ -633,11 +620,9 @@ func (p *workerPool) runJob(w *godotWorker, jobMsg workerPoolJob, jobNum int) (*
 	}
 
 	// Atomik yazma: önce .tmp, sonra rename.
-	// 0644 (not 0600): when this Go process is root, the Godot child that
-	// reads this file has been dropped to an unprivileged user (see
-	// privdrop_unix.go) and would get a permission-denied read on a 0600
-	// file owned by root. It's transient replay-log data in a scratch temp
-	// dir, not a secret, so world-readable here is fine.
+	// 0644 (not 0600): the Godot worker process needs to be able to read
+	// this file. It's transient replay-log data in a scratch temp dir, not
+	// a secret, so world-readable here is fine.
 	tmpFile := jobFile + ".tmp"
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return nil, fmt.Errorf("write job file: %w", err)

@@ -130,18 +130,14 @@ func servergamesDir() string {
 }
 
 // ensureReadableBySGDirUser — makes sure sgDir itself (a directory) and the
-// replay binary/pck inside it are traversable/readable/executable by
-// literally anyone. This matters specifically because of privdrop_unix.go:
-// when this Go process runs as root, spawned Godot workers are dropped to
-// an unprivileged user ("nobody" by default). If sgDir (or the files in it)
-// were created by an earlier run of this backend with a restrictive umask
-// (root commonly defaults to 077), the dropped-privilege worker can't even
-// traverse into the directory — which surfaces as a confusing Godot error
-// ("Couldn't load project data... Is the .pck file missing?") instead of a
-// clear permission-denied message, because Godot silently falls back
-// through its project-loading methods rather than reporting the real
-// reason opening the .pck failed. Safe to call unconditionally/often —
-// os.Chmod is a cheap syscall and this is not a hot path.
+// replay binary/pck inside it are traversable/readable/executable. If sgDir
+// (or the files in it) were created by an earlier run of this backend under
+// a restrictive umask, permissions can end up too tight — which surfaces as
+// a confusing Godot error ("Couldn't load project data... Is the .pck file
+// missing?") instead of a clear permission-denied message, because Godot
+// silently falls back through its project-loading methods rather than
+// reporting the real reason opening the .pck failed. Safe to call
+// unconditionally/often — os.Chmod is a cheap syscall and this is not a hot path.
 func ensureReadableBySGDirUser(sgDir, binPath, pckPath string) {
 	if err := os.Chmod(sgDir, 0755); err != nil {
 		log.Printf("[REPLAY] chmod 0755 failed for dir %s: %v", sgDir, err)
@@ -167,13 +163,12 @@ func extractLinuxBinary(sgDir string) (string, error) {
 	pckOK  := func() bool { _, e := os.Stat(pckPath); return e == nil }()
 	if binOK && pckOK {
 		// Re-apply permissions even on the "already extracted" fast path.
-		// Files extracted by an OLDER version of this code (before the
-		// privilege-drop / umask fixes below existed) may still be sitting
-		// here with root-only permissions from a previous run — this
-		// unconditional re-chmod (bypasses umask, unlike the perm passed to
-		// WriteFile) guarantees a privilege-dropped Godot worker (see
-		// privdrop_unix.go) can always read/execute them, regardless of
-		// when/how they were originally written to disk.
+		// Files extracted by an OLDER version of this code (before these
+		// umask fixes existed) may still be sitting here with overly
+		// restrictive permissions from a previous run — this unconditional
+		// re-chmod (bypasses umask, unlike the perm passed to WriteFile)
+		// guarantees the Godot worker can always read/execute them,
+		// regardless of when/how they were originally written to disk.
 		ensureReadableBySGDirUser(sgDir, binPath, pckPath)
 		log.Printf("[REPLAY] already extracted: %s", binPath)
 		return binPath, nil
@@ -232,12 +227,11 @@ func extractLinuxBinary(sgDir string) (string, error) {
 		if err := os.WriteFile(outPath, data, perm); err != nil {
 			return "", fmt.Errorf("write failed (%s): %w", name, err)
 		}
-		// os.WriteFile's perm arg is masked by the process umask (e.g. root
-		// often runs with umask 077, silently turning our requested 0644
-		// into 0600). Explicit os.Chmod bypasses umask entirely, guaranteeing
-		// the exact mode — needed so a privilege-dropped ("nobody") Godot
-		// child (see privdrop_unix.go) can actually read replay.pck /
-		// execute the replay binary even when this Go process is root.
+		// os.WriteFile's perm arg is masked by the process umask, which can
+		// silently turn our requested 0644 into something more restrictive.
+		// Explicit os.Chmod bypasses umask entirely, guaranteeing the exact
+		// mode so the Godot worker can always read replay.pck / execute the
+		// replay binary.
 		if err := os.Chmod(outPath, perm); err != nil {
 			log.Printf("[REPLAY] chmod %o failed for %s: %v", perm, outPath, err)
 		}
@@ -285,10 +279,9 @@ func godotBinary() string {
 			// "replay" binary on every subsequent backend restart (the
 			// extractLinuxBinary() path below is only reached the very
 			// first time, before "replay"/"replay.pck" exist). Without this
-			// re-chmod, files left over from a run before the privilege-drop
-			// fix (privdrop_unix.go) existed would keep their old root-only
-			// permissions forever, breaking the dropped-privilege ("nobody")
-			// Godot worker on every subsequent start.
+			// re-chmod, files left over from a run before these umask fixes
+			// existed would keep their old overly-restrictive permissions
+			// forever, breaking the Godot worker on every subsequent start.
 			if filepath.Base(c) == "replay" {
 				ensureReadableBySGDirUser(sgDir, c, filepath.Join(sgDir, "replay.pck"))
 			}
@@ -452,13 +445,12 @@ func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int
 	}
 	log.Printf("[REPLAY_SIM] raw_bytes=%d rle_decoded_ticks=%d seed=%d player_seed=%d", len(raw), rleDecodedTicks, seed, playerSeed)
 
-	// 0644 (not 0600): same reasoning as replay_worker.go's job file — when
-	// this process is root, the Godot child is dropped to an unprivileged
-	// user (privdrop_unix.go) and needs to actually be able to read this.
+	// 0644 (not 0600): same reasoning as replay_worker.go's job file — the
+	// Godot worker process needs to actually be able to read this file.
 	if err := os.WriteFile(logFile, raw, 0644); err != nil {
 		return nil, fmt.Errorf("log dosyasi yazilamadi: %w", err)
 	}
-	// os.WriteFile's perm is masked by the process umask (root often runs
+	// os.WriteFile's perm is masked by the process umask (which often runs
 	// with umask 077) — explicit chmod bypasses that entirely.
 	if err := os.Chmod(logFile, 0644); err != nil {
 		log.Printf("[REPLAY_SIM] chmod 0644 failed for %s: %v", logFile, err)
@@ -491,12 +483,6 @@ func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int
 		"PULSE_SERVER=",                // prevent PulseAudio connection attempt
 		"ALSA_CARD=",                   // prevent ALSA device probe
 	)
-
-	// Same root→unprivileged-user drop as the persistent worker pool (see
-	// privdrop_unix.go / replay_worker.go) — this one-shot path is used by
-	// the admin panel's manual replay re-verify, so it needs the identical
-	// protection against Godot hanging when started as root.
-	applyPrivDrop(cmd, crashLogDir)
 
 	var stdoutBuf, stderrBuf strings.Builder
 	cmd.Stdout = &stdoutBuf
