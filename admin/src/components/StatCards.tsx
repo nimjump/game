@@ -11,7 +11,7 @@ interface Props {
 export default function StatCards({ ov, activeTab, onTabChange }: Props) {
   const cards: { label: string; value: number; color: string; tab: Tab }[] = [
     { label: "Total",            value: ov.counts.total,              color: "var(--text)",   tab: "all" },
-    { label: "🎮 Active",        value: ov.counts.active,             color: "var(--green)",  tab: "active" },
+    { label: "🎮 Active",        value: ov.counts.active,             color: "var(--green)",  tab: "overview" },
     { label: "✅ Completed",     value: ov.counts.completed,          color: "var(--blue)",   tab: "completed" },
     { label: "🚩 Flagged",       value: ov.counts.flagged,            color: "var(--red)",    tab: "flagged" },
     { label: "⚠ Replay Failed",  value: ov.counts.replay_failed ?? 0, color: "var(--yellow)", tab: "failed_replays" },

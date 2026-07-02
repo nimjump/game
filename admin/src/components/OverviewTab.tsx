@@ -52,7 +52,7 @@ export default function OverviewTab({ ov }: Props) {
               <tr key={s.session_id} style={s.flagged ? { background: "#1a0d0d" } : {}}>
                 <td>
                   <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
-                    <NimiqAvatar address={s.player_id} size={24} />
+                    <NimiqAvatar address={s.player_id ?? ""} size={24} />
                     <span style={{ fontSize: 12 }}>{s.nickname || "—"}</span>
                   </div>
                 </td>

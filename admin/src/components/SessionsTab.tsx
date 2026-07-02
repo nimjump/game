@@ -150,7 +150,7 @@ export default function SessionsTab({
                     <td style={{ color: "var(--text-muted)", fontSize: 11 }}>{i + 1}</td>
                     <td>
                       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <NimiqAvatar address={s.player_id} size={30} />
+                        <NimiqAvatar address={s.player_id ?? ""} size={30} />
                         <div>
                           <div style={{ fontSize: 13, fontWeight: 600 }}>{s.nickname || "—"}</div>
                           <div style={{ fontFamily: "monospace", fontSize: 10, color: "var(--text-muted)" }}>
