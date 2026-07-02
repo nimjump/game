@@ -135,10 +135,46 @@ func jobDirFromEnv() string {
 	} else {
 		log.Printf("[WORKER_POOL] REPLAY_JOB_DIR abs path resolve failed (%s): %v — using as-is", dir, err)
 	}
+
+	// Find the deepest already-existing ancestor BEFORE creating anything —
+	// this tells us exactly which directory levels MkdirAll below is about
+	// to create fresh, so we know which ones are safe/necessary to re-chmod
+	// afterward (see loop below) without ever touching a pre-existing
+	// directory (like /root itself) that the operator manages themselves.
+	existingBase := dir
+	for {
+		if _, err := os.Stat(existingBase); err == nil {
+			break // found the deepest dir that already exists
+		}
+		parent := filepath.Dir(existingBase)
+		if parent == existingBase {
+			break // hit filesystem root without finding anything — bail
+		}
+		existingBase = parent
+	}
+
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Printf("[WORKER_POOL] REPLAY_JOB_DIR mkdir failed (%s): %v — falling back to os.TempDir()", dir, err)
 		return os.TempDir()
 	}
+
+	// os.MkdirAll's perm is masked by the process umask (root commonly
+	// defaults to 077), which can silently leave newly-created intermediate
+	// directories (e.g. ".../data" here, NOT just the final ".../replay-
+	// jobs" leaf) at 0700 — traversable only by root. A privilege-dropped
+	// Godot worker (privdrop_unix.go) then gets EACCES trying to chdir/open
+	// anything under such a directory, even though the leaf dir itself
+	// (chmod'd separately, see applyPrivDrop in startProcess below) is
+	// wide open. Walk every level THIS call actually created (stopping at
+	// existingBase, found above — never touching anything that already
+	// existed before this call) and force each one to 0755 explicitly,
+	// bypassing umask entirely (os.Chmod always sets the exact bits given).
+	for p := dir; p != existingBase && p != "" && p != "."; p = filepath.Dir(p) {
+		if err := os.Chmod(p, 0755); err != nil {
+			log.Printf("[WORKER_POOL] chmod 0755 failed for %s: %v", p, err)
+		}
+	}
+
 	return dir
 }
 
