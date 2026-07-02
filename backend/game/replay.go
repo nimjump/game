@@ -189,6 +189,15 @@ func extractLinuxBinary(sgDir string) (string, error) {
 		if err := os.WriteFile(outPath, data, perm); err != nil {
 			return "", fmt.Errorf("write failed (%s): %w", name, err)
 		}
+		// os.WriteFile's perm arg is masked by the process umask (e.g. root
+		// often runs with umask 077, silently turning our requested 0644
+		// into 0600). Explicit os.Chmod bypasses umask entirely, guaranteeing
+		// the exact mode — needed so a privilege-dropped ("nobody") Godot
+		// child (see privdrop_unix.go) can actually read replay.pck /
+		// execute the replay binary even when this Go process is root.
+		if err := os.Chmod(outPath, perm); err != nil {
+			log.Printf("[REPLAY] chmod %o failed for %s: %v", perm, outPath, err)
+		}
 		log.Printf("[REPLAY] extracted: %s (%d bytes, perm=%o)", name, len(data), perm)
 		if name == "replay" { foundBin = true }
 	}
@@ -395,6 +404,11 @@ func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int
 	if err := os.WriteFile(logFile, raw, 0644); err != nil {
 		return nil, fmt.Errorf("log dosyasi yazilamadi: %w", err)
 	}
+	// os.WriteFile's perm is masked by the process umask (root often runs
+	// with umask 077) — explicit chmod bypasses that entirely.
+	if err := os.Chmod(logFile, 0644); err != nil {
+		log.Printf("[REPLAY_SIM] chmod 0644 failed for %s: %v", logFile, err)
+	}
 
 	// Timeout: fast-sim runs all ticks in one blocking frame (seek_to_tick while loop).
 	// Startup + asset load ~3-8s on a real server. 30s is a very safe ceiling.
@@ -597,43 +611,4 @@ func logCrashDetails(crashLogDir string, seed int64) {
 
 		// Alt dizinlere de bak
 		_ = filepath.Walk(crashLogDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || info.IsDir() {
-				return nil
-			}
-			if strings.HasSuffix(path, ".log") || strings.HasSuffix(path, ".txt") {
-				content, rerr := os.ReadFile(path)
-				if rerr == nil && len(content) > 0 {
-					text := string(content)
-					if len(text) > 4096 {
-						text = "...(truncated)...\n" + text[len(text)-4096:]
-					}
-					log.Printf("[REPLAY_CRASH] seession log: %s\n%s", path, text)
-				}
-			}
-			return nil
-		})
-	}
-}
-
-// SummaryLine — returns replay sim result as a single log line
-func SummaryLine(result *GodotReplayResult, clientScore int) string {
-	if result == nil {
-		return "result=nil"
-	}
-	return fmt.Sprintf("server_score=%d client_score=%d ticks=%d err=%q",
-		result.ServerScore, clientScore, result.Ticks, result.Error)
-}
-
-// ParseFlagReason — compares client and server score; flags if outside tolerance.
-// tolerance: 0.05 = 5% (accounts for rounding vs physics differences)
-func ParseFlagReason(clientScore, serverScore int, tolerance float64) (flagged bool, reason string) {
-	if serverScore <= 0 {
-		return true, fmt.Sprintf("sim_zero:client=%d,server=%d", clientScore, serverScore)
-	}
-	diff := math.Abs(float64(clientScore-serverScore) / float64(serverScore))
-	if diff > tolerance {
-		return true, fmt.Sprintf("score_mismatch:client=%d,server=%d,diff=%.2f%%",
-			clientScore, serverScore, diff*100)
-	}
-	return false, ""
-}
+			if err != nil || inf

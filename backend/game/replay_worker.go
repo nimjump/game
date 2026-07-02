@@ -584,6 +584,11 @@ func (p *workerPool) runJob(w *godotWorker, jobMsg workerPoolJob, jobNum int) (*
 	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
 		return nil, fmt.Errorf("write job file: %w", err)
 	}
+	// os.WriteFile's perm is masked by the process umask (root often runs
+	// with umask 077) — explicit chmod bypasses that entirely.
+	if err := os.Chmod(tmpFile, 0644); err != nil {
+		log.Printf("[WORKER#%d] chmod 0644 failed for %s: %v", w.id, tmpFile, err)
+	}
 	if err := os.Rename(tmpFile, jobFile); err != nil {
 		os.Remove(tmpFile)
 		return nil, fmt.Errorf("rename job file: %w", err)
@@ -635,42 +640,4 @@ func (p *workerPool) runJob(w *godotWorker, jobMsg workerPoolJob, jobNum int) (*
 	}
 
 	reason := fmt.Sprintf("result timeout (polled %dx, deadline=%s)", pollCount, deadline.Format(time.RFC3339))
-	archiveFailedReplay(p.jobDir, job, jobMsg.jobID, "worker_timeout", reason, time.Since(jobMsg.submittedAt), time.Since(jobMsg.submittedAt))
-	os.Remove(jobFile)
-	os.Remove(job.Out)
-	return nil, fmt.Errorf("result timeout seed=%s worker#%d job#%d deadline=%s (polled %dx)",
-		job.Seed, w.id, jobNum, deadline.Format(time.RFC3339), pollCount)
-}
-
-// killWorker — QUIT job dosyası yazar, kısa bekle, sonra zorla öldür
-func (p *workerPool) killWorker(w *godotWorker) {
-	w.mu.Lock()
-	w.alive = false
-	wid := w.id
-	w.mu.Unlock()
-
-	quitFile := filepath.Join(p.jobDir, fmt.Sprintf("wrk_job_%d_quit.json", wid))
-	os.WriteFile(quitFile, []byte("QUIT"), 0600)
-	time.Sleep(2 * time.Second)
-	os.Remove(quitFile)
-
-	w.mu.Lock()
-	if w.cmd != nil && w.cmd.Process != nil {
-		w.cmd.Process.Kill()
-	}
-	w.mu.Unlock()
-}
-
-// dailyRestart — her 24 saatte bir tüm worker'ları sırayla yeniden başlat
-func (p *workerPool) dailyRestart() {
-	for {
-		time.Sleep(24 * time.Hour)
-		log.Printf("[WORKER_POOL] daily restart")
-		p.mu.Lock()
-		for _, w := range p.workers {
-			p.killWorker(w)
-			time.Sleep(1 * time.Second)
-		}
-		p.mu.Unlock()
-	}
-}
+	archiveFailedReplay(p.jo
