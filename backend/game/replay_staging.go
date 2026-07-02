@@ -77,4 +77,27 @@ func ActivateStagedReplayBinary() (string, error) {
 
 	srcPath := filepath.Join(stagedDir, name)
 	dstPath := filepath.Join(liveDir, name)
-	data, er
+	data, err := os.ReadFile(srcPath)
+	if err != nil {
+		return "", fmt.Errorf("read staged file: %w", err)
+	}
+	if err := os.WriteFile(dstPath, data, 0755); err != nil {
+		return "", fmt.Errorf("write live file: %w", err)
+	}
+	// Same umask concern as above — this file (replay.zip, or a directly
+	// uploaded "replay" binary) must be world-readable+executable so the
+	// privilege-dropped worker can run it.
+	if err := os.Chmod(dstPath, 0755); err != nil {
+		fmt.Printf("[REPLAY_STAGING] chmod 0755 failed for %s: %v\n", dstPath, err)
+	}
+
+	if name == "replay.zip" {
+		os.Remove(filepath.Join(liveDir, "replay"))
+		os.Remove(filepath.Join(liveDir, "replay.pck"))
+	}
+
+	_ = os.Remove(srcPath)
+	ResetBinaryCache()
+	RestartAllWorkers()
+	return name, nil
+}

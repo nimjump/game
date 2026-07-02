@@ -611,4 +611,43 @@ func logCrashDetails(crashLogDir string, seed int64) {
 
 		// Alt dizinlere de bak
 		_ = filepath.Walk(crashLogDir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || inf
+			if err != nil || info.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(path, ".log") || strings.HasSuffix(path, ".txt") {
+				content, rerr := os.ReadFile(path)
+				if rerr == nil && len(content) > 0 {
+					text := string(content)
+					if len(text) > 4096 {
+						text = "...(truncated)...\n" + text[len(text)-4096:]
+					}
+					log.Printf("[REPLAY_CRASH] seession log: %s\n%s", path, text)
+				}
+			}
+			return nil
+		})
+	}
+}
+
+// SummaryLine — returns replay sim result as a single log line
+func SummaryLine(result *GodotReplayResult, clientScore int) string {
+	if result == nil {
+		return "result=nil"
+	}
+	return fmt.Sprintf("server_score=%d client_score=%d ticks=%d err=%q",
+		result.ServerScore, clientScore, result.Ticks, result.Error)
+}
+
+// ParseFlagReason — compares client and server score; flags if outside tolerance.
+// tolerance: 0.05 = 5% (accounts for rounding vs physics differences)
+func ParseFlagReason(clientScore, serverScore int, tolerance float64) (flagged bool, reason string) {
+	if serverScore <= 0 {
+		return true, fmt.Sprintf("sim_zero:client=%d,server=%d", clientScore, serverScore)
+	}
+	diff := math.Abs(float64(clientScore-serverScore) / float64(serverScore))
+	if diff > tolerance {
+		return true, fmt.Sprintf("score_mismatch:client=%d,server=%d,diff=%.2f%%",
+			clientScore, serverScore, diff*100)
+	}
+	return false, ""
+}

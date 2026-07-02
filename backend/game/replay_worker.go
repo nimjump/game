@@ -640,4 +640,42 @@ func (p *workerPool) runJob(w *godotWorker, jobMsg workerPoolJob, jobNum int) (*
 	}
 
 	reason := fmt.Sprintf("result timeout (polled %dx, deadline=%s)", pollCount, deadline.Format(time.RFC3339))
-	archiveFailedReplay(p.jo
+	archiveFailedReplay(p.jobDir, job, jobMsg.jobID, "worker_timeout", reason, time.Since(jobMsg.submittedAt), time.Since(jobMsg.submittedAt))
+	os.Remove(jobFile)
+	os.Remove(job.Out)
+	return nil, fmt.Errorf("result timeout seed=%s worker#%d job#%d deadline=%s (polled %dx)",
+		job.Seed, w.id, jobNum, deadline.Format(time.RFC3339), pollCount)
+}
+
+// killWorker — QUIT job dosyası yazar, kısa bekle, sonra zorla öldür
+func (p *workerPool) killWorker(w *godotWorker) {
+	w.mu.Lock()
+	w.alive = false
+	wid := w.id
+	w.mu.Unlock()
+
+	quitFile := filepath.Join(p.jobDir, fmt.Sprintf("wrk_job_%d_quit.json", wid))
+	os.WriteFile(quitFile, []byte("QUIT"), 0600)
+	time.Sleep(2 * time.Second)
+	os.Remove(quitFile)
+
+	w.mu.Lock()
+	if w.cmd != nil && w.cmd.Process != nil {
+		w.cmd.Process.Kill()
+	}
+	w.mu.Unlock()
+}
+
+// dailyRestart — her 24 saatte bir tüm worker'ları sırayla yeniden başlat
+func (p *workerPool) dailyRestart() {
+	for {
+		time.Sleep(24 * time.Hour)
+		log.Printf("[WORKER_POOL] daily restart")
+		p.mu.Lock()
+		for _, w := range p.workers {
+			p.killWorker(w)
+			time.Sleep(1 * time.Second)
+		}
+		p.mu.Unlock()
+	}
+}
