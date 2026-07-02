@@ -155,7 +155,18 @@ func isCloudflareIP(ip net.IP) bool {
 func realClientIP(ctx *fasthttp.RequestCtx) string {
 	peer := ctx.RemoteIP()
 
-	if isCloudflareIP(peer) {
+	// BUG FIX: with a Cloudflare TUNNEL (cloudflared running locally and
+	// dialing this server over loopback) instead of Cloudflare connecting
+	// directly to a public origin IP, the TCP peer this server ever sees is
+	// ALWAYS 127.0.0.1/::1 — never a real Cloudflare edge IP — so the
+	// isCloudflareIP(peer) check below could never pass, and every request
+	// (including admin login attempts) logged as ip=127.0.0.1 regardless of
+	// who actually connected. Trusting CF-Connecting-IP/X-Forwarded-For for
+	// loopback peers too is safe specifically because this server now binds
+	// to 127.0.0.1 only (see main.go BIND_HOST) — nothing on the network can
+	// reach the loopback interface to forge these headers directly; the only
+	// process able to connect at all is cloudflared itself.
+	if isCloudflareIP(peer) || peer.IsLoopback() {
 		if cf := strings.TrimSpace(string(ctx.Request.Header.Peek("CF-Connecting-IP"))); cf != "" {
 			return cf
 		}

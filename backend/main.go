@@ -83,6 +83,22 @@ func printStartupBanner(store *game.Store) {
 		fmt.Println("  [NIMIQ] Balance     : (skipped — key/address missing)")
 	}
 
+	// ADMIN AUTH — logs which values are ACTUALLY active at startup (never
+	// the password itself). loadEnv() above only sets a var from .env if it
+	// wasn't already a real env var — so if something else (a shell export,
+	// a systemd Environment= line, /etc/environment, etc.) already defines
+	// ADMIN_USERNAME/ADMIN_PASSWORD, THAT value silently wins over .env and
+	// the login form's credentials will never match what's in the .env file
+	// on disk. This line makes that mismatch visible instead of a mystery
+	// "invalid_credentials" with no way to tell where the real value came from.
+	adminUser := os.Getenv("ADMIN_USERNAME")
+	adminPassLen := len(os.Getenv("ADMIN_PASSWORD"))
+	if adminUser == "" && adminPassLen == 0 {
+		fmt.Println("  [ADMIN_AUTH] !!  ADMIN_USERNAME / ADMIN_PASSWORD not set — admin panel login disabled")
+	} else {
+		fmt.Printf("  [ADMIN_AUTH] username=%q password_len=%d — if these don't match what you just put in .env, something else (shell export / systemd Environment= / /etc/environment) is overriding it\n", adminUser, adminPassLen)
+	}
+
 	fmt.Println("──────────────────────────────────────────────────────")
 }
 

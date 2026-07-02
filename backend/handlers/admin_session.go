@@ -95,7 +95,7 @@ func (s *Server) handleAdminLogin(ctx *fasthttp.RequestCtx) {
 	userOK := subtle.ConstantTimeCompare([]byte(req.Username), []byte(user)) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(req.Password), []byte(pass)) == 1
 	if !userOK || !passOK {
-		log.Printf("[ADMIN_AUTH] failed login attempt (user=%q ip=%s)", req.Username, ctx.RemoteIP())
+		log.Printf("[ADMIN_AUTH] failed login attempt (user=%q ip=%s)", req.Username, realClientIP(ctx))
 		ctx.SetStatusCode(401)
 		writeJSON(ctx, 401, map[string]any{"error": "invalid_credentials"})
 		return
@@ -108,7 +108,7 @@ func (s *Server) handleAdminLogin(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	setAdminCookie(ctx, token)
-	log.Printf("[ADMIN_AUTH] login ok (ip=%s)", ctx.RemoteIP())
+	log.Printf("[ADMIN_AUTH] login ok (ip=%s)", realClientIP(ctx))
 	writeJSON(ctx, 200, map[string]any{"ok": true})
 }
 
