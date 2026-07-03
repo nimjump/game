@@ -4020,6 +4020,15 @@ func _do_start_game(forced_seed: int = 0) -> void:
 		var inst := Toast.get_instance()
 		if inst != null:
 			inst.show_toast(_update_message, Toast.Kind.WARN)
+		# _on_play_pressed() already set _started = true before calling us
+		# (so it can't re-enter while the async auth/tween flow is mid-way).
+		# If we bail out here instead of actually starting the game, that
+		# flag never gets undone — every future PLAY press then dies
+		# silently at _on_play_pressed()'s own "if _started: return" guard,
+		# forever, even after the admin flips update mode back to normal.
+		# That's exactly the "button stopped responding" symptom. Undo it
+		# here so a blocked press doesn't permanently brick the button.
+		_started = false
 		return
 
 	var tw := create_tween()
