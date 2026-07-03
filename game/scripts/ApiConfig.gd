@@ -39,7 +39,7 @@ const CONFIG_FILE_NAME := "config.cfg"
 #  Örnek:  const PROD_BASE := "http://1.2.3.4:8080"
 # ════════════════════════════════════════════════════════════════════════
 const PROD_BASE     := "https://backbone.zetashare.com"   # <-- backend API URL'i
-const PROD_GAME_URL := "https://game.zetashare.com"        # <-- oyunun public URL'i (share/replay/VS invite linkleri)
+const PROD_GAME_URL := "https://nimjump.zetashare.com"     # <-- oyunun public URL'i (share/replay/VS invite linkleri)
 
 # Local-dev-only last-resort values. These are intentionally NOT "the"
 # production backend — real deployments must set NIMJUMP_API_BASE / --api=
