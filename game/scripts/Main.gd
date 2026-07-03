@@ -87,7 +87,9 @@ var _ui_root  : Control
 var _char_lbl : Label
 
 var _settings_popup    : Control
+var _settings_dim      : ColorRect  # full-rect input-blocking dimmer inside _settings_popup
 var _settings_rebuilding := false  # re-entrancy guard for _rebuild_settings_if_open()
+var _settings_closing    := false  # true while _close_settings()'s fade-out tween is running
 var _nick_overlay      : Control   # tam ekran nickname düzenleme overlay'i
 var _sound_toggle      : CheckButton
 var _volume_slider     : HSlider
@@ -2650,6 +2652,8 @@ func _build_settings_popup() -> void:
 	dim.color = Color(0.0, 0.0, 0.0, 0.55)
 	_anchored(dim, Control.PRESET_FULL_RECT)
 	_settings_popup.add_child(dim)
+	_settings_dim    = dim
+	_settings_closing = false
 
 	var at  := UITheme.get_theme_assets()
 	var M2  := int(_p(0.020))
@@ -3378,6 +3382,7 @@ func _set_containers_pass(node: Node) -> void:
 
 func _open_settings() -> void:
 	# Her açılışta rebuild — auth state, nickname vs güncel olsun
+	_settings_closing = false
 	_sync_panels()
 	if is_instance_valid(_settings_popup):
 		_settings_popup.queue_free()
@@ -3414,10 +3419,14 @@ func _rebuild_settings_if_open() -> void:
 	# of racing.
 	if _settings_rebuilding:
 		return
+	# LOCK FIX: don't resurrect the popup while the user's own close action is
+	# mid-fade — see the comment in _close_settings() for the full race.
+	if _settings_closing:
+		return
 	_settings_rebuilding = true
 	# Wait one frame so bridge state is fully written before reading
 	await get_tree().process_frame
-	if not is_instance_valid(_settings_popup) or not _settings_popup.visible:
+	if not is_instance_valid(_settings_popup) or not _settings_popup.visible or _settings_closing:
 		_settings_rebuilding = false
 		return
 	_sync_panels()
@@ -3645,14 +3654,38 @@ func _close_settings() -> void:
 		_nick_overlay.queue_free()
 		_nick_overlay = null
 	if _settings_popup:
+		# LOCK FIX: the popup used to only lose its full-screen, click-blocking
+		# dim layer once the fade-out tween's chained callback fired 0.15s
+		# later. If an auth/bridge event (disconnect, 401 expiry, reconnect —
+		# _on_auth_failed/_on_auth_expired/_on_nimiq_ready) raced in during
+		# that window, _rebuild_settings_if_open() would see the popup still
+		# `visible == true` (the tween only animates modulate/scale, not
+		# visible), queue_free() the mid-fade instance out from under the
+		# running tween (killing its chained callback before it could ever
+		# set visible=false), and immediately rebuild a brand-new popup at
+		# full opacity. Net result: the player taps the X, thinks settings
+		# closed, but a full-rect MOUSE_FILTER_STOP dimmer is still sitting
+		# on top of the whole screen — so Play (or anything else) silently
+		# eats every tap with zero visual feedback.
+		# Fix: kill the dimmer's ability to block input THE INSTANT close is
+		# requested (independent of the cosmetic fade), and flag that we're
+		# closing so a same-frame rebuild call can't resurrect it.
+		_settings_closing = true
+		if is_instance_valid(_settings_dim):
+			_settings_dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		var tw := create_tween()
 		if tw:
 			tw.set_parallel(true)
 			tw.tween_property(_settings_popup, "modulate:a", 0.0,                  0.15).set_trans(Tween.TRANS_QUAD)
 			tw.tween_property(_settings_popup, "scale",      Vector2(0.90, 0.90),  0.15).set_trans(Tween.TRANS_QUAD)
-			tw.chain().tween_callback(func(): _settings_popup.visible = false)
+			tw.chain().tween_callback(func():
+				if is_instance_valid(_settings_popup):
+					_settings_popup.visible = false
+				_settings_closing = false
+			)
 		else:
 			_settings_popup.visible = false
+			_settings_closing = false
 
 
 func _on_sound_toggled(pressed: bool) -> void:
