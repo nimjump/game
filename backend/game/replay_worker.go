@@ -408,7 +408,7 @@ func (p *workerPool) startProcess(w *godotWorker) error {
 	} else {
 		log.Printf("[WORKER#%d] abs path resolve failed for %s: %v", w.id, bin, err)
 	}
-	cmd := exec.Command(absBin,
+	cmd := lineBufferedCommand(absBin,
 		"--headless",
 		"--audio-driver", "Dummy",
 		"--user-data-dir", crashDir,

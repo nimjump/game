@@ -87,6 +87,44 @@ func ReplaySemCap() chan struct{} {
 // upload endpoint to know where to save the uploaded replay.zip/replay.exe.
 func ServerGamesDir() string { return servergamesDir() }
 
+var (
+	stdbufPathOnce sync.Once
+	stdbufPath     string
+)
+
+// lineBufferedCommand builds the exec.Cmd used to launch a Godot headless
+// subprocess, wrapped with `stdbuf -oL -eL` when available.
+//
+// Why this exists: run the replay binary by hand in an SSH terminal and
+// "[WORKER#N] READY" appears instantly — because stdout is a real TTY,
+// and libc's stdio defaults to LINE buffering (flush on every '\n') for a
+// terminal. The moment stdout is anything else — a plain pipe, which is
+// exactly what exec.Command sets up so Go can read the child's output —
+// libc silently switches to FULLY buffered mode instead (flush only when
+// the buffer fills, many KB later, or the process exits normally). Godot's
+// print() calls still happen, but the bytes sit in the child's own
+// userspace buffer and never actually reach Go's end of the pipe. Combined
+// with the fact that a hung/never-ready worker gets SIGKILLed (which
+// discards that unflushed buffer instead of flushing it), this looks
+// exactly like "the process never printed anything and hung" even though
+// it may have run and printed READY just fine internally. `stdbuf -oL -eL`
+// forces line buffering on the child regardless of what its stdout/stderr
+// are connected to, which fixes this at the source.
+func lineBufferedCommand(bin string, args ...string) *exec.Cmd {
+	stdbufPathOnce.Do(func() {
+		if p, err := exec.LookPath("stdbuf"); err == nil {
+			stdbufPath = p
+		} else {
+			log.Printf("[REPLAY] stdbuf not found on PATH — Godot subprocess stdout may be fully buffered and appear delayed or missing entirely")
+		}
+	})
+	if stdbufPath == "" {
+		return exec.Command(bin, args...)
+	}
+	fullArgs := append([]string{"-oL", "-eL", bin}, args...)
+	return exec.Command(stdbufPath, fullArgs...)
+}
+
 // ResetBinaryCache — clears the cached binary path so godotBinary() re-
 // resolves it on next call. Call after uploading a new replay.zip /
 // replay.exe via the admin panel, then RestartAllWorkers() so the
@@ -481,7 +519,7 @@ func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int
 	} else {
 		log.Printf("[REPLAY_SIM] abs path resolve failed for %s: %v", bin, err)
 	}
-	cmd := exec.Command(absBin, args...)
+	cmd := lineBufferedCommand(absBin, args...)
 	cmd.Dir = filepath.Dir(absBin)
 	cmd.Env = append(os.Environ(),
 		"DISPLAY=",                     // prevent X11 connection attempt
