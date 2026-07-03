@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -18,6 +20,34 @@ import (
 	"nimjump-backend/game"
 	"nimjump-backend/handlers"
 )
+
+// anchorWorkingDir forces the process's current directory to be the actual
+// backend/ folder — the one containing this source file on disk — no
+// matter where or how the process was actually launched from (a different
+// shell, systemd with a stale WorkingDirectory=, the project folder having
+// been moved/renamed, etc). Practically every relative path in this codebase
+// (.env, SERVERGAMES_DIR, REPLAY_JOB_DIR, DB_PATH, ../webexport, ../admin,
+// ../export) silently assumes cwd == backend/. Rather than have each of
+// those guess independently across several fallback candidates, this makes
+// that assumption actually true, once, before anything else runs — so
+// every relative path anywhere downstream just works, on any machine.
+// runtime.Caller(0) resolves to this file's real path on disk, which is
+// accurate for `go run .` (this project's normal way of running it) and for
+// a locally-built binary run from its own source tree; if the binary was
+// copied elsewhere without its source, Chdir simply fails and is logged,
+// falling back to whatever cwd the process already had.
+func anchorWorkingDir() {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		return
+	}
+	root := filepath.Dir(thisFile)
+	if err := os.Chdir(root); err != nil {
+		log.Printf("[STARTUP] could not chdir to backend root %s: %v", root, err)
+		return
+	}
+	log.Printf("[STARTUP] working directory anchored to %s", root)
+}
 
 // loadEnv loads key=value pairs from a .env file into the environment.
 // Existing env vars are NOT overwritten (env takes priority over .env).
@@ -103,6 +133,9 @@ func printStartupBanner(store *game.Store) {
 }
 
 func main() {
+	// Must run before anything else — see anchorWorkingDir() doc comment.
+	anchorWorkingDir()
+
 	// Load .env file (optional, real env vars take priority)
 	loadEnv(".env")
 	loadEnv("../.env")

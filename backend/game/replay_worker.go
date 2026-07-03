@@ -393,12 +393,28 @@ func (p *workerPool) startProcess(w *godotWorker) error {
 	_ = os.MkdirAll(crashDir, 0755)
 
 	wid := fmt.Sprintf("%d", w.id)
-	cmd := exec.Command(bin,
+	// godotBinary() commonly returns a path relative to wherever the Go
+	// process itself was launched from (e.g. "replay-verifier/replay" when
+	// started via `go run .` from backend/), NOT relative to the binary's
+	// own directory. exec.Command with no cmd.Dir set inherits Go's cwd for
+	// the child process too — so Godot ends up starting from backend/
+	// instead of backend/replay-verifier/. Manually running "./replay"
+	// after cd-ing into replay-verifier/ works instantly; spawned this way
+	// it hangs forever and never prints READY. Resolve to an absolute path
+	// and explicitly run it from its own directory so the two match.
+	absBin := bin
+	if a, err := filepath.Abs(bin); err == nil {
+		absBin = a
+	} else {
+		log.Printf("[WORKER#%d] abs path resolve failed for %s: %v", w.id, bin, err)
+	}
+	cmd := exec.Command(absBin,
 		"--headless",
 		"--audio-driver", "Dummy",
 		"--user-data-dir", crashDir,
 		"--", "--server-worker",
 	)
+	cmd.Dir = filepath.Dir(absBin)
 	cmd.Env = append(os.Environ(),
 		"WORKER_JOB_DIR="+p.jobDir,
 		"WORKER_ID="+wid,

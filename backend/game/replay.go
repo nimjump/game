@@ -97,36 +97,22 @@ func ResetBinaryCache() {
 }
 
 // servergamesDir — replay binary + replay.zip klasoru.
-// Priority: SERVERGAMES_DIR env → working directory/servergames → next to executable/servergames
+//
+// main.go's anchorWorkingDir() forces the process's cwd to be the actual
+// backend/ folder before anything else runs — so a plain filepath.Abs()
+// here is enough to make a relative SERVERGAMES_DIR (".env" ships
+// "./replay-verifier") resolve correctly no matter how the process was
+// actually launched (go run, systemd, a moved project folder, ...). No more
+// guessing across executable-dir / working-dir candidates.
 func servergamesDir() string {
-	// explicit override — production tuning
-	if env := os.Getenv("SERVERGAMES_DIR"); env != "" {
-		return env
+	env := os.Getenv("SERVERGAMES_DIR")
+	if env == "" {
+		env = "./servergames"
 	}
-
-	// first check working directory (for go run and development)
-	if wd, err := os.Getwd(); err == nil {
-		candidate := filepath.Join(wd, "servergames")
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
+	if abs, err := filepath.Abs(env); err == nil {
+		return abs
 	}
-	// then check next to the executable (for production binary)
-	exe, err := os.Executable()
-	if err != nil {
-		return "servergames"
-	}
-	// go run gecici dizin kullanir, onu atla
-	exeDir := filepath.Dir(exe)
-	candidate := filepath.Join(exeDir, "servergames")
-	if _, err := os.Stat(candidate); err == nil {
-		return candidate
-	}
-	// fallback: working directory
-	if wd, err := os.Getwd(); err == nil {
-		return filepath.Join(wd, "servergames")
-	}
-	return "servergames"
+	return env
 }
 
 // ensureReadableBySGDirUser — makes sure sgDir itself (a directory) and the
@@ -249,6 +235,11 @@ func extractLinuxBinary(sgDir string) (string, error) {
 // Priority: GODOT_BIN env → servergames/ folder (tries all known names) → PATH
 func godotBinary() string {
 	if env := os.Getenv("GODOT_BIN"); env != "" {
+		// Same relative-path trap as SERVERGAMES_DIR — resolve once so it's
+		// independent of the launching process's working directory.
+		if abs, err := filepath.Abs(env); err == nil {
+			return abs
+		}
 		return env
 	}
 
@@ -477,7 +468,21 @@ func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int
 		"--player-seed", strconv.FormatInt(playerSeed, 10),
 	}
 
-	cmd := exec.Command(bin, args...)
+	// godotBinary() is commonly a path relative to wherever the Go process
+	// itself was launched from, not relative to the binary's own directory —
+	// exec.Command with no cmd.Dir inherits Go's cwd for the child too, so
+	// Godot starts from the wrong directory and can hang indefinitely
+	// instead of running (see identical fix + explanation in
+	// replay_worker.go's startProcess()). Resolve to an absolute path and
+	// run it from its own directory.
+	absBin := bin
+	if a, err := filepath.Abs(bin); err == nil {
+		absBin = a
+	} else {
+		log.Printf("[REPLAY_SIM] abs path resolve failed for %s: %v", bin, err)
+	}
+	cmd := exec.Command(absBin, args...)
+	cmd.Dir = filepath.Dir(absBin)
 	cmd.Env = append(os.Environ(),
 		"DISPLAY=",                     // prevent X11 connection attempt
 		"PULSE_SERVER=",                // prevent PulseAudio connection attempt
