@@ -235,6 +235,26 @@ func _fail_sign_auth(reason: String) -> void:
 	auth_failed.emit(reason)
 
 
+## Belt-and-suspenders safety net for _signing_in_progress. Every normal exit
+## path (challenge fetch failure, sign rejection, verify success/failure)
+## already clears the flag directly — this exists purely to guarantee it can
+## NEVER get stuck true forever if some future change (or an unexpected
+## edge case, e.g. this node being freed mid-await) skips those paths. A
+## permanently-stuck true here is exactly as bad as the Main.gd "_started
+## never reset" bug found earlier: _do_sign_auth() would silently no-op
+## forever afterwards, and the player could never sign in again without a
+## full page reload. Worst-case legitimate duration is challenge fetch
+## (<=8s) + wallet sign (<=60s) + verify (<=10s) — 100s gives a safe margin
+## above that.
+func _arm_signing_watchdog() -> void:
+	var t := get_tree().create_timer(100.0)
+	t.timeout.connect(func():
+		if _signing_in_progress:
+			push_warning("[NimiqBridge] _signing_in_progress watchdog fired — force-clearing stuck lock")
+			_signing_in_progress = false
+	)
+
+
 ## Sign-based auth flow: get challenge → sign → verify → store token
 func _do_sign_auth() -> void:
 	print("[NimiqBridge] _do_sign_auth called auth_verified=%s addr=%s in_progress=%s" % [str(auth_verified), nimiq_address.left(12), str(_signing_in_progress)])
@@ -254,6 +274,7 @@ func _do_sign_auth() -> void:
 		print("[NimiqBridge] sign already in progress — ignoring duplicate call")
 		return
 	_signing_in_progress = true
+	_arm_signing_watchdog()
 
 	# 1. Get challenge
 	var http := HTTPRequest.new()
@@ -305,13 +326,31 @@ func _sign_and_verify(challenge: String) -> void:
 	_verify_with_backend(challenge, pub_key, signature)
 
 
+## Guards _verify_with_backend()'s response handler against acting on a
+## STALE response — e.g. a slow/delayed network retry of an old request
+## that finally lands minutes later (challenge TTL is 5 minutes; a response
+## arriving suspiciously close to that window is almost certainly one of
+## these). Two independent checks, either one is enough to call it stale:
+##   1. We're already auth_verified — some OTHER attempt already succeeded
+##      while this one was in flight, so this result (success OR failure)
+##      no longer matters and must NOT be allowed to downgrade a perfectly
+##      good session.
+##   2. This response isn't for the challenge we're currently tracking as
+##      "the one in flight" — a newer attempt has already superseded it.
+var _active_verify_challenge := ""
+
 ## Sends challenge + signature to backend, receives token
 func _verify_with_backend(challenge: String, public_key: String, signature: String) -> void:
+	_active_verify_challenge = challenge
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
+		if auth_verified or _active_verify_challenge != challenge:
+			print("[NimiqBridge] ignoring stale verify response for challenge=%s (already verified=%s, active=%s)" \
+				% [challenge.left(24), str(auth_verified), _active_verify_challenge.left(24)])
+			return
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			push_warning("[NimiqBridge] Auth verify failed: %d" % code)
 			if code == 401:
