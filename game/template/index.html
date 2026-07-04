@@ -98,7 +98,14 @@
 
     async function _initNimiq() {
       try {
-        const sdk = await import('https://unpkg.com/@nimiq/mini-app-sdk@latest/dist/index.js');
+        // Pinned (was @latest) — this package is still 0.x, so @latest could
+        // silently pull a behavior-breaking update (e.g. changing how
+        // listAccounts()/connect() persist across sessions, which is exactly
+        // the kind of change that would look like "keeps asking to
+        // reconnect/resign for no reason" with zero corresponding change on
+        // our side or in the backend logs). Bump this deliberately, on
+        // purpose, after testing — never let it float again.
+        const sdk = await import('https://unpkg.com/@nimiq/mini-app-sdk@0.1.0/dist/index.js');
         let nimiq;
         try {
           nimiq = await sdk.init({ timeout: 10000 });

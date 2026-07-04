@@ -2189,11 +2189,14 @@ func _build_start_ui() -> void:
 	sel_pc.add_child(right_btn)
 
 	# ── PLAY and Settings buttons ────────────────────
-	# (VS button removed from the menu per request — system kept intact)
+	# VS button removed from this build (see _open_vs_panel/_build_vs_panel —
+	# code kept intact, just not linked to a menu button here, so VS can be
+	# re-enabled later by re-adding the button below without touching the
+	# panel/backend logic).
 	var btn_w       := _p(0.72)
 	var play_h      := int(_p(0.105))
 	var set_h       := int(_p(0.080))
-	var gap         := int(_p(0.034))   # slightly bigger than the old inter-button gap so there's still visible breathing room, without the full VS-row gap
+	var gap         := int(_p(0.034))
 
 	# Centre the PLAY/Settings block in the space between the character
 	# selector's bottom edge (the arrow row above) and the bottom nav bar's
@@ -2202,7 +2205,6 @@ func _build_start_ui() -> void:
 	var sel_bottom_abs     : float = _vh * 0.5 + sel_pc.offset_bottom
 	var bottom_bar_h       : float = _vh * 0.09  # must match _build_bottom_bar()'s bar_h formula
 	var bottom_bar_top_abs : float = _vh - bottom_bar_h
-	# VS button removed — no longer reserving vs_h+gap of blank space here.
 	var block_h            : float = play_h + gap + set_h
 	var avail_h             : float = bottom_bar_top_abs - sel_bottom_abs
 	var equal_margin        : float = maxf((avail_h - block_h) * 0.5, 0.0)
@@ -2224,11 +2226,6 @@ func _build_start_ui() -> void:
 	UITheme.apply_ghost_button(settings_btn)
 	_ui_root.add_child(settings_btn)
 
-	# VS button removed from the main menu per request — the whole VS system
-	# (VSManager, VSPanel, _open_vs_panel/_build_vs_panel/_start_vs_game, deep
-	# links via _open_vs_room, etc.) stays fully intact, there's just no
-	# button here to open it anymore.
-
 	# PLAY — above Settings
 	_play_btn = Button.new()
 	_play_btn.disabled = false
@@ -2244,7 +2241,6 @@ func _build_start_ui() -> void:
 	_play_btn.pressed.connect(_on_play_pressed)
 	UITheme.apply_play_button(_play_btn)
 	_ui_root.add_child(_play_btn)
-
 
 	# Error/connection banners now go through the global Toast singleton
 	# (see Toast.gd) — call Toast.show_banner("...") wherever needed.

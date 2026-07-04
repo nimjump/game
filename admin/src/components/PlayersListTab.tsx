@@ -18,25 +18,33 @@ function fmtRelative(ts: number) {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+function nim(n?: number) { return (n ?? 0).toFixed(2); }
+
+const PAGE_SIZE = 50;
+
 export default function PlayersListTab() {
   const [players, setPlayers] = useState<RegisteredPlayer[]>([]);
   const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [search, setSearch] = useState("");
   const [sortBy, setSortBy] = useState<"registered" | "last_seen" | "sessions">("registered");
 
-  useEffect(() => {
+  function load(off: number) {
     setLoading(true);
-    fetchPlayersList()
+    fetchPlayersList(PAGE_SIZE, off)
       .then((res) => {
         setPlayers(res.players ?? []);
         setTotal(res.total ?? 0);
+        setOffset(off);
         setError("");
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, []);
+  }
+
+  useEffect(() => { load(0); }, []);
 
   const filtered = useMemo(() => {
     let list = [...players];
@@ -69,13 +77,7 @@ export default function PlayersListTab() {
           <StatPill label="Total" value={total} color="#6366f1" />
         </div>
         <button
-          onClick={() => {
-            setLoading(true);
-            fetchPlayersList()
-              .then((res) => { setPlayers(res.players ?? []); setTotal(res.total ?? 0); })
-              .catch((e) => setError(e.message))
-              .finally(() => setLoading(false));
-          }}
+          onClick={() => load(offset)}
           style={{ marginLeft: "auto", padding: "6px 14px", borderRadius: 8, border: "1px solid #334155", background: "#1e293b", color: "#e2e8f0", cursor: "pointer", fontSize: 13 }}
         >
           ↻ Refresh
@@ -83,10 +85,10 @@ export default function PlayersListTab() {
       </div>
 
       {/* Controls */}
-      <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+      <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>
         <input
           type="text"
-          placeholder="Search nickname or wallet…"
+          placeholder="Search nickname or wallet… (current page only)"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
           style={{ flex: "1 1 220px", padding: "8px 12px", borderRadius: 8, border: "1px solid #334155", background: "#0f172a", color: "#e2e8f0", fontSize: 14, minWidth: 180 }}
@@ -100,6 +102,23 @@ export default function PlayersListTab() {
           <option value="last_seen">Sort: Last seen</option>
           <option value="sessions">Sort: Most sessions</option>
         </select>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#64748b", marginLeft: "auto" }}>
+          <span>{total === 0 ? "0 players" : `${offset + 1}–${Math.min(offset + players.length, total)} of ${total}`}</span>
+          <button
+            onClick={() => load(Math.max(0, offset - PAGE_SIZE))}
+            disabled={loading || offset === 0}
+            style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid #334155", background: "#1e293b", color: "#e2e8f0", cursor: "pointer", fontSize: 12 }}
+          >
+            ← Prev
+          </button>
+          <button
+            onClick={() => load(offset + PAGE_SIZE)}
+            disabled={loading || offset + players.length >= total}
+            style={{ padding: "4px 10px", borderRadius: 6, border: "1px solid #334155", background: "#1e293b", color: "#e2e8f0", cursor: "pointer", fontSize: 12 }}
+          >
+            Next →
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -124,6 +143,9 @@ export default function PlayersListTab() {
                   <th style={th}>Player</th>
                   <th style={th}>Wallet</th>
                   <th style={th}>Sessions</th>
+                  <th style={th}>Daily Quests</th>
+                  <th style={th}>Rank (D/W)</th>
+                  <th style={th}>Daily Cap</th>
                   <th style={th}>Last Seen</th>
                   <th style={th}>Registered</th>
                 </tr>
@@ -160,9 +182,51 @@ function PlayerRow({ player, even }: { player: RegisteredPlayer; even: boolean }
           : "—"}
       </td>
       <td style={{ ...td, color: "#e2e8f0", fontWeight: 600 }}>{player.session_count ?? 0}</td>
+      <td style={td}>
+        <QuestBar completed={player.quests_completed ?? 0} total={player.quests_total ?? 5} />
+      </td>
+      <td style={{ ...td, fontSize: 13 }}>
+        <span style={{ color: player.daily_rank ? "#e2e8f0" : "#475569" }}>
+          {player.daily_rank ? `#${player.daily_rank}` : "—"}
+        </span>
+        <span style={{ color: "#475569" }}> / </span>
+        <span style={{ color: player.weekly_rank ? "#e2e8f0" : "#475569" }}>
+          {player.weekly_rank ? `#${player.weekly_rank}` : "—"}
+        </span>
+      </td>
+      <td style={td}>
+        <DailyCapBar earned={player.daily_cap?.daily_earned ?? 0} cap={player.daily_cap?.daily_cap ?? 0} />
+      </td>
       <td style={{ ...td, color: "#94a3b8", fontSize: 13 }}>{fmtRelative(player.last_seen ?? 0)}</td>
       <td style={{ ...td, color: "#94a3b8", fontSize: 12 }}>{fmtDate(player.registered_at)}</td>
     </tr>
+  );
+}
+
+function QuestBar({ completed, total }: { completed: number; total: number }) {
+  const pct = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0;
+  const color = pct >= 100 ? "#4caf50" : pct > 0 ? "#e0a030" : "#475569";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 110 }}>
+      <div style={{ width: 60, height: 6, borderRadius: 3, background: "#1e293b", overflow: "hidden" }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 3 }} />
+      </div>
+      <span style={{ fontSize: 12, color: "#94a3b8", whiteSpace: "nowrap" }}>{completed}/{total}</span>
+    </div>
+  );
+}
+
+function DailyCapBar({ earned, cap }: { earned: number; cap: number }) {
+  if (cap <= 0) return <span style={{ color: "#475569", fontSize: 12 }}>—</span>;
+  const pct = Math.min(100, Math.round((earned / cap) * 100));
+  const color = pct >= 100 ? "#e05555" : pct > 70 ? "#e0a030" : "#4caf50";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 130 }} title={`${nim(earned)} / ${nim(cap)} NIM today`}>
+      <div style={{ width: 60, height: 6, borderRadius: 3, background: "#1e293b", overflow: "hidden" }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: color, borderRadius: 3 }} />
+      </div>
+      <span style={{ fontSize: 12, color: "#94a3b8", whiteSpace: "nowrap" }}>{nim(earned)}/{nim(cap)}</span>
+    </div>
   );
 }
 

@@ -383,6 +383,11 @@ export interface RegisteredPlayer {
   token_expires_at?: number;
   session_count: number;
   last_seen?: number;
+  quests_completed: number;
+  quests_total: number;
+  daily_rank: number;  // 0 = not ranked this period
+  weekly_rank: number; // 0 = not ranked this period
+  daily_cap: DailyCapStats;
 }
 
 export interface PlayersListResponse {
@@ -390,8 +395,8 @@ export interface PlayersListResponse {
   players: RegisteredPlayer[];
 }
 
-export async function fetchPlayersList(): Promise<PlayersListResponse> {
-  const r = await fetch(`${BASE}/backend/admin/players`, { cache: "no-store" });
+export async function fetchPlayersList(limit = 50, offset = 0): Promise<PlayersListResponse> {
+  const r = await fetch(`${BASE}/backend/admin/players?limit=${limit}&offset=${offset}`, { cache: "no-store" });
   if (!r.ok) throw new Error("players list fetch failed");
   return r.json();
 }
@@ -405,6 +410,8 @@ export interface AppConfig {
   update_active: boolean;
   update_scheduled_week?: string;
   replay_version: number;
+  daily_earn_cap_nim?: number;
+  coin_nim_rate?: number;
 }
 
 export async function fetchAppConfig(): Promise<AppConfig> {
@@ -417,6 +424,8 @@ export async function saveAppConfig(patch: Partial<{
   daily_leaderboard_enabled: boolean;
   weekly_leaderboard_enabled: boolean;
   replay_version: number;
+  daily_earn_cap_nim: number;
+  coin_nim_rate: number;
 }>): Promise<AppConfig> {
   const r = await fetch(`${BASE}/backend/admin/config`, {
     method: "POST",
@@ -425,6 +434,36 @@ export async function saveAppConfig(patch: Partial<{
   });
   if (!r.ok) throw new Error("config save failed");
   return r.json();
+}
+
+// ── Quest reward pool (admin-editable NIM rewards per quest template) ──────────
+
+export interface QuestPoolEntry {
+  quest_type: string;
+  target: number;
+  description: string;
+  default_reward_nim: number;
+  reward_nim: number; // effective — override if set, else default
+  overridden: boolean;
+}
+
+export async function fetchQuestPool(): Promise<QuestPoolEntry[]> {
+  const r = await fetch(`${BASE}/backend/admin/quest-pool`, { cache: "no-store" });
+  if (!r.ok) throw new Error("quest pool fetch failed");
+  const d = await r.json();
+  return d.quests ?? [];
+}
+
+// Pass rewardNIM = null to reset that template back to its hardcoded default.
+export async function setQuestReward(questType: string, target: number, rewardNIM: number | null): Promise<QuestPoolEntry[]> {
+  const r = await fetch(`${BASE}/backend/admin/quest-reward`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ quest_type: questType, target, reward_nim: rewardNIM }),
+  });
+  if (!r.ok) throw new Error("quest reward save failed");
+  const d = await r.json();
+  return d.quests ?? [];
 }
 
 export interface LeaderboardPrizes {
@@ -762,13 +801,19 @@ export interface VSRoom {
   settled_at?: number;
   created_at: number;
   expires_at: number;
+  creator_forfeit_requested?: boolean;
+  opponent_forfeit_requested?: boolean;
 }
 
-export async function fetchVSRooms(): Promise<{ rooms: VSRoom[] }> {
-  const r = await fetch(`${BASE}/backend/admin/vs-rooms`, { cache: "no-store" });
+// fetchVSRooms — paginated: a single player can open unlimited paid rooms,
+// so the admin list can no longer just fetch "everything" in one call.
+// Returns the requested page plus the total matching-room count so the UI
+// can offer a "load more" control.
+export async function fetchVSRooms(limit = 100, offset = 0): Promise<{ rooms: VSRoom[]; total: number }> {
+  const r = await fetch(`${BASE}/backend/admin/vs-rooms?limit=${limit}&offset=${offset}`, { cache: "no-store" });
   if (!r.ok) throw new Error("vs rooms fetch failed");
   const data = await r.json();
-  return { rooms: data.rooms || [] };
+  return { rooms: data.rooms || [], total: data.total ?? (data.rooms || []).length };
 }
 
 export async function sweepVSRooms(): Promise<{ ok: boolean }> {

@@ -801,11 +801,25 @@ the repo):
     # process cleanly (see main.go's shutdown handler) before systemd
     # sends SIGKILL.
     TimeoutStopSec=10
-    # Don't let a crash-loop eat the box — after 5 restarts inside 60s,
-    # systemd stops trying and the service shows as failed (check with
-    # `systemctl status nimjump-backend` / `journalctl -u nimjump-backend`).
+    # Crash-loop cap: if the service fails to stay up 5 times within 60s,
+    # something is seriously wrong (not just a one-off blip that
+    # RestartSec=3 will quietly fix) — a corrupt binary, a stuck port
+    # conflict, disk full, whatever. Rather than the old failure mode
+    # (systemd just gives up and marks the unit `failed` PERMANENTLY,
+    # never coming back on its own — the "sistemd'de kuruluydu ama geri
+    # açmadı" symptom this project hit once), StartLimitAction below
+    # escalates instead of giving up: it reboots the whole machine. A
+    # reboot clears almost anything a repeated crash loop could be stuck
+    # on (stale port bindings, wedged child processes, etc.), and unlike
+    # "just retry forever" it doesn't burn CPU/log space failing in a
+    # tight loop indefinitely if something is truly broken.
     StartLimitIntervalSec=60
     StartLimitBurst=5
+    # Fires when the above burst limit is hit. `reboot` = a normal
+    # `systemctl reboot` (other services get a clean shutdown first). Use
+    # `reboot-force` instead if you want it to skip that and reboot
+    # immediately — faster recovery, less graceful.
+    StartLimitAction=reboot
 
     [Install]
     WantedBy=multi-user.target
@@ -824,6 +838,51 @@ What each close-safety piece is doing:
   cancels the admin app's child process, section 7) a moment to run
   before systemd forces it. A `systemctl stop`/`restart` is a normal
   SIGTERM, same as Ctrl+C — handled the same way either way.
+- **`StartLimitIntervalSec=60` / `StartLimitBurst=5` / `StartLimitAction=reboot`**
+  — the three work together as one escalation ladder: individual crashes
+  just get `Restart=always`'d back within `RestartSec` like normal, with
+  no cap, no matter how many happen — as long as they're not bunched up
+  fast. Only if 5 of them land inside the same 60-second window does it
+  escalate to a full system reboot instead of the old behavior (marking
+  the unit permanently `failed` and just sitting there dead until
+  someone runs `systemctl reset-failed` by hand). A reboot is a much
+  stronger recovery action than a bare service restart, and — unlike the
+  permanently-`failed` trap — it's still fully automatic; nobody has to
+  notice and intervene.
+  Since main.go now fails fast and clearly on a port conflict (see its
+  startup port probe) instead of silently limping through a slow
+  partial-boot loop, hitting this burst limit at all should now be rare
+  — but if it ever does happen, the reboot escalation makes sure it
+  doesn't get stuck down waiting for someone to notice.
+
+If you already have this unit installed with the old settings, editing
+`/etc/systemd/system/nimjump-backend.service` on the server and running
+`sudo systemctl daemon-reload` picks up the change (no reinstall needed).
+
+### 19.2b Make sure logs actually survive a crash/reboot (do this once)
+
+The reboot escalation above is only useful if the *logs explaining why*
+survive the reboot too — otherwise you're back to "it happened, no way to
+tell why," same as the incident that started this whole section. By
+default, many distros only keep the systemd journal in a small
+in-memory/volatile buffer that's wiped on every reboot. Make it
+persistent and generously sized, once, on the server:
+
+    sudo mkdir -p /etc/systemd/journald.conf.d
+    printf '[Journal]\nStorage=persistent\nSystemMaxUse=500M\n' | sudo tee /etc/systemd/journald.conf.d/nimjump.conf
+    sudo systemctl restart systemd-journald
+
+- **`Storage=persistent`** — writes to `/var/log/journal/` on disk
+  instead of a volatile in-memory ring buffer, so logs survive reboots
+  (and the `StartLimitAction=reboot` above can't erase its own evidence).
+- **`SystemMaxUse=500M`** — caps how much disk it's allowed to use so
+  persistent logging can't slowly fill the disk; old entries get
+  rotated out once the cap is hit, but 500MB at this project's log
+  volume is weeks, not hours.
+
+After this, `journalctl -u nimjump.service` (or `--list-boots` to see
+every past boot) keeps working across reboots instead of only covering
+whatever's happened since the box last came up.
 
 ### 19.3 Enable it
 

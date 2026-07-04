@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -140,6 +141,32 @@ func main() {
 	loadEnv(".env")
 	loadEnv("../.env")
 
+	// Resolve the listen address up front and probe it BEFORE opening the
+	// DB, starting the admin app supervisor, or doing anything else —
+	// running `go run .` (or a second copy of the binary) while another
+	// instance is already listening here (e.g. the systemd/Windows-service
+	// managed one) used to fail deep inside fasthttp's ListenAndServe at
+	// the very end of main(), by which point the DB was already open, the
+	// admin-app child process had already been spawned, etc. That admin
+	// child then raced its OWN port (see adminproc.go) and kept retrying
+	// with backoff forever — the "şişiyor" (ballooning) symptom: a second
+	// instance stuck looping spawn-attempts instead of just exiting.
+	// Failing here, first, with a clear message, avoids all of that.
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	bindHost := os.Getenv("BIND_HOST")
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	addr := bindHost + ":" + port
+	if probe, probeErr := net.Listen("tcp", addr); probeErr != nil {
+		log.Fatalf("[FATAL] cannot bind %s: %v — another instance of this backend is very likely already running here (the systemd/service-managed one?). Stop it first (e.g. `sudo systemctl stop <service>` on Linux, or stop the Windows service/scheduled task), then try again. Refusing to start a second instance.", addr, probeErr)
+	} else {
+		probe.Close() // just a fast pre-flight check — the real listener binds this same addr again below
+	}
+
 	// If NIMIQ_MNEMONIC is set, derive private key + address from it automatically
 	if mnemonic := os.Getenv("NIMIQ_MNEMONIC"); mnemonic != "" {
 		if err := game.NimiqConfigFromMnemonic(mnemonic); err != nil {
@@ -147,11 +174,6 @@ func main() {
 		} else {
 			log.Printf("[NIMIQ] wallet address derived from mnemonic: %s", os.Getenv("NIMIQ_WALLET_ADDRESS"))
 		}
-	}
-
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
 	}
 
 	dbPath := os.Getenv("DB_PATH")
@@ -189,11 +211,13 @@ func main() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
 		for range ticker.C {
-			for {
-				if err := db.RunValueLogGC(0.5); err != nil {
-					break // no more GC needed
+			game.SafeCall("BadgerValueLogGC", func() {
+				for {
+					if err := db.RunValueLogGC(0.5); err != nil {
+						break // no more GC needed
+					}
 				}
-			}
+			})
 		}
 	}()
 
@@ -235,19 +259,14 @@ func main() {
 		staticHandler(ctx)
 	})
 
-	// BIND_HOST — defaults to 127.0.0.1 (localhost-only). This server sits
-	// behind a Cloudflare Tunnel (cloudflared connects out to this local
-	// port — no inbound port needs to be open on this machine at all), so
-	// there's no reason for the raw Go process itself to also be reachable
-	// directly from the network on 0.0.0.0. Binding to loopback only means
-	// nothing on this box can hit the backend (game API or admin panel)
-	// except through the tunnel. Override with BIND_HOST=0.0.0.0 if this
-	// ever needs to run without a tunnel/reverse proxy in front of it.
-	bindHost := os.Getenv("BIND_HOST")
-	if bindHost == "" {
-		bindHost = "127.0.0.1"
-	}
-	addr := bindHost + ":" + port
+	// bindHost/port/addr were already resolved (and probe-checked) at the
+	// very top of main() — see the comment there. BIND_HOST defaults to
+	// 127.0.0.1 (localhost-only): this server sits behind a Cloudflare
+	// Tunnel (cloudflared connects out to this local port — no inbound port
+	// needs to be open on this machine at all), so there's no reason for the
+	// raw Go process itself to also be reachable directly from the network
+	// on 0.0.0.0. Override with BIND_HOST=0.0.0.0 if this ever needs to run
+	// without a tunnel/reverse proxy in front of it.
 	log.Printf("[STARTUP] listening on http://%s", addr)
 
 	// Graceful shutdown

@@ -74,6 +74,8 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/admin/config",                 s.requireAdminSession(s.handleAdminSetConfig))
 	r.POST("/backend/admin/update-mode",            s.requireAdminSession(s.handleAdminSetUpdateMode))
 	r.POST("/backend/admin/update-complete",        s.requireAdminSession(s.handleAdminCompleteUpdate))
+	r.GET("/backend/admin/quest-pool",              s.requireAdminSession(s.handleAdminQuestPool))
+	r.POST("/backend/admin/quest-reward",           s.requireAdminSession(s.handleAdminSetQuestReward))
 	r.POST("/backend/admin/replays/clear-all",      s.requireAdminSession(s.handleAdminClearAllReplays))
 	r.GET("/backend/admin/replay-binary",           s.requireAdminSession(s.handleAdminReplayBinaryStatus))
 	r.POST("/backend/admin/replay-binary",          s.requireAdminSession(s.handleAdminReplayBinaryUpload))
@@ -152,6 +154,7 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/vsroom/{id}/join",         rl(s.handleVSRoomJoin))
 	r.POST("/backend/vsroom/{id}/pay",          rl(s.handleVSRoomConfirmPayment))
 	r.POST("/backend/vsroom/{id}/cancel",       rl(s.handleVSRoomCancel))
+	r.POST("/backend/vsroom/{id}/forfeit",      rl(s.handleVSRoomForfeit))
 	r.GET("/backend/admin/vs-rooms",                     s.requireAdminSession(s.handleAdminVSRooms))
 	r.POST("/backend/admin/vs-rooms/sweep",              s.requireAdminSession(s.handleAdminVSRoomsSweep))
 	r.POST("/backend/admin/vs-rooms/reconcile-payments", s.requireAdminSession(s.handleAdminVSRoomsReconcile))
@@ -585,7 +588,7 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 
 				// ── Coin → NIM ödülü (daily cap uygulanır) ────────────────
 				if result.QuestCoins > 0 {
-					coinRate := game.CoinNIMRate()
+					coinRate := s.Store.CoinNIMRate()
 					requestedNIM := float64(result.QuestCoins) * coinRate
 					if requestedNIM > 0 {
 						earned, cerr := s.Store.QueueRewardCapped(playerID, requestedNIM, result.QuestCoins)

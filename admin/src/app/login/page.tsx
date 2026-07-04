@@ -1,10 +1,17 @@
 "use client";
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
 import { adminLogin, adminMe } from "@/lib/api";
 
+// Where to send the browser once we know it's authenticated. Computed
+// relative to the login page's own path (strip the trailing "/login")
+// instead of hardcoding "/", so this works whether the admin app is served
+// at the domain root or under a basePath (e.g. "/admin" — see
+// admin/next.config.js's basePath, driven by ADMIN_BASE_PATH).
+function adminRootPath(): string {
+  return window.location.pathname.replace(/\/login\/?$/, "/") || "/";
+}
+
 export default function LoginPage() {
-  const router = useRouter();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error,    setError]    = useState("");
@@ -14,10 +21,10 @@ export default function LoginPage() {
   // Already logged in? Skip straight past the login form.
   useEffect(() => {
     adminMe().then(authed => {
-      if (authed) router.replace("/");
+      if (authed) window.location.href = adminRootPath();
       else setChecking(false);
     });
-  }, [router]);
+  }, []);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -25,10 +32,21 @@ export default function LoginPage() {
     setLoading(true);
     try {
       await adminLogin(username, password);
-      router.replace("/");
+      // BUG FIX: this used to be router.replace("/") — a client-side SPA
+      // navigation. The admin root page (page.tsx) runs its own auth check
+      // on mount (adminMe()), and on some setups that check could see a
+      // still-in-flight or not-yet-committed cookie state right after
+      // login, redirecting straight back to /login — it looked exactly
+      // like "I log in, the page just bounces/reloads back to the login
+      // form," and only "worked" with devtools open because the extra
+      // overhead/delay from having devtools open happened to give the
+      // cookie time to settle before the second check ran. A hard
+      // navigation (window.location.href) starts a brand-new top-level
+      // request cycle, which is guaranteed to include the just-set cookie
+      // — no client-side race is possible.
+      window.location.href = adminRootPath();
     } catch {
       setError("Invalid username or password.");
-    } finally {
       setLoading(false);
     }
   }

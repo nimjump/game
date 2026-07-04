@@ -4,8 +4,9 @@ import {
   fetchAppConfig, saveAppConfig, setUpdateMode, completeUpdate, clearAllReplays,
   fetchReplayBinaryStatus, uploadReplayBinary, deleteReplayBinaryFile,
   fetchGoldenReplays, deleteGoldenReplay, runGoldenSelfTest, fetchDeterminismLint,
+  fetchQuestPool, setQuestReward,
   type AppConfig, type ReplayBinaryStatus, type GoldenReplay, type GoldenReplayResult,
-  type DeterminismFinding,
+  type DeterminismFinding, type QuestPoolEntry,
 } from "@/lib/api";
 
 function fmtBytes(n: number) {
@@ -29,7 +30,67 @@ export default function SystemTab() {
   const [deletingFile, setDeletingFile] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
   const [versionInput, setVersionInput] = useState("1");
+  const [capInput, setCapInput] = useState("100");
+  const [coinRateInput, setCoinRateInput] = useState("1");
   const fileRef = useRef<HTMLInputElement | null>(null);
+
+  // ── Quest reward overrides ──────────────────────────────────────────
+  const [questPool,   setQuestPool]   = useState<QuestPoolEntry[]>([]);
+  const [questLoading,setQuestLoading]= useState(true);
+  const [questInputs, setQuestInputs] = useState<Record<string, string>>({});
+  const [questSavingKey, setQuestSavingKey] = useState<string | null>(null);
+
+  const questKey = (q: { quest_type: string; target: number }) => `${q.quest_type}:${q.target}`;
+
+  const loadQuestPool = async () => {
+    setQuestLoading(true);
+    try {
+      const quests = await fetchQuestPool();
+      setQuestPool(quests);
+      const inputs: Record<string, string> = {};
+      for (const q of quests) inputs[questKey(q)] = String(q.reward_nim);
+      setQuestInputs(inputs);
+    } catch {
+      // non-fatal — quest rewards panel just stays empty
+    } finally {
+      setQuestLoading(false);
+    }
+  };
+
+  function syncQuestInputs(quests: QuestPoolEntry[]) {
+    setQuestPool(quests);
+    setQuestInputs(prev => {
+      const next = { ...prev };
+      for (const q of quests) next[questKey(q)] = String(q.reward_nim);
+      return next;
+    });
+  }
+
+  async function doSaveQuestReward(q: QuestPoolEntry) {
+    const key = questKey(q);
+    const n = parseFloat(questInputs[key]);
+    if (!Number.isFinite(n) || n < 0) { alert("Reward must be a number ≥ 0."); return; }
+    setQuestSavingKey(key);
+    try {
+      syncQuestInputs(await setQuestReward(q.quest_type, q.target, n));
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setQuestSavingKey(null);
+    }
+  }
+
+  async function doResetQuestReward(q: QuestPoolEntry) {
+    const key = questKey(q);
+    setQuestSavingKey(key);
+    try {
+      syncQuestInputs(await setQuestReward(q.quest_type, q.target, null));
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setQuestSavingKey(null);
+    }
+  }
 
   // ── Golden replays: determinism self-test ──────────────────────────
   const [goldens,      setGoldens]      = useState<GoldenReplay[]>([]);
@@ -98,6 +159,8 @@ export default function SystemTab() {
       const [c, b] = await Promise.all([fetchAppConfig(), fetchReplayBinaryStatus()]);
       setCfg(c);
       setVersionInput(String(c.replay_version));
+      setCapInput(String(c.daily_earn_cap_nim && c.daily_earn_cap_nim > 0 ? c.daily_earn_cap_nim : 100));
+      setCoinRateInput(String(c.coin_nim_rate && c.coin_nim_rate > 0 ? c.coin_nim_rate : 1));
       setBinary(b);
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
@@ -106,7 +169,35 @@ export default function SystemTab() {
     }
   };
 
-  useEffect(() => { load(); loadGoldens(); doLint(); }, []); // eslint-disable-line
+  useEffect(() => { load(); loadGoldens(); doLint(); loadQuestPool(); }, []); // eslint-disable-line
+
+  async function saveCap() {
+    const n = parseFloat(capInput);
+    if (!Number.isFinite(n) || n <= 0) { alert("Daily earn cap must be a positive number."); return; }
+    setSaving(true);
+    try {
+      const updated = await saveAppConfig({ daily_earn_cap_nim: n });
+      setCfg(updated);
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveCoinRate() {
+    const n = parseFloat(coinRateInput);
+    if (!Number.isFinite(n) || n <= 0) { alert("Coin → NIM rate must be a positive number."); return; }
+    setSaving(true);
+    try {
+      const updated = await saveAppConfig({ coin_nim_rate: n });
+      setCfg(updated);
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
 
   async function toggleLeaderboard(key: "daily_leaderboard_enabled" | "weekly_leaderboard_enabled") {
     if (!cfg) return;
@@ -281,7 +372,90 @@ export default function SystemTab() {
               submits from an old client (mismatched version) are rejected and never saved.
             </span>
           </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Daily earn cap (NIM):</span>
+            <input type="number" min={0.01} step="any" value={capInput}
+              onChange={e => setCapInput(e.target.value)}
+              style={{ width: 100, padding: "4px 8px", fontSize: 13 }} />
+            <button className="btn" disabled={saving || capInput === String(cfg.daily_earn_cap_nim)} onClick={saveCap}>
+              Save
+            </button>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              Max NIM a player can earn per day from in-game coins. Quest and leaderboard payouts are not capped by this.
+            </span>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Coin → NIM rate:</span>
+            <input type="number" min={0.000001} step="any" value={coinRateInput}
+              onChange={e => setCoinRateInput(e.target.value)}
+              style={{ width: 100, padding: "4px 8px", fontSize: 13 }} />
+            <button className="btn" disabled={saving || coinRateInput === String(cfg.coin_nim_rate)} onClick={saveCoinRate}>
+              Save
+            </button>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              How many NIM 1 in-game coin is worth (e.g. 0.001 = 1000 coins per NIM). Applied to coins
+              collected in a run, still subject to the daily earn cap above.
+            </span>
+          </div>
         </div>
+      </div>
+
+      {/* ── Quest rewards ── */}
+      <div className="card" style={{ padding: 16 }}>
+        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8 }}>Quest Rewards</div>
+        <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 10, lineHeight: 1.6 }}>
+          Override the NIM reward for any daily quest template. Players who already have that quest
+          assigned for today keep whatever reward they were originally given — a change here only
+          affects quests generated from now on. Use &quot;Reset&quot; to go back to the hardcoded default.
+        </div>
+        {questLoading ? (
+          <div style={{ padding: 16, textAlign: "center", color: "var(--text-muted)", fontSize: 12 }}>Loading…</div>
+        ) : questPool.length === 0 ? (
+          <div style={{ padding: 16, textAlign: "center", color: "var(--text-muted)", fontSize: 12 }}>
+            No quest templates found.
+          </div>
+        ) : (
+          <table>
+            <thead>
+              <tr><th>Type</th><th>Target</th><th>Description</th><th>Default</th><th>Reward (NIM)</th><th></th></tr>
+            </thead>
+            <tbody>
+              {questPool.map(q => {
+                const key = questKey(q);
+                const busy = questSavingKey === key;
+                return (
+                  <tr key={key}>
+                    <td style={{ fontFamily: "monospace", fontSize: 11 }}>{q.quest_type}</td>
+                    <td style={{ fontSize: 12 }}>{q.target}</td>
+                    <td style={{ fontSize: 12 }}>{q.description}</td>
+                    <td style={{ fontSize: 12, color: "var(--text-muted)" }}>{q.default_reward_nim}</td>
+                    <td>
+                      <input type="number" min={0} step="any" value={questInputs[key] ?? ""}
+                        onChange={e => setQuestInputs(prev => ({ ...prev, [key]: e.target.value }))}
+                        style={{ width: 80, padding: "3px 6px", fontSize: 12 }} />
+                      {q.overridden && <span className="badge badge-yellow" style={{ fontSize: 10, marginLeft: 6 }}>overridden</span>}
+                    </td>
+                    <td style={{ display: "flex", gap: 6 }}>
+                      <button className="btn" style={{ fontSize: 11, padding: "2px 8px" }}
+                        disabled={busy || questInputs[key] === String(q.reward_nim)}
+                        onClick={() => doSaveQuestReward(q)}>
+                        {busy ? "…" : "Save"}
+                      </button>
+                      {q.overridden && (
+                        <button className="btn" style={{ fontSize: 11, padding: "2px 8px" }}
+                          disabled={busy} onClick={() => doResetQuestReward(q)}>
+                          Reset
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* ── Replay verifier binary ── */}

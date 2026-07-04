@@ -41,8 +41,19 @@ function StatusBadge({ status }: { status: string }) {
   );
 }
 
+const PAGE_SIZE = 100;
+// A single, generously-high limit used only for the summary KPI cards
+// (active count / total / NIM volume / fee collected), which need to
+// reflect ALL rooms, not just whatever page of the table is currently
+// loaded. The backend already scans every room into memory to answer this
+// regardless of the limit passed, so this costs nothing extra server-side.
+const STATS_LIMIT = 1_000_000;
+
 export default function VSRoomsTab() {
   const [rooms, setRooms] = useState<VSRoom[]>([]);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
+  const [statsRooms, setStatsRooms] = useState<VSRoom[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"all" | "active" | "completed">("active");
   const [sweeping, setSweeping] = useState(false);
@@ -50,12 +61,17 @@ export default function VSRoomsTab() {
   const [cancelling, setCancelling] = useState<string | null>(null);
 
   async function doCancel(r: VSRoom) {
-    const amountTxt = r.creator_paid ? ` and refund ${nim(r.entry_nim)} NIM to ${r.creator_nickname}` : "";
-    if (!confirm(`Close room ${r.id}${amountTxt}? Only possible while nobody has joined yet.`)) return;
+    const matched = !!r.opponent_id;
+    const refunds: string[] = [];
+    if (r.creator_paid) refunds.push(`${nim(r.entry_nim)} NIM to ${r.creator_nickname}`);
+    if (matched && r.opponent_paid) refunds.push(`${nim(r.entry_nim)} NIM to ${r.opponent_nickname}`);
+    const amountTxt = refunds.length ? ` and refund ${refunds.join(" + ")}` : "";
+    const warn = matched ? " This room is already matched — this is a forced dispute resolution, use with care." : "";
+    if (!confirm(`Close room ${r.id}${amountTxt}?${warn}`)) return;
     setCancelling(r.id);
     try {
       await cancelVSRoomAdmin(r.id);
-      await load();
+      await Promise.all([load(offset), loadStats()]);
     } catch (e) {
       alert(e instanceof Error ? e.message : "Cancel failed");
     } finally {
@@ -63,35 +79,51 @@ export default function VSRoomsTab() {
     }
   }
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (off: number) => {
     setLoading(true);
     try {
-      const { rooms } = await fetchVSRooms();
+      const { rooms, total } = await fetchVSRooms(PAGE_SIZE, off);
       setRooms(rooms.sort((a, b) => b.created_at - a.created_at));
+      setTotal(total);
+      setOffset(off);
     } finally {
       setLoading(false);
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  const loadStats = useCallback(async () => {
+    const { rooms } = await fetchVSRooms(STATS_LIMIT, 0);
+    setStatsRooms(rooms);
+  }, []);
 
+  useEffect(() => { load(0); loadStats(); }, [load, loadStats]);
+
+  // KPI cards are computed from statsRooms (an all-rooms fetch) so they stay
+  // accurate all-time figures regardless of which page of the table below is
+  // currently loaded.
+  const activeAll = statsRooms.filter(r => !["completed", "expired_payout", "expired_refunded", "cancelled"].includes(r.status));
+  const paidVolume = statsRooms.reduce((sum, r) => sum + (r.creator_paid ? r.entry_nim : 0) + (r.opponent_paid ? r.entry_nim : 0), 0);
+  const feeCollected = statsRooms.reduce((sum, r) => sum + (r.fee_nim ?? 0), 0);
+
+  // Table filter (active/completed/all) applies only to the currently
+  // loaded page — use Prev/Next below to page through the rest.
   const active = rooms.filter(r => !["completed", "expired_payout", "expired_refunded", "cancelled"].includes(r.status));
   const completed = rooms.filter(r => ["completed", "expired_payout", "expired_refunded", "cancelled"].includes(r.status));
-  const paidVolume = rooms.reduce((sum, r) => sum + (r.creator_paid ? r.entry_nim : 0) + (r.opponent_paid ? r.entry_nim : 0), 0);
-  const feeCollected = rooms.reduce((sum, r) => sum + (r.fee_nim ?? 0), 0);
-
   const shown = filter === "all" ? rooms : filter === "active" ? active : completed;
+
+  const pageStart = total === 0 ? 0 : offset + 1;
+  const pageEnd = Math.min(offset + rooms.length, total);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
         <div className="card" style={{ padding: "14px 18px", flex: "1 1 140px" }}>
           <div style={{ fontSize: 11, color: "var(--text-muted)", textTransform: "uppercase" }}>Active rooms</div>
-          <div style={{ fontSize: 22, fontWeight: 700 }}>{active.length}</div>
+          <div style={{ fontSize: 22, fontWeight: 700 }}>{activeAll.length}</div>
         </div>
         <div className="card" style={{ padding: "14px 18px", flex: "1 1 140px" }}>
           <div style={{ fontSize: 11, color: "var(--text-muted)", textTransform: "uppercase" }}>Total rooms</div>
-          <div style={{ fontSize: 22, fontWeight: 700 }}>{rooms.length}</div>
+          <div style={{ fontSize: 22, fontWeight: 700 }}>{statsRooms.length}</div>
         </div>
         <div className="card" style={{ padding: "14px 18px", flex: "1 1 160px" }}>
           <div style={{ fontSize: 11, color: "var(--text-muted)", textTransform: "uppercase" }}>NIM paid in (all-time)</div>
@@ -103,7 +135,7 @@ export default function VSRoomsTab() {
         </div>
       </div>
 
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
         {(["active", "completed", "all"] as const).map(f => (
           <button
             key={f}
@@ -114,11 +146,11 @@ export default function VSRoomsTab() {
             {f === "active" ? "Active" : f === "completed" ? "Completed" : "All"}
           </button>
         ))}
-        <button onClick={load} className="btn" style={{ fontSize: 12, padding: "6px 12px" }} disabled={loading}>
+        <button onClick={() => { load(offset); loadStats(); }} className="btn" style={{ fontSize: 12, padding: "6px 12px" }} disabled={loading}>
           {loading ? "Loading…" : "Refresh"}
         </button>
         <button
-          onClick={async () => { setSweeping(true); try { await sweepVSRooms(); await load(); } finally { setSweeping(false); } }}
+          onClick={async () => { setSweeping(true); try { await sweepVSRooms(); await Promise.all([load(offset), loadStats()]); } finally { setSweeping(false); } }}
           className="btn"
           style={{ fontSize: 12, padding: "6px 12px" }}
           disabled={sweeping}
@@ -127,7 +159,7 @@ export default function VSRoomsTab() {
           {sweeping ? "Sweeping…" : "Force sweep"}
         </button>
         <button
-          onClick={async () => { setReconciling(true); try { await reconcileVSPayments(); await load(); } finally { setReconciling(false); } }}
+          onClick={async () => { setReconciling(true); try { await reconcileVSPayments(); await Promise.all([load(offset), loadStats()]); } finally { setReconciling(false); } }}
           className="btn"
           style={{ fontSize: 12, padding: "6px 12px" }}
           disabled={reconciling}
@@ -135,6 +167,25 @@ export default function VSRoomsTab() {
         >
           {reconciling ? "Scanning chain…" : "Force payment scan"}
         </button>
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "var(--text-muted)" }}>
+          <span>{total === 0 ? "0 rooms" : `${pageStart}–${pageEnd} of ${total}`}</span>
+          <button
+            onClick={() => load(Math.max(0, offset - PAGE_SIZE))}
+            className="btn"
+            style={{ fontSize: 12, padding: "4px 10px" }}
+            disabled={loading || offset === 0}
+          >
+            ← Prev
+          </button>
+          <button
+            onClick={() => load(offset + PAGE_SIZE)}
+            className="btn"
+            style={{ fontSize: 12, padding: "4px 10px" }}
+            disabled={loading || offset + rooms.length >= total}
+          >
+            Next →
+          </button>
+        </div>
       </div>
 
       <div className="card" style={{ padding: 0, overflowX: "auto" }}>
@@ -170,7 +221,14 @@ export default function VSRoomsTab() {
                   {r.opponent_id && r.entry_nim > 0 && <span style={{ color: r.opponent_paid ? "#4caf50" : "var(--text-muted)", marginLeft: 6 }}>{r.opponent_paid ? "paid" : "unpaid"}</span>}
                   {r.opponent_score != null && <span style={{ color: "var(--text-muted)", marginLeft: 6 }}>score {r.opponent_score}</span>}
                 </td>
-                <td style={{ padding: "10px 14px" }}><StatusBadge status={r.status} /></td>
+                <td style={{ padding: "10px 14px" }}>
+                  <StatusBadge status={r.status} />
+                  {(r.creator_forfeit_requested || r.opponent_forfeit_requested) && (
+                    <div style={{ fontSize: 10, color: "var(--red)", marginTop: 2, textTransform: "uppercase" }} title="A player has asked to bail out of this match — it only cancels once BOTH sides request it">
+                      forfeit: {[r.creator_forfeit_requested && "creator", r.opponent_forfeit_requested && "opponent"].filter(Boolean).join(" + ")}
+                    </div>
+                  )}
+                </td>
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>{timeLeft(r.expires_at, r.status)}</td>
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>
                   {r.winner_id ? (
@@ -183,15 +241,17 @@ export default function VSRoomsTab() {
                 </td>
                 <td style={{ padding: "10px 14px", fontSize: 12, color: "var(--text-muted)" }}>{fmt(r.created_at)}</td>
                 <td style={{ padding: "10px 14px" }}>
-                  {!r.opponent_id && !["completed", "expired_payout", "expired_refunded", "cancelled"].includes(r.status) && (
+                  {!["completed", "expired_payout", "expired_refunded", "cancelled"].includes(r.status) && (
                     <button
                       onClick={() => doCancel(r)}
                       className="btn"
                       style={{ fontSize: 11, padding: "3px 8px", background: "var(--red)" }}
                       disabled={cancelling === r.id}
-                      title="Nobody has joined this room — close it and refund the creator if they paid"
+                      title={r.opponent_id
+                        ? "Already matched — force-close and refund whoever paid in (dispute resolution)"
+                        : "Nobody has joined this room — close it and refund the creator if they paid"}
                     >
-                      {cancelling === r.id ? "Closing…" : "Close & Refund"}
+                      {cancelling === r.id ? "Closing…" : r.opponent_id ? "Force Close & Refund" : "Close & Refund"}
                     </button>
                   )}
                 </td>

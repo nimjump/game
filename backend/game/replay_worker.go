@@ -513,8 +513,27 @@ func (p *workerPool) processJobs(w *godotWorker) {
 
 		log.Printf("[WORKER#%d] %s START job#%d queue_wait=%.1fs", w.id, jobMsg.jobID, jobNum, queueWait.Seconds())
 
+		// BUG FIX: runJob processes untrusted client-submitted replay data
+		// (base64 replay log, seed, char index) end-to-end through a
+		// subprocess pipe — a malformed/adversarial payload triggering an
+		// unexpected panic here (bad index, nil deref, etc.) used to kill
+		// this entire `for jobMsg := range p.jobCh` loop with no recovery,
+		// silently removing one worker from the pool forever (or stalling
+		// the whole replay-verification pipeline if it happened to all of
+		// them). Recovering and converting the panic into a plain error
+		// routes it through the EXISTING "kill worker, return, supervisor
+		// restarts" error path below instead of an uncaught crash.
 		execStart := time.Now()
-		res, err := p.runJob(w, jobMsg, jobNum)
+		var res *GodotReplayResult
+		var err error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("runJob panic: %v", r)
+				}
+			}()
+			res, err = p.runJob(w, jobMsg, jobNum)
+		}()
 		execElapsed := time.Since(execStart)
 
 		if err != nil {

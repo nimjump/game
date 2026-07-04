@@ -38,3 +38,6 @@ Thumbs.db
 
 # --- replay build ---
 *.pck
+
+# --- Local dev-only tooling (tunnels, personal test scripts) ---
+devtools/

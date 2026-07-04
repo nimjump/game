@@ -48,6 +48,15 @@ type VSRoom struct {
 
 	Status VSRoomStatus `json:"status"`
 
+	// Mutual forfeit — once matched (OpponentID set), either side can request
+	// to bail out. Nothing happens until BOTH sides have requested it: at
+	// that point the room is cancelled and whoever paid in gets a full
+	// refund (no fee — no real match happened). A one-sided request alone
+	// never ends the room; it just records intent until the other side
+	// agrees (or the normal 24h expiry/settlement takes over regardless).
+	CreatorForfeitRequested  bool `json:"creator_forfeit_requested,omitempty"`
+	OpponentForfeitRequested bool `json:"opponent_forfeit_requested,omitempty"`
+
 	WinnerID     string  `json:"winner_id,omitempty"`     // "" if tie-split or refunded
 	PayoutNIM    float64 `json:"payout_nim,omitempty"`     // total amount actually paid out (post-fee)
 	FeeNIM       float64 `json:"fee_nim,omitempty"`

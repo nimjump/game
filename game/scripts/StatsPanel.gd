@@ -816,7 +816,7 @@ func _build_rewards(rewards: Array) -> void:
 			tx_btn.add_theme_font_size_override("font_size", int(ref * 0.022))
 			var h := tx_hash
 			tx_btn.pressed.connect(func():
-				OS.shell_open("https://nimiq.watch/#" + h)
+				UITheme.confirm_external_link(self, "https://nimiq.watch/#" + h, ref)
 			)
 			row.add_child(tx_btn)
 		else:

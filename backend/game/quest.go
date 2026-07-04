@@ -5,11 +5,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
 	"nimjump-backend/models"
 )
+
+// claimingQuests guards against the same (playerID, questID) being claimed
+// twice concurrently. handleQuestClaim/handleQuestClaimAll do a plain
+// read-Completed/ClaimedAt-then-write with no transactional check-and-set,
+// so two requests racing for the same quest (double-click, retried request,
+// two tabs) could both read ClaimedAt==0 before either writes it, and both
+// would go on to QueueReward — a real double-payout. Same class of bug as
+// the reward-send double-dispatch guarded by sendingRewards in nimiq.go;
+// this is the equivalent lock for the claim path. Key: playerID+"|"+questID.
+var claimingQuests sync.Map
+
+// TryClaimQuestLock claims the in-process lock for (playerID, questID).
+// Returns ok=false if another claim for the same pair is already in flight —
+// callers should treat that as "already being claimed" and bail out without
+// touching the DB or queuing a reward. On success, callers MUST call the
+// returned release() when done (success or failure) via defer.
+func TryClaimQuestLock(playerID, questID string) (release func(), ok bool) {
+	key := playerID + "|" + questID
+	if _, already := claimingQuests.LoadOrStore(key, struct{}{}); already {
+		return func() {}, false
+	}
+	return func() { claimingQuests.Delete(key) }, true
+}
 
 // today returns today's date in "2006-01-02" format (UTC+3).
 func today() string {
@@ -19,13 +43,92 @@ func today() string {
 // DailyQuests returns today's 5 daily quests for a specific player.
 // Each player gets a unique, deterministic set based on playerID + day.
 // Use GetOrCreatePlayerQuests for the canonical per-player set stored in DB.
-func DailyQuests(playerID string) []models.Quest {
+//
+// Store method (not a free function) because reward amounts can be
+// admin-overridden (AppConfig.QuestRewardOverrides, see
+// SetQuestRewardOverride below) and that override lives in BadgerDB.
+func (s *Store) DailyQuests(playerID string) []models.Quest {
 	day := today()
+	overrides := s.GetAppConfig().QuestRewardOverrides
 	quests := make([]models.Quest, 5)
 	for i := range quests {
-		quests[i] = generateQuest(playerID, day, i)
+		quests[i] = generateQuest(playerID, day, i, overrides)
 	}
 	return quests
+}
+
+// questRewardKey — the AppConfig.QuestRewardOverrides map key for a given
+// quest template, e.g. "score:1500". Stable across pool reordering since
+// it's based on (type, target), not the template's index in questPool.
+func questRewardKey(qtype models.QuestType, target int) string {
+	return fmt.Sprintf("%s:%d", qtype, target)
+}
+
+// QuestPoolEntry — one questPool template plus its admin-override status,
+// for the admin panel's quest-reward editor.
+type QuestPoolEntry struct {
+	QuestType        string  `json:"quest_type"`
+	Target           int     `json:"target"`
+	Description      string  `json:"description"`
+	DefaultRewardNIM float64 `json:"default_reward_nim"`
+	RewardNIM        float64 `json:"reward_nim"` // effective — override if set, else default
+	Overridden       bool    `json:"overridden"`
+}
+
+// QuestPoolWithOverrides — every template in questPool with its current
+// effective reward (admin override if present, else the hardcoded default).
+func (s *Store) QuestPoolWithOverrides() []QuestPoolEntry {
+	overrides := s.GetAppConfig().QuestRewardOverrides
+	out := make([]QuestPoolEntry, 0, len(questPool))
+	for _, t := range questPool {
+		key := questRewardKey(t.qtype, t.target)
+		reward := t.reward
+		overridden := false
+		if v, ok := overrides[key]; ok {
+			reward = v
+			overridden = true
+		}
+		out = append(out, QuestPoolEntry{
+			QuestType:        string(t.qtype),
+			Target:           t.target,
+			Description:      t.desc,
+			DefaultRewardNIM: t.reward,
+			RewardNIM:        reward,
+			Overridden:       overridden,
+		})
+	}
+	return out
+}
+
+// SetQuestRewardOverride — admin-triggered. Sets (or, with rewardNIM == nil,
+// clears) the NIM reward for the questPool template matching (qtype, target).
+// Returns an error if no such template exists (typo-guard — the admin UI
+// should only ever send back (qtype, target) pairs it got from
+// QuestPoolWithOverrides, but this keeps a bad manual API call from silently
+// creating a dead override that never matches anything).
+func (s *Store) SetQuestRewardOverride(qtype string, target int, rewardNIM *float64) error {
+	found := false
+	for _, t := range questPool {
+		if string(t.qtype) == qtype && t.target == target {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("no quest template matches quest_type=%s target=%d", qtype, target)
+	}
+
+	cfg := s.GetAppConfig()
+	if cfg.QuestRewardOverrides == nil {
+		cfg.QuestRewardOverrides = map[string]float64{}
+	}
+	key := questRewardKey(models.QuestType(qtype), target)
+	if rewardNIM == nil {
+		delete(cfg.QuestRewardOverrides, key)
+	} else {
+		cfg.QuestRewardOverrides[key] = *rewardNIM
+	}
+	return s.SaveAppConfig(cfg)
 }
 
 // questPool is the full pool of quest templates used by generateQuest.
@@ -91,12 +194,19 @@ var questPool = []questTemplate{
 }
 
 // generateQuest deterministically picks a quest for a specific player+day+slot.
-func generateQuest(playerID, day string, idx int) models.Quest {
+// overrides is AppConfig.QuestRewardOverrides (may be nil — just means no
+// admin overrides are active, every template uses its hardcoded default).
+func generateQuest(playerID, day string, idx int, overrides map[string]float64) models.Quest {
 	h    := md5.Sum([]byte(fmt.Sprintf("%s:%s:%d", playerID, day, idx)))
 	seed := int(h[0])<<8 | int(h[1])
 
 	offset := (idx * (len(questPool) / 5)) % len(questPool)
 	t      := questPool[(seed+offset)%len(questPool)]
+
+	reward := t.reward
+	if v, ok := overrides[questRewardKey(t.qtype, t.target)]; ok {
+		reward = v
+	}
 
 	ph   := md5.Sum([]byte(playerID))
 	phex := fmt.Sprintf("%x", ph[:3]) // 6 hex chars
@@ -106,7 +216,7 @@ func generateQuest(playerID, day string, idx int) models.Quest {
 		Type:        t.qtype,
 		Description: t.desc,
 		Target:      t.target,
-		RewardNIM:   t.reward,
+		RewardNIM:   reward,
 		Day:         day,
 	}
 }
@@ -138,7 +248,7 @@ func (s *Store) GetOrCreatePlayerQuests(playerID string) ([]models.Quest, error)
 		return nil, fmt.Errorf("quest DB read error: %w", err)
 	}
 
-	quests := DailyQuests(playerID)
+	quests := s.DailyQuests(playerID)
 
 	data, _ := json.Marshal(quests)
 	_ = s.db.Update(func(txn *badger.Txn) error {

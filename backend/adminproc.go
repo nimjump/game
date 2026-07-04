@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -91,6 +92,23 @@ func superviseAdmin(ctx context.Context, dir string, cmdParts []string) {
 		// folders, or with ADMIN_REBUILD_ON_START=true.
 		if err := prepareAdminApp(ctx, dir, cmdParts); err != nil {
 			log.Printf("[ADMIN_BUILD] %v — retrying in %s", err, backoff)
+			if !sleepOrDone(ctx, backoff) {
+				return
+			}
+			backoff = nextBackoff(backoff, maxBackoff)
+			continue
+		}
+
+		// Same idea as the early port probe in main.go: check ADMIN_PORT is
+		// actually free before spawning `npm start`. Without this, a second
+		// instance of this backend (e.g. `go run .` started by hand while
+		// the systemd/service-managed one is already running) would spawn
+		// its own `npm start`, watch it fail deep inside Next.js trying to
+		// bind the same port, and keep retrying with backoff forever — a
+		// confusing "it's stuck in some loop, is it ballooning?" symptom
+		// instead of a clear one-line explanation.
+		if busyAddr := adminPortBusy(); busyAddr != "" {
+			log.Printf("[ADMIN_PROC] %s is already in use — most likely another instance of this backend (and its admin app) is already running. Not starting a duplicate; will keep checking every %s. Stop the other instance first if this isn't expected.", busyAddr, backoff)
 			if !sleepOrDone(ctx, backoff) {
 				return
 			}
@@ -221,6 +239,23 @@ func runBuildStep(ctx context.Context, dir string, name string, args ...string) 
 	go streamPrefixed("[ADMIN_BUILD]", stdout)
 	go streamPrefixed("[ADMIN_BUILD]", stderr)
 	return cmd.Wait()
+}
+
+// adminPortBusy checks whether ADMIN_PORT (default 3001, same default
+// admin_proxy.go's adminPort() uses) is already occupied by something else.
+// Returns the "host:port" string if busy, or "" if free.
+func adminPortBusy() string {
+	port := os.Getenv("ADMIN_PORT")
+	if port == "" {
+		port = "3001"
+	}
+	addr := "127.0.0.1:" + port
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return addr
+	}
+	ln.Close()
+	return ""
 }
 
 // sleepOrDone waits for d, or returns false early if ctx is cancelled.

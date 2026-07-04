@@ -29,11 +29,55 @@ const (
 	keyNimiqConfig        = "nimcfg"
 	NimLunaMultiplier     = 100_000     // 1 NIM = 100,000 luna
 
-	MaxRetryAttempts = 10               // after this, marked as "failed"
-	RetryInterval    = 15 * time.Second // retry every 15 seconds
+	MaxRetryAttempts = 10               // informational only — not enforced; rewards retry forever (see attemptSend)
+
+	// RetryInterval — how often the background loop WAKES UP to scan for due
+	// rewards (cheap: just a DB list, no RPC calls unless something is
+	// actually due). This is intentionally short so a reward that just became
+	// eligible again doesn't sit around long.
+	RetryInterval = 15 * time.Second
+
+	// RewardRetryCooldown — minimum time between two send ATTEMPTS for the
+	// SAME reward. This used to be wired to RetryInterval (15s) by mistake —
+	// the comment above the old check said "15 minutes" but the code used
+	// RetryInterval.Seconds() = 15 SECONDS, so every reward that failed (e.g.
+	// due to RPC "Rate limit exceeded") was retried again on the very next
+	// 15s loop tick, forever. With dozens of pending rewards that meant
+	// dozens of pushTransaction/getBlockNumber RPC calls every 15 seconds —
+	// which is exactly what triggered (and perpetuated) the rate limiting in
+	// the first place, and also caused the same still-in-flight transaction
+	// to be re-signed/re-pushed before it had time to leave the mempool,
+	// producing "Transaction already in mempool" errors on top.
+	RewardRetryCooldown = 3 * time.Minute
+	// RewardRetryMaxCooldown — cap for the exponential backoff below, so a
+	// reward that keeps failing doesn't end up waiting hours between tries.
+	RewardRetryMaxCooldown = 15 * time.Minute
+
+	// vsNotifyPingNIM — the smallest indivisible NIM amount (1 luna) sent to
+	// a player purely to trigger Nimiq Pay's own built-in "payment received"
+	// notification. This mini-app runs inside a WebView with no Web Push
+	// support and no way to reach a player who isn't actively in the game,
+	// so this piggybacks on the wallet app's own notification instead of
+	// building a separate push infrastructure. The actual value is
+	// irrelevant — what matters is the memo carrying the message — so it's
+	// kept at the true minimum rather than some arbitrary "small" amount.
+	// See sendVSJoinPing.
+	vsNotifyPingNIM = 0.00001
 )
 
 var retryMu sync.Mutex
+
+// sendingRewards tracks reward IDs that currently have an attemptSend() call
+// in flight. Without this, the same reward could be dispatched twice at once
+// — e.g. QueueReward's immediate "go s.attemptSend(reward)" overlapping with
+// the 15s retry loop or an admin's ForceRetryPendingRewards (which explicitly
+// skips the normal cooldown check) — and each concurrent call independently
+// signs and pushes its own on-chain transaction for the same payout, i.e. a
+// real double-spend of house funds. This is a simple mutual-exclusion lock
+// per reward ID: attemptSend claims the ID before doing any RPC work and
+// releases it when done (success or failure), so a second concurrent call
+// for the same reward is dropped instead of firing a second real payment.
+var sendingRewards sync.Map // rewardID (string) → struct{}{} while in flight
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -263,7 +307,7 @@ func (s *Store) QueueReward(playerID string, amountNIM float64, reason string) (
 		reward.ID, playerID[:min8s(playerID)], amountNIM, reason)
 
 	// Attempt to send in background
-	go s.attemptSend(reward)
+	SafeGo("attemptSend", func() { s.attemptSend(reward) })
 
 	return reward, nil
 }
@@ -289,6 +333,16 @@ func buildMemo(amountNIM float64, reason string) string {
 
 	case len(parts) >= 3 && parts[0] == "vsroom":
 		kind := parts[2]
+		// notify_join is a near-zero "ping" payment (see sendVSJoinPing) —
+		// its whole purpose is to piggyback on Nimiq Pay's own "payment
+		// received" notification as a way to reach a player who isn't
+		// actively in the game, since a WebView mini-app has no other push
+		// channel. The memo text IS the notification, so skip the generic
+		// "+0.01 NIM" amount suffix — showing a near-zero amount would just
+		// read as a glitch instead of the actual message.
+		if kind == "notify_join" {
+			return truncate64("NimJump: VS match started — 24h to play!")
+		}
 		label := map[string]string{
 			"win":     "VS win",
 			"split":   "VS tie split",
@@ -340,6 +394,18 @@ func truncate64(s string) string {
 
 // attemptSend — single send attempt
 func (s *Store) attemptSend(reward *models.PendingReward) {
+	// BUG FIX: claim this reward ID before doing any RPC work, and release
+	// it when done. If another attemptSend call for the SAME reward is
+	// already in flight (e.g. QueueReward's immediate dispatch overlapping
+	// the 15s retry loop, or an admin double-clicking "force retry"), this
+	// call backs off instead of independently signing and pushing a second
+	// real on-chain transaction for the same payout.
+	if _, alreadySending := sendingRewards.LoadOrStore(reward.ID, struct{}{}); alreadySending {
+		log.Printf("[REWARD] id=%s already has a send in flight — skipping duplicate dispatch", reward.ID)
+		return
+	}
+	defer sendingRewards.Delete(reward.ID)
+
 	reward.Attempts++
 	reward.LastAttempt = time.Now().Unix()
 
@@ -348,7 +414,12 @@ func (s *Store) attemptSend(reward *models.PendingReward) {
 
 	if err != nil {
 		reward.ErrorMsg = err.Error()
-		reward.Status = models.RewardPending // always keep pending — retry forever
+		// Retry forever, no cutoff — everything routes through this one
+		// reward queue (visible/manageable from the admin panel), so there's
+		// no need for a separate "gave up" terminal state. An operator can
+		// always see it sitting in the pending queue and force-retry or
+		// investigate from there.
+		reward.Status = models.RewardPending
 		log.Printf("[REWARD] attempt=%d FAILED id=%s err=%v — will retry", reward.Attempts, reward.ID, err)
 	} else {
 		reward.TxHash = txHash
@@ -358,7 +429,7 @@ func (s *Store) attemptSend(reward *models.PendingReward) {
 			reward.ID, txHash, reward.AmountNIM, reward.NimiqAddress)
 
 		// Bakiye kontrol et
-		go s.checkBalanceAndNotify(cfg)
+		SafeGo("checkBalanceAndNotify", func() { s.checkBalanceAndNotify(cfg) })
 	}
 
 	_ = s.saveReward(reward)
@@ -379,26 +450,56 @@ func (s *Store) retryPendingRewards(force bool) {
 	defer retryMu.Unlock()
 
 	pending, err1 := s.ListRewards("pending")
-	failed, err2  := s.ListRewards("failed")
 	if err1 != nil {
 		log.Printf("[RETRY] list error: %v", err1)
 		return
 	}
-	rewards := append(pending, failed...)
+	rewards := pending
+	failedCount := 0
+
+	// Every reward retries forever (no cutoff — see attemptSend), so any
+	// legacy/manually-set "failed" reward should keep getting picked back up
+	// here regardless of force, same as before.
+	//
+	// BUG FIX: this used to reset the "failed" copies back to pending in a
+	// separate `failed` slice, then append that same (already-copied) slice
+	// into `rewards` — but `append(pending, failed...)` had already copied
+	// the ORIGINAL (still-"failed") values into `rewards` at that point, so
+	// mutating `failed[i]` afterwards never actually reached the struct that
+	// got passed to attemptSend. Reset happens on `failed` BEFORE appending
+	// now, so the reset actually lands on what gets retried.
+	failed, err2 := s.ListRewards("failed")
 	if err2 == nil {
-		// reset any old "failed" back to pending so they keep retrying
+		failedCount = len(failed)
 		for i := range failed {
 			failed[i].Status = models.RewardPending
 		}
+		rewards = append(rewards, failed...)
 	}
+
 	if len(rewards) == 0 {
 		return
 	}
-	log.Printf("[RETRY] retrying %d rewards (%d pending, %d previously-failed) force=%v", len(rewards), len(pending), len(failed), force)
+	log.Printf("[RETRY] retrying %d rewards (%d pending, %d previously-failed) force=%v", len(rewards), len(pending), failedCount, force)
 	for i := range rewards {
 		r := &rewards[i]
-		// Skip if less than 15 minutes since last attempt (unless forced)
-		if !force && r.LastAttempt > 0 && time.Now().Unix()-r.LastAttempt < int64(RetryInterval.Seconds()) {
+		// Skip if less than RewardRetryCooldown since last attempt (unless
+		// forced), with simple exponential backoff on repeated failures:
+		// attempt 1→2 waits the base cooldown, each further failed attempt
+		// doubles the wait, capped at RewardRetryMaxCooldown. This is what
+		// actually keeps us from hammering the RPC node every 15s — the
+		// retry loop itself still ticks every 15s (RetryInterval), it just
+		// won't have anything due to send most of the time now.
+		cooldown := RewardRetryCooldown
+		if r.Attempts > 1 {
+			shift := min(r.Attempts-1, 6) // cap the shift so it can't overflow/misbehave
+			backoff := RewardRetryCooldown * time.Duration(int64(1)<<uint(shift))
+			if backoff > RewardRetryMaxCooldown {
+				backoff = RewardRetryMaxCooldown
+			}
+			cooldown = backoff
+		}
+		if !force && r.LastAttempt > 0 && time.Now().Unix()-r.LastAttempt < int64(cooldown.Seconds()) {
 			continue
 		}
 		// For no_wallet rewards, re-check wallet
@@ -410,7 +511,8 @@ func (s *Store) retryPendingRewards(force bool) {
 			r.NimiqAddress = walletInfo.NimiqAddress
 			r.Status       = models.RewardPending
 		}
-		go s.attemptSend(r)
+		rr := r
+		SafeGo("attemptSend", func() { s.attemptSend(rr) })
 	}
 }
 

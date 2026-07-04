@@ -42,6 +42,26 @@ type AppConfig struct {
 	UpdateScheduledWeek string `json:"update_scheduled_week,omitempty"`
 
 	ReplayVersion int `json:"replay_version"` // client must submit a matching client_version
+
+	// DailyEarnCapNIM — admin-editable daily in-game-coin earn cap (NIM).
+	// 0 means "not set yet" → falls back to DAILY_EARN_CAP_NIM env var or the
+	// 100 NIM default (see DailyCapNIM() in daily_earn_cap.go). Only
+	// "in_game_coins" rewards count against this — quest/leaderboard payouts
+	// are unaffected (see IsReasonCapped).
+	DailyEarnCapNIM float64 `json:"daily_earn_cap_nim,omitempty"`
+
+	// QuestRewardOverrides — admin-editable NIM reward per quest template,
+	// keyed by "<questType>:<target>" (e.g. "score:1500"), overriding the
+	// hardcoded reward in questPool (game/quest.go). A key with no entry
+	// here just uses questPool's default. See effectiveQuestReward().
+	QuestRewardOverrides map[string]float64 `json:"quest_reward_overrides,omitempty"`
+
+	// CoinNIMRate — admin-editable "1 in-game coin = how many NIM" rate,
+	// applied to QuestCoins collected during a run (see handleSubmit in
+	// handlers/server.go, "Coin → NIM ödülü"). 0 means "not set yet" →
+	// falls back to COIN_NIM_RATE env var or the 1.0 NIM/coin default
+	// (see CoinNIMRate() in daily_earn_cap.go).
+	CoinNIMRate float64 `json:"coin_nim_rate,omitempty"`
 }
 
 func envBoolDefault(key string, def bool) bool {
@@ -60,6 +80,19 @@ func defaultAppConfig() AppConfig {
 			replayVer = n
 		}
 	}
+	dailyCap := 0.0 // 0 = unset, DailyCapNIM() falls back to env/default
+	if v := os.Getenv("DAILY_EARN_CAP_NIM"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			dailyCap = f
+		}
+	}
+	coinRate := 0.0 // 0 = unset, CoinNIMRate() method falls back to env/default
+	if v := os.Getenv("COIN_NIM_RATE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			coinRate = f
+		}
+	}
+
 	return AppConfig{
 		// Weekly leaderboard starts OFF on purpose (temporarily disabled —
 		// not a bug). Both can be flipped back on from the admin panel or
@@ -69,6 +102,8 @@ func defaultAppConfig() AppConfig {
 		UpdateMode:               UpdateModeOff,
 		UpdateActive:             false,
 		ReplayVersion:            replayVer,
+		DailyEarnCapNIM:          dailyCap,
+		CoinNIMRate:              coinRate,
 	}
 }
 

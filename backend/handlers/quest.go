@@ -211,6 +211,17 @@ func (s *Server) handleQuestClaim(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// BUG FIX: serialize claims for the same (player, quest) — without this,
+	// two concurrent requests (double-click, retry, two tabs) could both
+	// read ClaimedAt==0 before either wrote it, and both would queue a real
+	// NIM payout. See TryClaimQuestLock in game/quest.go.
+	release, ok := game.TryClaimQuestLock(playerID, questID)
+	if !ok {
+		writeErr(ctx, 409, "claim_in_progress")
+		return
+	}
+	defer release()
+
 	prog, err := s.Store.GetProgress(playerID, questID)
 	if err != nil || prog == nil {
 		writeErr(ctx, 404, "quest_progress_not_found")
@@ -288,24 +299,36 @@ func (s *Server) handleQuestClaimAll(ctx *fasthttp.RequestCtx) {
 
 	results := make([]claimResult, 0, len(req.QuestIDs))
 	for _, questID := range req.QuestIDs {
+		// Same double-claim guard as handleQuestClaim — see TryClaimQuestLock.
+		release, lockOK := game.TryClaimQuestLock(req.PlayerID, questID)
+		if !lockOK {
+			results = append(results, claimResult{QuestID: questID, Error: "claim_in_progress"})
+			continue
+		}
+
 		prog, err := s.Store.GetProgress(req.PlayerID, questID)
 		if err != nil || prog == nil {
 			results = append(results, claimResult{QuestID: questID, Error: "not_found"})
+			release()
 			continue
 		}
 		if !prog.Completed {
 			results = append(results, claimResult{QuestID: questID, Error: "not_completed"})
+			release()
 			continue
 		}
 		if prog.ClaimedAt != 0 {
 			results = append(results, claimResult{QuestID: questID, Error: "already_claimed"})
+			release()
 			continue
 		}
 		prog.ClaimedAt = time.Now().Unix()
 		if err := s.Store.SaveProgress(prog); err != nil {
 			results = append(results, claimResult{QuestID: questID, Error: "save_error"})
+			release()
 			continue
 		}
+		release()
 		if prog.RewardNIM > 0 {
 			_, rerr := s.Store.QueueReward(req.PlayerID, prog.RewardNIM, "quest_claim:"+questID)
 			if rerr != nil {

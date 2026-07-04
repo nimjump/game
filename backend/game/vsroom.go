@@ -1,6 +1,7 @@
 package game
 
 import (
+	crand "crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -71,11 +72,30 @@ func vsRoomLock(roomID string) *sync.Mutex {
 
 // ── ID / seed helpers ────────────────────────────────────────────────────────
 
+// vsRoomRandID generates a room ID. This ID doubles as a de-facto bearer
+// token: the unauthenticated GET /backend/vsroom/{id} route (needed so a
+// shared invite link works before the recipient has signed in) trusts
+// "knows the ID" as "was actually given the invite link". math/rand is
+// predictable (seeded, reproducible) and unsuitable for anything acting as
+// a secret — crypto/rand is required here. (The per-run game *seed* stored
+// on the room is a different thing and stays math/rand — it only needs to
+// be unpredictable pre-match, not cryptographically secure, and always
+// requires knowing/holding a valid room ID to ever read in the first
+// place.)
 func vsRoomRandID(n int) string {
 	const chars = "abcdefghijklmnopqrstuvwxyz0123456789"
+	buf := make([]byte, n)
+	if _, err := crand.Read(buf); err != nil {
+		// crypto/rand failing means the OS entropy source is broken — extremely
+		// unlikely, but fall back rather than panic so room creation still works.
+		log.Printf("[VSROOM] crypto/rand read failed, falling back to math/rand: %v", err)
+		for i := range buf {
+			buf[i] = byte(rand.Intn(256))
+		}
+	}
 	b := make([]byte, n)
-	for i := range b {
-		b[i] = chars[rand.Intn(len(chars))]
+	for i, v := range buf {
+		b[i] = chars[int(v)%len(chars)]
 	}
 	return string(b)
 }
@@ -174,22 +194,56 @@ func (s *Store) FindVSRoomBySessionID(sessionID string) (*models.VSRoom, error) 
 	return nil, nil
 }
 
-// ListVSRoomsByPlayer — rooms where playerID is creator or opponent, newest first.
-func (s *Store) ListVSRoomsByPlayer(playerID string, limit int) ([]models.VSRoom, error) {
+// StripVSSeed returns a copy of r with the game Seed cleared unless viewerID
+// is one of the room's two participants. Both sides play the exact same
+// fixed seed asynchronously, so leaking it to anyone else — an
+// unauthenticated visitor opening a shared invite link before signing in, or
+// anyone browsing the public "open rooms" list — would let them scout the
+// level's platform/enemy layout ahead of their own attempt. Call this on
+// every room (or list of rooms) returned by an endpoint that isn't
+// exclusively gated to that room's own participants (admin routes, which
+// are already behind requireAdminSession, are exempt).
+func StripVSSeed(r models.VSRoom, viewerID string) models.VSRoom {
+	if viewerID == "" || (viewerID != r.CreatorID && viewerID != r.OpponentID) {
+		r.Seed = ""
+	}
+	return r
+}
+
+// PaginateVSRooms slices an already-filtered/sorted room list into a page,
+// returning the page plus the pre-pagination total count (so a caller can
+// show "X of Y" or decide whether to offer a "load more" control). limit<=0
+// means "no limit" (return everything from offset onward).
+func PaginateVSRooms(all []models.VSRoom, limit, offset int) ([]models.VSRoom, int) {
+	total := len(all)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return []models.VSRoom{}, total
+	}
+	end := total
+	if limit > 0 && offset+limit < total {
+		end = offset + limit
+	}
+	return all[offset:end], total
+}
+
+// ListVSRoomsByPlayer — rooms where playerID is creator or opponent, newest
+// first, paginated. Returns the page plus the total matching-room count.
+func (s *Store) ListVSRoomsByPlayer(playerID string, limit, offset int) ([]models.VSRoom, int, error) {
 	all, err := s.ListVSRooms()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	var out []models.VSRoom
+	var filtered []models.VSRoom
 	for _, r := range all {
 		if r.CreatorID == playerID || r.OpponentID == playerID {
-			out = append(out, r)
+			filtered = append(filtered, r)
 		}
 	}
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
+	page, total := PaginateVSRooms(filtered, limit, offset)
+	return page, total, nil
 }
 
 // ListOpenVSRooms — public "browse" list: rooms that are public (not
@@ -234,7 +288,7 @@ func (s *Store) CreateVSRoom(creatorID, creatorNickname string, entryNIM float64
 		status = models.VSAwaitingCreatorPay
 	}
 	r := &models.VSRoom{
-		ID:              vsRoomRandID(8),
+		ID:              vsRoomRandID(12),
 		Seed:            strconv.FormatInt(rand.Int63(), 10),
 		EntryNIM:        entryNIM,
 		IsPrivate:       isPrivate,
@@ -291,8 +345,30 @@ func (s *Store) JoinVSRoom(roomID, playerID, nickname string) (*models.VSRoom, e
 			return nil, err
 		}
 		log.Printf("[VSROOM] joined id=%s opponent=%s status=%s expires_at=%d", r.ID, playerID, r.Status, r.ExpiresAt)
+		// Ping BOTH sides via a tiny NIM "notification payment" — see
+		// sendVSJoinPing. Fire-and-forget in a goroutine so a slow wallet
+		// lookup/RPC never delays this join response.
+		SafeGo("sendVSJoinPing", func() { s.sendVSJoinPing(r.CreatorID, r.ID) })
+		SafeGo("sendVSJoinPing", func() { s.sendVSJoinPing(r.OpponentID, r.ID) })
 	}
 	return r, nil
+}
+
+// sendVSJoinPing sends a player the smallest possible NIM amount the moment
+// their room actually gets a real opponent (both the creator AND the
+// opponent get one) — the only practical way this WebView mini-app has to
+// reach a player who's since closed the tab and isn't actively polling the
+// room. It rides on Nimiq Pay's own built-in "payment received" notification
+// (there is no other push channel available here); the memo carries the
+// actual message (see buildMemo's "notify_join" case) — the amount itself is
+// irrelevant, which is why it's kept at the true minimum (vsNotifyPingNIM).
+// Uses the exact same reward queue/retry machinery as every other payout, so
+// it's visible in the same admin panel queue and costs nothing extra to
+// operate — it's just another QueueReward call with a near-zero amount.
+func (s *Store) sendVSJoinPing(playerID, roomID string) {
+	if _, err := s.QueueReward(playerID, vsNotifyPingNIM, fmt.Sprintf("vsroom:%s:notify_join", roomID)); err != nil {
+		log.Printf("[VSROOM] join-ping failed room=%s player=%s err=%v (non-fatal, purely cosmetic)", roomID, playerID, err)
+	}
 }
 
 // ── Payment confirmation ──────────────────────────────────────────────────────
@@ -559,7 +635,7 @@ func (s *Store) StartVSPaymentReconciler() {
 	go func() {
 		time.Sleep(45 * time.Second)
 		for {
-			s.ReconcileVSPayments()
+			SafeCall("ReconcileVSPayments", s.ReconcileVSPayments)
 			time.Sleep(90 * time.Second)
 		}
 	}()
@@ -834,7 +910,7 @@ func (s *Store) StartVSRoomSweep() {
 	go func() {
 		time.Sleep(30 * time.Second)
 		for {
-			s.SweepExpiredVSRooms()
+			SafeCall("SweepExpiredVSRooms", s.SweepExpiredVSRooms)
 			time.Sleep(5 * time.Minute)
 		}
 	}()
@@ -867,16 +943,26 @@ func (s *Store) CancelVSRoom(roomID, playerID string) error {
 	return s.saveVSRoom(r)
 }
 
-// AdminCancelAndRefundVSRoom — force-closes a room that's still open for an
-// opponent to join (OpponentID == "") and refunds the creator's payment if
-// they'd already paid in. This is the admin-panel "close & refund" action.
+// AdminCancelAndRefundVSRoom — force-closes ANY non-terminal room and
+// refunds whichever side(s) actually paid in, no fee taken. This is the
+// admin-panel "close & refund" / dispute-resolution action.
+//
+// Originally this only worked pre-match (OpponentID == ""); once two players
+// were matched and paid in, admins had zero intervention capability short of
+// hand-editing the database — a real operational risk for a feature moving
+// real money. It now works at any point before the room reaches a terminal
+// status: if only the creator ever paid, only the creator is refunded (same
+// as before); if both paid, both get refunded. There's no partial/manual
+// settlement option here by design — a full refund-both is the one outcome
+// that's always fair regardless of what actually happened in a disputed
+// match, so it's the safe generic answer rather than admin having to pick a
+// winner.
 //
 // Locked exactly like every other mutator here, so the classic failure mode
 // — admin clicks close at the same instant someone else clicks the invite
-// link — cannot happen: whichever request (this cancel, or JoinVSRoom)
-// acquires the room's mutex first completes fully before the other one even
-// reads the room's state, so the second one always sees the first one's
-// result and fails cleanly instead of silently racing it.
+// link, or the score-submit flow is mid-settlement — cannot happen:
+// whichever request acquires the room's mutex first completes fully before
+// the other one even reads the room's state.
 func (s *Store) AdminCancelAndRefundVSRoom(roomID string) (*models.VSRoom, error) {
 	lock := vsRoomLock(roomID)
 	lock.Lock()
@@ -886,22 +972,85 @@ func (s *Store) AdminCancelAndRefundVSRoom(roomID string) (*models.VSRoom, error
 	if err != nil || r == nil {
 		return nil, fmt.Errorf("room_not_found")
 	}
-	if r.OpponentID != "" {
-		return nil, fmt.Errorf("opponent_already_joined")
-	}
 	if isVSTerminalStatus(r.Status) {
 		return nil, fmt.Errorf("already_closed")
 	}
-	refunded := 0.0
+	creatorRefund := 0.0
+	opponentRefund := 0.0
 	if r.CreatorPaid {
 		s.refundVSRoom(r, r.CreatorID, r.EntryNIM)
-		refunded = r.EntryNIM
+		creatorRefund = r.EntryNIM
+	}
+	if r.OpponentID != "" && r.OpponentPaid {
+		s.refundVSRoom(r, r.OpponentID, r.EntryNIM)
+		opponentRefund = r.EntryNIM
 	}
 	r.Status = models.VSCancelled
 	r.SettledAt = time.Now().Unix()
 	if err := s.saveVSRoom(r); err != nil {
 		return nil, err
 	}
-	log.Printf("[VSROOM] admin cancel+refund id=%s creator=%s refunded=%.4f", r.ID, r.CreatorID, refunded)
+	log.Printf("[VSROOM] admin cancel+refund id=%s matched=%v creator_refund=%.4f opponent_refund=%.4f",
+		r.ID, r.OpponentID != "", creatorRefund, opponentRefund)
+	return r, nil
+}
+
+// RequestVSForfeit — a matched player's request to bail out of a room they
+// no longer want to play. Nothing happens on a one-sided request except
+// recording it; only once BOTH the creator and the opponent have requested
+// it does the room actually get cancelled and refunded (full refund to
+// whoever paid, no fee — this is a mutual "let's just call it off", not a
+// competitive outcome). This is separate from CancelVSRoom (creator-only,
+// pre-match) and AdminCancelAndRefundVSRoom (admin-only, any time) — this
+// one requires no admin, but requires consent from both sides, so neither
+// player can unilaterally deny the other a fair shot at a match they
+// already paid into.
+func (s *Store) RequestVSForfeit(roomID, playerID string) (*models.VSRoom, error) {
+	lock := vsRoomLock(roomID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	r, err := s.GetVSRoom(roomID)
+	if err != nil || r == nil {
+		return nil, fmt.Errorf("room_not_found")
+	}
+	if isVSTerminalStatus(r.Status) {
+		return nil, fmt.Errorf("already_closed")
+	}
+	if r.OpponentID == "" {
+		return nil, fmt.Errorf("no_opponent_yet") // use /cancel instead
+	}
+	switch playerID {
+	case r.CreatorID:
+		if r.CreatorForfeitRequested {
+			return r, nil // already requested — idempotent
+		}
+		r.CreatorForfeitRequested = true
+	case r.OpponentID:
+		if r.OpponentForfeitRequested {
+			return r, nil
+		}
+		r.OpponentForfeitRequested = true
+	default:
+		return nil, fmt.Errorf("not_a_participant")
+	}
+
+	if r.CreatorForfeitRequested && r.OpponentForfeitRequested {
+		if r.CreatorPaid {
+			s.refundVSRoom(r, r.CreatorID, r.EntryNIM)
+		}
+		if r.OpponentPaid {
+			s.refundVSRoom(r, r.OpponentID, r.EntryNIM)
+		}
+		r.Status = models.VSCancelled
+		r.SettledAt = time.Now().Unix()
+		log.Printf("[VSROOM] mutual forfeit id=%s — both sides agreed, refunded and cancelled", r.ID)
+	} else {
+		log.Printf("[VSROOM] forfeit requested id=%s by=%s (waiting on the other side)", r.ID, playerID)
+	}
+
+	if err := s.saveVSRoom(r); err != nil {
+		return nil, err
+	}
 	return r, nil
 }

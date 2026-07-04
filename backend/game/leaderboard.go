@@ -116,6 +116,59 @@ func (s *Store) GetLeaderboard(periodType, period string, limit int) ([]LBEntry,
 	return s.GetLeaderboardPaged(periodType, period, limit, 0, "")
 }
 
+// RankMapForPeriod computes every ranked player's position for a given
+// period in a single pass over all sessions. Used by the admin players list,
+// which needs a rank for potentially many players at once — calling
+// GetLeaderboardPaged once per player would re-scan+re-sort every session
+// for each row; this does the scan/sort once and returns a playerID→rank
+// lookup map instead. Applies the exact same filtering rules as
+// GetLeaderboardPaged (flagged/unverified/pending sessions excluded, one
+// best score per player) so ranks always agree with the real leaderboard.
+// len(map) is also the total number of ranked players for that period.
+func (s *Store) RankMapForPeriod(periodType, period string) map[string]int {
+	all := s.List(false, 0)
+
+	var startTs, endTs int64
+	if periodType != "alltime" && period != "" {
+		startTs, endTs = periodBounds(period)
+	}
+
+	best := map[string]models.Session{}
+	for _, sess := range all {
+		if sess.Flagged || sess.ServerScore <= 0 || sess.State == models.StatePending {
+			continue
+		}
+		if startTs > 0 && (sess.SubmittedAt < startTs || sess.SubmittedAt >= endTs) {
+			continue
+		}
+		pid := sess.PlayerID
+		if pid == "" {
+			pid = sess.SessionID
+		}
+		if prev, ok := best[pid]; !ok || sess.ServerScore > prev.ServerScore {
+			best[pid] = sess
+		}
+	}
+
+	entries := make([]models.Session, 0, len(best))
+	for _, sess := range best {
+		entries = append(entries, sess)
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].ServerScore > entries[j].ServerScore
+	})
+
+	ranks := make(map[string]int, len(entries))
+	for i, e := range entries {
+		pid := e.PlayerID
+		if pid == "" {
+			pid = e.SessionID
+		}
+		ranks[pid] = i + 1
+	}
+	return ranks
+}
+
 func (s *Store) GetLeaderboardPaged(periodType, period string, limit, offset int, selfPlayerID string) ([]LBEntry, error) {
 	all := s.List(false, 0)
 

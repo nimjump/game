@@ -30,9 +30,11 @@ func (s *Server) handleAdminGetConfig(ctx *fasthttp.RequestCtx) {
 // /backend/admin/update-mode so the scheduling logic stays consistent.
 func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	var req struct {
-		DailyLeaderboardEnabled  *bool `json:"daily_leaderboard_enabled"`
-		WeeklyLeaderboardEnabled *bool `json:"weekly_leaderboard_enabled"`
-		ReplayVersion            *int  `json:"replay_version"`
+		DailyLeaderboardEnabled  *bool    `json:"daily_leaderboard_enabled"`
+		WeeklyLeaderboardEnabled *bool    `json:"weekly_leaderboard_enabled"`
+		ReplayVersion            *int     `json:"replay_version"`
+		DailyEarnCapNIM          *float64 `json:"daily_earn_cap_nim"`
+		CoinNIMRate              *float64 `json:"coin_nim_rate"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
@@ -48,13 +50,60 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	if req.ReplayVersion != nil && *req.ReplayVersion > 0 {
 		cfg.ReplayVersion = *req.ReplayVersion
 	}
+	if req.DailyEarnCapNIM != nil && *req.DailyEarnCapNIM > 0 {
+		cfg.DailyEarnCapNIM = *req.DailyEarnCapNIM
+	}
+	if req.CoinNIMRate != nil && *req.CoinNIMRate > 0 {
+		cfg.CoinNIMRate = *req.CoinNIMRate
+	}
 	if err := s.Store.SaveAppConfig(cfg); err != nil {
 		writeErr(ctx, 500, "save_error")
 		return
 	}
-	log.Printf("[ADMIN] config updated: daily=%v weekly=%v replay_version=%d",
-		cfg.DailyLeaderboardEnabled, cfg.WeeklyLeaderboardEnabled, cfg.ReplayVersion)
+	log.Printf("[ADMIN] config updated: daily=%v weekly=%v replay_version=%d daily_earn_cap_nim=%.4f coin_nim_rate=%.6f",
+		cfg.DailyLeaderboardEnabled, cfg.WeeklyLeaderboardEnabled, cfg.ReplayVersion, cfg.DailyEarnCapNIM, cfg.CoinNIMRate)
 	writeJSON(ctx, 200, cfg)
+}
+
+// GET /backend/admin/quest-pool — every quest template in the pool
+// (game/quest.go questPool), each with its default reward and the current
+// effective reward (default, unless an admin override is active).
+func (s *Server) handleAdminQuestPool(ctx *fasthttp.RequestCtx) {
+	writeJSON(ctx, 200, map[string]any{"quests": s.Store.QuestPoolWithOverrides()})
+}
+
+// POST /backend/admin/quest-reward
+// Body: {"quest_type":"score","target":1500,"reward_nim":5.0}
+// Omit reward_nim (or send null) to RESET that template back to its
+// hardcoded default reward instead of overriding it.
+func (s *Server) handleAdminSetQuestReward(ctx *fasthttp.RequestCtx) {
+	var req struct {
+		QuestType string   `json:"quest_type"`
+		Target    int      `json:"target"`
+		RewardNIM *float64 `json:"reward_nim"`
+	}
+	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+		writeErr(ctx, 400, "bad_json")
+		return
+	}
+	if req.QuestType == "" {
+		writeErr(ctx, 400, "quest_type is required")
+		return
+	}
+	if req.RewardNIM != nil && *req.RewardNIM < 0 {
+		writeErr(ctx, 400, "reward_nim must be >= 0")
+		return
+	}
+	if err := s.Store.SetQuestRewardOverride(req.QuestType, req.Target, req.RewardNIM); err != nil {
+		writeErr(ctx, 400, err.Error())
+		return
+	}
+	if req.RewardNIM != nil {
+		log.Printf("[ADMIN] quest reward override set type=%s target=%d reward=%.4f NIM", req.QuestType, req.Target, *req.RewardNIM)
+	} else {
+		log.Printf("[ADMIN] quest reward override RESET type=%s target=%d", req.QuestType, req.Target)
+	}
+	writeJSON(ctx, 200, map[string]any{"quests": s.Store.QuestPoolWithOverrides()})
 }
 
 // POST /backend/admin/update-mode — body: {"mode":"off"|"force"|"normal"}

@@ -360,12 +360,26 @@ static func apply_toggle_button(btn: CheckButton, icon_height: int = 36) -> void
 # keep their default filter so taps still register on them normally.
 # Same behavior as Main.gd's Settings panel — call this once after a
 # panel's scrollable content has finished building/rebuilding.
+#
+# BUG FIX: this used to blindly stomp MOUSE_FILTER_PASS onto every
+# non-Button Control, including cards that deliberately set
+# MOUSE_FILTER_STOP themselves (e.g. VSPanel's tappable room-row cards,
+# which use their own gui_input handler instead of a Button). Overwriting
+# that STOP back to PASS let the same tap both fire the card's handler AND
+# keep propagating up into the ScrollContainer's drag/scroll detection —
+# which is what caused taps on a scrollable row list to feel like they
+# register "one tap behind" (a fast tap's target sometimes got attributed
+# to whatever the scroll gesture logic was still resolving from the
+# previous tap). Now any Control that already explicitly opted into STOP
+# is left alone — only the default-filter passive wrappers (VBox/HBox,
+# Labels, plain Controls) get switched to PASS.
 static func set_scroll_passthrough(node: Node) -> void:
 	for child in node.get_children():
 		if child is Button or child is BaseButton or child is Slider or child is LineEdit:
 			pass  # leave interactive controls alone
 		elif child is Control:
-			child.mouse_filter = Control.MOUSE_FILTER_PASS
+			if child.mouse_filter != Control.MOUSE_FILTER_STOP:
+				child.mouse_filter = Control.MOUSE_FILTER_PASS
 			set_scroll_passthrough(child)
 		else:
 			set_scroll_passthrough(child)
@@ -480,3 +494,119 @@ static func lucide_icon(name: String, size: int, color: Color = Color.WHITE) -> 
 	tr.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 	tr.size_flags_vertical   = Control.SIZE_SHRINK_CENTER
 	return tr
+
+
+# ── External link confirmation ───────────────────────────────────────────────
+# Any time the game is about to hand off to OS.shell_open() (e.g. a "TX" button
+# opening a block explorer), show this first instead of silently leaving the
+# app — a mini-app running inside a wallet's webview shouldn't pop an external
+# tab/browser with zero warning. `ref` should be the caller's usual reference
+# size (whatever it passes to its own _p()/ref-based sizing) so this scales
+# consistently with the panel that invoked it.
+#
+# Deliberately NOT animated (no fade/scale tween): a prior bug in this
+# codebase (see Main.gd's settings-popup close flow) came from a full-rect,
+# input-blocking dim layer whose removal depended on a tween's chained
+# callback — if that callback got skipped by a race, the invisible-once-
+# faded-out layer kept silently eating every tap underneath it. This dialog
+# avoids that whole class of bug by removing itself synchronously, in the
+# same call that handles the button press, no deferred step involved.
+static func confirm_external_link(parent: Node, url: String, ref: float) -> void:
+	const BG      := Color(0.957, 0.898, 0.800)
+	const BORDER  := Color(0.700, 0.520, 0.340)
+	const BROWN   := Color(0.220, 0.130, 0.060)
+	const MID     := Color(0.480, 0.340, 0.200)
+	const ORANGE  := Color(0.780, 0.380, 0.120)
+
+	var host := url
+	host = host.replace("https://", "").replace("http://", "")
+	var slash_idx := host.find("/")
+	if slash_idx >= 0:
+		host = host.substr(0, slash_idx)
+
+	var overlay := Control.new()
+	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	overlay.z_index = 200   # above any panel that could invoke this
+	overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	parent.add_child(overlay)
+
+	var dim := ColorRect.new()
+	dim.color = Color(0, 0, 0, 0.6)
+	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	overlay.add_child(dim)
+
+	# Fixed width AND height (not content-auto-sized) with anchor_top/bottom
+	# both at 0.5 — this is the same "center a variable-height popup" pattern
+	# used elsewhere in this codebase (e.g. Main.gd's _show_vs_waiting_popup).
+	# Leaving height to auto-size from content while only anchoring at 0.5
+	# with no explicit top/bottom offsets pins the box to the top of the
+	# screen instead of centering it — a real bug if left as-is here.
+	var pw := ref * 0.82
+	var ph := ref * 0.34
+	var pc := PanelContainer.new()
+	pc.anchor_left   = 0.5; pc.anchor_right  = 0.5
+	pc.anchor_top    = 0.5; pc.anchor_bottom = 0.5
+	pc.offset_left   = -pw * 0.5
+	pc.offset_right  =  pw * 0.5
+	pc.offset_top    = -ph * 0.5
+	pc.offset_bottom =  ph * 0.5
+	var pc_st := StyleBoxFlat.new()
+	pc_st.bg_color = BG
+	pc_st.border_color = BORDER
+	pc_st.set_border_width_all(3)
+	pc_st.set_corner_radius_all(16)
+	pc_st.content_margin_left   = ref * 0.045
+	pc_st.content_margin_right  = ref * 0.045
+	pc_st.content_margin_top    = ref * 0.032
+	pc_st.content_margin_bottom = ref * 0.032
+	pc.add_theme_stylebox_override("panel", pc_st)
+	overlay.add_child(pc)
+
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", int(ref * 0.020))
+	pc.add_child(vb)
+
+	var hdr := HBoxContainer.new()
+	hdr.add_theme_constant_override("separation", int(ref * 0.012))
+	vb.add_child(hdr)
+	hdr.add_child(lucide_icon("alert-triangle", int(ref * 0.040), ORANGE))
+	var title := Label.new()
+	title.text = "Leaving the app"
+	apply_label(title, BROWN, int(ref * 0.032))
+	hdr.add_child(title)
+
+	var body := Label.new()
+	body.text = "This will open an external website in your browser:"
+	body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	apply_label(body, MID, int(ref * 0.024))
+	vb.add_child(body)
+
+	var host_lbl := Label.new()
+	host_lbl.text = host
+	host_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	apply_label(host_lbl, ORANGE, int(ref * 0.028))
+	vb.add_child(host_lbl)
+
+	var btn_row := HBoxContainer.new()
+	btn_row.add_theme_constant_override("separation", int(ref * 0.016))
+	vb.add_child(btn_row)
+
+	var cancel_btn := Button.new()
+	cancel_btn.text = "Cancel"
+	cancel_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cancel_btn.custom_minimum_size.y = int(ref * 0.064)
+	apply_ghost_button(cancel_btn)
+	btn_row.add_child(cancel_btn)
+	cancel_btn.pressed.connect(func(): overlay.queue_free())
+
+	var open_btn := Button.new()
+	open_btn.text = "Open"
+	open_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	open_btn.custom_minimum_size.y = int(ref * 0.064)
+	apply_play_button(open_btn)
+	btn_row.add_child(open_btn)
+	open_btn.pressed.connect(func():
+		OS.shell_open(url)
+		overlay.queue_free()
+	)
