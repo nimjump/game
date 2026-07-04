@@ -83,6 +83,7 @@ const PLATFORM_GAP_FIX := {
 # Chases the player in range, returns to static patrol when out of range
 var WINGMAN_CHASE_RANGE : float = 0.0
 var WINGMAN_CHASE_SPEED : float = 0.0
+var WINGMAN_RETURN_SPEED : float = 0.0
 var _wingman_chasing := false
 
 # ── SPIKEMAN ─────────────────────────────────────────────────────────
@@ -215,6 +216,7 @@ var _spider_climb_target_plat  : Node = null
 # Flies left-right, chases when spotted, returns if it can't catch the player
 var GHOST_DETECT_RANGE : float = 0.0
 var GHOST_CHASE_SPEED  : float = 0.0
+var GHOST_RETURN_SPEED : float = 0.0
 const GHOST_CHASE_DURATION := 3.0
 var _ghost_chasing    := false
 var _ghost_chase_timer := 0.0
@@ -253,8 +255,8 @@ const ALIEN_SHOOT_WARN := 0.4
 var _alien_shooting := false
 
 # ── WORM ─────────────────────────────────────────────────────────────
-const WORM_BABY_SCALE      := 0.6
-const WORM_BABY_PATROL_SPD := 1.8
+const WORM_BABY_SCALE      := 0.8   # was 0.6 — too small per request, bumped up (still smaller than adult)
+const WORM_BABY_PATROL_SPD := 0.6   # was 1.8 — /3 per request ("3 kat azalt")
 const WORM_DIRT_COOLDOWN   := 3.0
 var WORM_DIRT_RANGE   : float = 0.0
 var WORM_DIRT_SPEED_X : float = 0.0
@@ -533,17 +535,18 @@ func _special_setup() -> void:
 	# Cache computed constants (EN-04: avoid per-access multiplication)
 	WINGMAN_CHASE_RANGE = _vw * 0.30 * _diff_range_mult
 	WINGMAN_CHASE_SPEED = _vw * 0.55 * _diff_speed_mult   # matched to BEE_CHASE_SPEED per request
+	WINGMAN_RETURN_SPEED = WINGMAN_CHASE_SPEED   # BUG FIX: see _wingman_ai — used to snap home in a fixed 0.5s regardless of distance, now returns at its own normal speed
 	SPIKEMAN_DETECT_X   = _vw * 0.20 * _diff_range_mult
 	SPIKEMAN_CHASE_SPEED= _vw * 0.28 * _diff_speed_mult
 	SPIKEBALL_AMPLITUDE = _vh * 0.07
 	SUN_AMPLITUDE       = _vh * 0.08
 	CLOUD_FOLLOW_SPEED  = _vw * 0.23 * _diff_speed_mult   # was 0.46 — halved, was following horizontally way too fast
 	CLOUD_RAIN_RANGE_X  = _vw * 0.06
-	BEE_AGGRO_RANGE     = _vw * 0.25 * _diff_range_mult
-	BEE_CHASE_SPEED     = _vw * 0.55 * _diff_speed_mult
-	BEE_RETURN_SPEED    = _vw * 0.5
+	BEE_AGGRO_RANGE     = _vw * 0.32 * _diff_range_mult   # was 0.25 — too low, barely chased, bumped up per request
+	BEE_CHASE_SPEED     = _vw * 0.55 * 0.95 * _diff_speed_mult   # -5% per request
+	BEE_RETURN_SPEED    = BEE_CHASE_SPEED   # per request: same as WINGMAN/GHOST — returns at its own normal speed, not a separate fixed value
 	FLY_AGGRO_RANGE     = _vw * 0.28 * _diff_range_mult
-	FLY_CHASE_SPEED     = _vw * 0.48 * _diff_speed_mult
+	FLY_CHASE_SPEED     = _vw * 0.48 * 0.95 * _diff_speed_mult   # -5% per request ("sivrisinek")
 	MOUSE_AGGRO_RANGE   = _vw * 0.22 * _diff_range_mult
 	MOUSE_CHASE_SPEED   = _vw * 0.42 * _diff_speed_mult
 	FROG_DETECT_X       = _vw * 0.20 * _diff_range_mult
@@ -556,6 +559,7 @@ func _special_setup() -> void:
 	SPIDER_DETECT_Y     = _vh * 0.32 * _diff_range_mult
 	GHOST_DETECT_RANGE  = _vw * 0.28 * _diff_range_mult
 	GHOST_CHASE_SPEED   = _vw * 0.30 * _diff_speed_mult
+	GHOST_RETURN_SPEED  = GHOST_CHASE_SPEED   # BUG FIX: see _ghost_ai — used to snap home in a fixed 0.5s regardless of distance, now returns at its own normal speed
 	WORM_DIRT_RANGE     = _vw * 0.233 * _diff_range_mult
 	WORM_DIRT_SPEED_X   = _vw * 0.15   # already scaled by difficulty at use-site (line ~1869), don't double-scale here
 	WORM_DIRT_SPEED_Y   = -_vh * 0.40
@@ -701,7 +705,15 @@ func _special_setup() -> void:
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			elif sf: _anim.play(sf.get_animation_names()[0])
 			if _worm_is_baby:
-				if not headless and is_instance_valid(_anim): _anim.scale = _anim.scale * WORM_BABY_SCALE
+				if not headless and is_instance_valid(_anim):
+					_anim.scale = _anim.scale * WORM_BABY_SCALE
+					# Defensive: force full-opacity/no-tint so babies never look
+					# "soluk" (faded/washed out) — same frames as the adult, so
+					# any perceived paleness was coming from the tiny 0.6 scale
+					# itself (small sprite + antialiasing reads as washed out),
+					# not an actual color/alpha bug, but this rules it out for good.
+					_anim.modulate = Color.WHITE
+					_anim.self_modulate = Color.WHITE
 				_col.scale = Vector2(WORM_BABY_SCALE, WORM_BABY_SCALE)
 			_start_patrol_from(global_position.x, spd)
 
@@ -843,7 +855,9 @@ func _special_hit(body: Node, stomped: bool, powered: bool) -> bool:
 
 		EnemyType.SLIME_BLOCK:
 			if stomped:
-				body.velocity.y = -_vh * 2.025
+				# Per request: 0.2 weaker than the spring item's SPRING_SPEED
+				# (SPRING_SPEED is negative, so +_vh*0.2 reduces the magnitude).
+				body.velocity.y = body.SPRING_SPEED + _vh * 0.2
 				if is_instance_valid(_anim):
 					var squish := _make_tween()
 					if squish:
@@ -890,7 +904,9 @@ func _special_hit(body: Node, stomped: bool, powered: bool) -> bool:
 
 		EnemyType.SPRINGMAN:
 			if stomped:
-				body.velocity.y = -_vh * 1.60
+				# Per request: 0.2 weaker than the spring item's SPRING_SPEED
+				# (SPRING_SPEED is negative, so +_vh*0.2 reduces the magnitude).
+				body.velocity.y = body.SPRING_SPEED + _vh * 0.2
 				if is_instance_valid(_anim):
 					var sf2 := _anim.sprite_frames
 					if sf2 and sf2.has_animation("hurt"):
@@ -1032,7 +1048,15 @@ func _wingman_ai(_delta: float) -> void:
 		if dist_sq > chase_sq * 1.69:
 			_wingman_chasing = false
 			_move_cancel()
-			_move_to(Vector2(global_position.x, _start_y), 0.5, false, true, false, func():
+			# BUG FIX: this used to be a fixed 0.5s move regardless of how far
+			# the chase wandered from _start_y — the farther it chased, the
+			# faster (and more unnatural) the snap back looked, since the same
+			# distance covered in the same time = higher speed. Duration is
+			# now distance / WINGMAN_RETURN_SPEED, so it always travels home
+			# at its own normal speed no matter how far out it went.
+			var return_dist : float = absf(global_position.y - _start_y)
+			var return_secs : float = clampf(return_dist / maxf(WINGMAN_RETURN_SPEED, 1.0), 0.15, 2.0)
+			_move_to(Vector2(global_position.x, _start_y), return_secs, false, true, false, func():
 				_start_patrol_from(global_position.x, 1.0, true)   # matched to BEE
 				_start_vertical_bob(10.0, 1.8)
 			)
@@ -1983,6 +2007,21 @@ func _worm_spawn_baby(offset: Vector2) -> void:
 	baby._gm_ref = _gm_ref
 	baby.set("_player_ref", _player_ref)
 	baby.setup(enemy_type, _worm_baby_frames, minf(difficulty + 0.15, 1.0), true)
+	# BUG FIX: setup() -> base_setup() unconditionally resets _overlap_triggered
+	# to false (EnemyBase.gd) — fine for a normal spawn, but a split baby is
+	# born at ~this exact spot (offset is only ±_vw*0.037) at the exact moment
+	# the player's stomp is still overlapping that position (that overlap is
+	# what killed the parent one tick ago). With the flag reset to false, the
+	# baby's very first _tick_player_overlap() call finds the player still in
+	# range and fires _on_body_entered() immediately — since the player is
+	# still mid-stomp (is_stomping() true), that's an instant, unearned kill
+	# before the baby ever gets a frame to move away. Symptom reported: stomp
+	# an adult worm, both babies are already dead the instant they appear.
+	# Marking it as "already triggered" makes the overlap check require the
+	# player to actually leave and come back into range — a genuine new
+	# touch — before it can hit the baby again, exactly like it would for any
+	# enemy the player is already standing on/next to.
+	baby._overlap_triggered = true
 	# BUG FIX: babies spawned here bypass GameManager._add_enemy(), so without
 	# these two calls they never enter the platform's overlap-tracking list and
 	# never enter _enemies (the array simulate_tick() loops over every physics
@@ -2295,6 +2334,31 @@ func _spider_web_jump_to(target_plat: Node) -> void:
 	_spider_climb_time        = climb_t
 	_spider_climb_target_plat = target_plat
 
+	# BUG FIX: the web's VISUAL endpoint used to always be `land_pos` — i.e. the
+	# spot the spider will end up STANDING on (the platform's TOP surface MINUS
+	# the stand-gap, so slightly floating above the actual sprite surface).
+	# Climbing UP to a platform ABOVE the spider had the worse version of this:
+	# the top surface is the FAR side, so the web was drawn straight through
+	# the platform's solid body to a point on the other side of it — looked
+	# like the web was thrown "to wherever it's going" instead of landing on
+	# the platform. But climbing DOWN had the same root problem too, just
+	# smaller: the stand-gap offset still left the web stopping short of the
+	# visible platform surface instead of touching it.
+	# Fix: the web's visible attach point always touches the platform's actual
+	# NEAR edge relative to the spider — bottom edge (no gap) when climbing
+	# up, top edge (no gap) when climbing down — so it visually lands ON the
+	# platform in both directions. The spider's real resting position
+	# (`land_pos`, with the stand-gap, used by _move_to below) is unchanged —
+	# it still ends up standing correctly on top, gap and all.
+	var climbing_up : bool = land_y < from_pos.y
+	var web_attach_y : float
+	if ps and ps.shape:
+		web_attach_y = target_plat.global_position.y + ps.shape.size.y * 0.5 if climbing_up \
+			else target_plat.global_position.y - ps.shape.size.y * 0.5
+	else:
+		web_attach_y = target_plat.global_position.y
+	var web_attach_pos : Vector2 = Vector2(land_x, web_attach_y)
+
 	# FIX: the jump/walk animation used to start here — i.e. the instant the
 	# throw begins, while the spider is still standing still and only the
 	# thread is extending (see _spider_ai's "spider stays put" comment below).
@@ -2334,7 +2398,7 @@ func _spider_web_jump_to(target_plat: Node) -> void:
 			_spider_web_line = web
 
 	_spider_web_from          = from_pos
-	_spider_web_target        = land_pos
+	_spider_web_target        = web_attach_pos
 	_spider_web_throw_elapsed = 0
 	_spider_web_throw_total   = maxi(1, int(round(throw_t * 60.0)))
 	_spider_web_throwing      = true
@@ -2396,7 +2460,13 @@ func _ghost_ai(_delta: float) -> void:
 		if _ghost_chase_timer <= 0.0:
 			_ghost_chasing = false
 			_move_cancel()
-			_move_to(Vector2(global_position.x, _start_y), 0.5, false, true, false, func():
+			# BUG FIX: same class of bug as WINGMAN's return — a fixed 0.5s
+			# move regardless of chase distance meant a long chase snapped
+			# back unnaturally fast. Duration now scales with distance /
+			# GHOST_RETURN_SPEED so it always returns at its own normal pace.
+			var return_dist : float = absf(global_position.y - _start_y)
+			var return_secs : float = clampf(return_dist / maxf(GHOST_RETURN_SPEED, 1.0), 0.15, 2.0)
+			_move_to(Vector2(global_position.x, _start_y), return_secs, false, true, false, func():
 				_start_patrol_from(global_position.x, 0.9, true)
 				_start_vertical_bob(12.0, 2.2)
 			)

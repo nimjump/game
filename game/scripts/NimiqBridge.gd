@@ -394,12 +394,36 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 		# Register wallet address — after emit so Main already has the token
 		_register_wallet_async(auth_player_id, nimiq_address)
 	)
+	# Browser/OS metadata — purely informational, backs the admin panel's
+	# "what devices are our players actually on" view (game.DeviceBreakdown).
+	# Read the same way index.html's own _deviceMeta() does it, since this
+	# is the one moment virtually every real player passes through (unlike
+	# client-log entries, which only exist for players who hit an error).
+	var user_agent := ""
+	var platform   := ""
+	var screen_str := ""
+	var dpr_str    := ""
+	if OS.has_feature("web"):
+		var ua_raw = JavaScriptBridge.eval("navigator.userAgent || ''", true)
+		user_agent = str(ua_raw) if ua_raw != null else ""
+		var plat_raw = JavaScriptBridge.eval(
+			"(navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || ''", true)
+		platform = str(plat_raw) if plat_raw != null else ""
+		var scr_raw = JavaScriptBridge.eval("screen.width + 'x' + screen.height", true)
+		screen_str = str(scr_raw) if scr_raw != null else ""
+		var dpr_raw = JavaScriptBridge.eval("String(window.devicePixelRatio || 1)", true)
+		dpr_str = str(dpr_raw) if dpr_raw != null else ""
+
 	var body := JSON.stringify({
 		"challenge":     challenge,
 		"nimiq_address": nimiq_address,
 		"public_key":    public_key,
 		"signature":     signature,
 		"device_id":     device_id,
+		"user_agent":    user_agent,
+		"platform":      platform,
+		"screen":        screen_str,
+		"dpr":           dpr_str,
 	})
 	http.request(BACKEND_URL + "/backend/auth/verify",
 		["Content-Type: application/json"], HTTPClient.METHOD_POST, body)

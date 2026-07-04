@@ -448,24 +448,45 @@ static func apply_label(lbl: Label, color: Color = COL_TEXT, size: int = 0) -> v
 	_apply_pixel_font(lbl)
 
 static func _apply_pixel_font(ctrl: Control) -> void:
-	if not _font_loaded:
-		_font_loaded = true
-		if ResourceLoader.exists(PIXEL_FONT_PATH):
-			_cached_font = load(PIXEL_FONT_PATH) as FontFile
-			if _cached_font:
-				# BUG FIX: KartwoFilled.ttf is a decorative pixel font with a
-				# limited glyph set — characters like "/" aren't in it. With no
-				# fallback configured, Godot rendered those as broken/missing
-				# glyph boxes (tofu), visible in WebView wherever UI text used
-				# such a character. Godot's built-in default font (ThemeDB's
-				# fallback) has full common-glyph coverage, so chaining it as
-				# a fallback here makes any glyph missing from our custom font
-				# silently render in the normal system-style font instead of
-				# showing as broken — applies everywhere apply_label() is used,
-				# since they all share this one cached Font resource.
-				_cached_font.fallbacks = [ThemeDB.fallback_font]
+	# BUG FIX: KartwoFilled.ttf is a decorative pixel font with a limited
+	# glyph set — characters like "/" aren't in it. With no fallback
+	# configured, Godot rendered those as broken/missing glyph boxes (tofu),
+	# visible in WebView wherever UI text used such a character. Godot's
+	# built-in default font (ThemeDB's fallback) has full common-glyph
+	# coverage, so chaining it as a fallback here makes any glyph missing
+	# from our custom font silently render in the normal system-style font
+	# instead of showing as broken — applies everywhere apply_label() is
+	# used, since they all share this one cached Font resource.
+	_ensure_font_loaded()
 	if _cached_font:
 		ctrl.add_theme_font_override("font", _cached_font)
+
+# BUG FIX: any Label/Button/etc. created WITHOUT going through apply_label()/
+# _apply_pixel_font() (a missed call site, a 3rd-party control, dynamically
+# built debug UI, etc.) had no font override at all, so it silently fell back
+# to Godot's built-in engine default font instead of our pixel font — visibly
+# "wrong font" text/numbers next to correctly-styled ones. Rather than chase
+# down every call site, this installs our font as the whole tree's THEME
+# default, so anything that doesn't set its own font override inherits this
+# one automatically (this is exactly what a Theme's default_font is for).
+# Explicit per-control overrides via apply_label()/_apply_pixel_font() still
+# win where they're used — this only fills the gaps.
+static func apply_global_default(tree: SceneTree) -> void:
+	_ensure_font_loaded()
+	if not _cached_font or not is_instance_valid(tree.root):
+		return
+	var thm := Theme.new()
+	thm.default_font = _cached_font
+	tree.root.theme = thm
+
+static func _ensure_font_loaded() -> void:
+	if _font_loaded:
+		return
+	_font_loaded = true
+	if ResourceLoader.exists(PIXEL_FONT_PATH):
+		_cached_font = load(PIXEL_FONT_PATH) as FontFile
+		if _cached_font:
+			_cached_font.fallbacks = [ThemeDB.fallback_font]
 
 # ── FALLBACK FLAT VARIANTS ────────────────────────────────
 static func make_flat_style(bg: Color, border: Color = Color.TRANSPARENT, corner: int = 10, border_w: int = 0) -> StyleBoxFlat:

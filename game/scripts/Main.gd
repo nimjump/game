@@ -1807,6 +1807,13 @@ func _build_game() -> void:
 		vl.text = d[2] as String
 		UITheme.apply_label(vl, Color(0.180, 0.100, 0.040), int(_p(0.044)))
 		vl.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		# FIX: Label defaults to vertical_alignment=TOP for its own text — the
+		# icon (TextureRect, STRETCH_KEEP_ASPECT_CENTERED) is centered inside
+		# its rect, but the number text was pinned to the top of its rect, so
+		# whenever the row's height came out taller than the glyph itself the
+		# number sat higher than the icon (icon looked "slightly lower / not
+		# level with it"). Centering the text vertically fixes the misalignment.
+		vl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
 		icon_row.add_child(vl)
 		_stat_val_nodes.append(vl)
 

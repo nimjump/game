@@ -417,6 +417,9 @@
   // expose for game engine init below
   window._earlyLog = _log;
 
+  // _enqueue itself is exposed further down, right after it's defined —
+  // see window._enqueueLog below.
+
   // ── Backend log queue ────────────────────────────────────────────────────
   var _queue = [];
   var _timer = null;
@@ -444,9 +447,30 @@
 
   function _enqueue(level, msg) {
     _queue.push({ level:level, message:msg });
-    if (_queue.length >= 30) { clearTimeout(_timer); _timer=null; _flush(); }
-    else if (!_timer) { _timer=setTimeout(function(){_timer=null;_flush();}, 30000); }
+    if (_queue.length >= 30) { clearTimeout(_timer); _timer=null; _flush(); return; }
+    // Any "error" in the queue gets a short debounce (250ms — still batches
+    // a burst of errors from the same crash into one request) instead of
+    // waiting up to 30s like pure warn/info. Reasoning: if the page/webview
+    // gets killed abruptly right after an error (very plausible here — this
+    // runs inside Nimiq Pay's mini-app host, which can switch away from /
+    // kill the tab with zero warning, unlike a normal desktop browser tab
+    // close), anything still sitting in the 30s-debounced queue never
+    // reaches the backend — no pagehide/visibilitychange fires either,
+    // since the host isn't giving the page a normal close. Recomputed from
+    // the whole queue's contents (not just this call's level) so a warn
+    // arriving right after a queued error can't push the error's flush back
+    // out to the slow 30s timer.
+    var hasError = false;
+    for (var i = 0; i < _queue.length; i++) { if (_queue[i].level === 'error') { hasError = true; break; } }
+    var delayMs = hasError ? 250 : 30000;
+    clearTimeout(_timer);
+    _timer = setTimeout(function(){ _timer=null; _flush(); }, delayMs);
   }
+  // Exposed so the separate Engine-bootstrap <script> block further down
+  // (which runs in its own IIFE/scope, can't see this one's locals) can
+  // report the capability probe / missing-features result through the same
+  // queue/backend-flush machinery instead of duplicating it.
+  window._enqueueLog = _enqueue;
 
   document.addEventListener('visibilitychange', function(){ if(document.visibilityState==='hidden') _flush(); });
   window.addEventListener('pagehide', _flush);
@@ -600,11 +624,32 @@
   fetch(gameUrl)
     .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.text(); })
     .then(function(code) {
-      // Bypass Safari v15.2 check injected by Emscripten
+      // Bypass Safari v15.2 check injected by Emscripten.
+      //
+      // Emscripten ships this check because of a real WebKit WASM bug that
+      // existed before Safari 15.2 — it's not overcautious noise, it's a
+      // guard against actual miscompiles/crashes on those older builds.
+      // Whoever added this bypass presumably found it too aggressive for
+      // some Safari version that in practice worked fine — but stripping it
+      // unconditionally means ANY visitor still on a genuinely-affected
+      // pre-15.2 Safari (this device's floor is iOS 15.0+ for WebGL2 to
+      // begin with, so the exposed window here is specifically 15.0/15.1)
+      // now attempts to run anyway. Instead of Emscripten's own clean "your
+      // Safari is too old" error, they can hit the raw underlying WASM bug
+      // directly — which looks like exactly this ticket: "game doesn't even
+      // open," no clear error, nothing obviously wrong in a screenshot.
+      // Not reverting this blind (don't know what specifically it was
+      // fixing for whoever added it) — but this was previously only logged
+      // in DEV, so there was literally no data on how often it fires in
+      // production. Logging it for real now so the Logs tab can be
+      // cross-referenced against the device-capability probe above (same
+      // session, same timestamp) to see whether "won't open" reports
+      // cluster on exactly this Safari version range.
       var p1=/throw\s+new\s+Error\(['"]This emscripten-generated code requires Safari v15.2.0.*?['"]\);?/g;
       if(p1.test(code)){
         code=code.replace(p1,'/* Safari check bypassed */');
         if(DEV) window._earlyLog("🎯 Safari throw removed");
+        if (window._enqueueLog) window._enqueueLog('warn', 'SAFARI_BYPASS: pre-15.2 Safari check stripped, attempting run anyway — ' + navigator.userAgent.slice(0,150));
       }
       if(code.includes("requires Safari v15.2.0")){
         code=code.split('\n').map(function(l){
@@ -682,11 +727,90 @@ function initGodotGame() {
     setStatusMode('notice');
   }
 
+  // ── Capability probe ──────────────────────────────────────────────────────
+  // Godot 4's web export (gl_compatibility renderer) hard-requires WebGL2 —
+  // there is no WebGL1 fallback anywhere in Godot 4 (unlike Godot 3's GLES2
+  // export); this is an engine-level limitation, confirmed against Godot's
+  // own docs/forum, not something any project-side code change can add back.
+  // What we CAN do: know exactly who this excludes and see it in the admin
+  // Logs tab, instead of guessing. This probe runs on EVERY load (not just
+  // failures) so the full device population is visible, not only the ones
+  // that fail — sent as "info" so it never gets lost/misread as an actual
+  // error in the Logs tab's error count.
+  function _probeCapabilities() {
+    var webgl1 = false, webgl2 = false, renderer = '', vendor = '';
+    try {
+      var c1 = document.createElement('canvas');
+      var gl1 = c1.getContext('webgl') || c1.getContext('experimental-webgl');
+      webgl1 = !!gl1;
+      var c2 = document.createElement('canvas');
+      var gl2 = c2.getContext('webgl2');
+      webgl2 = !!gl2;
+      var gl = gl2 || gl1;
+      if (gl) {
+        var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+        if (dbg) {
+          renderer = String(gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) || '').slice(0, 100);
+          vendor   = String(gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL)   || '').slice(0, 60);
+        }
+      }
+    } catch (e) { /* probing itself must never throw */ }
+    var mem = (navigator.deviceMemory != null) ? (navigator.deviceMemory + 'GB') : '?';
+    var cores = navigator.hardwareConcurrency || '?';
+    var msg = 'CAPS webgl1=' + webgl1 + ' webgl2=' + webgl2 +
+      ' gpu=' + (vendor || '?') + '/' + (renderer || '?') +
+      ' mem=' + mem + ' cores=' + cores;
+    if (DEV) window._earlyLog(msg, '#0ff');
+    if (window._enqueueLog) window._enqueueLog('info', msg);
+    return { webgl1: webgl1, webgl2: webgl2 };
+  }
+  var _caps = _probeCapabilities();
+
   var missing=Engine.getMissingFeatures({threads:false});
   if(DEV) window._earlyLog('missing: ['+missing.join(',')+']');
+  if (missing.length > 0) {
+    // Previously only logged in DEV — in prod this fell through to
+    // startGame() anyway, which either eventually rejects deep in WASM
+    // setup (no friendly message, since that path only calls
+    // displayFailureNotice from the .then() rejection handler below) or, on
+    // some devices/browsers, just hangs the loading screen forever with no
+    // visible error and no log sent at all if the failure is a synchronous
+    // throw during Engine setup that never reaches that rejection handler.
+    // Best we can do: fail fast with a clear message instead of a silent
+    // stuck spinner, and report it as an error immediately (not debounced,
+    // see _enqueue's per-level delay) so the admin Logs tab actually shows
+    // how many real users are hitting this and on what device/browser —
+    // _probeCapabilities() above already sent the raw webgl1/webgl2/gpu
+    // facts for this exact session right before this, so the two log lines
+    // pair up by device/ip/time in the admin panel.
+    var missMsg = 'Unsupported device/browser — missing: ' + missing.join(', ') +
+      ' (webgl1=' + _caps.webgl1 + ' webgl2=' + _caps.webgl2 + ')';
+    console.error(missMsg);
+    statusNotice.innerHTML = 'Your device or browser doesn\'t support what this game needs to run ('
+      + missing.join(', ') + '). Try updating your browser/app, or use a different device.';
+    setStatusMode('notice');
+    return;
+  }
 
   setStatusMode('progress');
   var _last=-1;
+  var _gameStarted=false;
+
+  // Stall detector — on a slow/flaky connection (very plausible on mobile
+  // data, which is most of this game's real traffic), the .wasm/.pck
+  // download can just sit there with no progress and no error either: no
+  // onProgress call, no rejection, nothing — the loading spinner spins
+  // forever with zero signal that anything is wrong. That's another
+  // "game just doesn't open" report we'd otherwise have no way to tell
+  // apart from a genuine compatibility failure. If nothing has happened by
+  // 20s, log it once (still lets it keep trying — no reload forced, in
+  // case it's just a slow-but-eventually-fine load).
+  var _stallTimer = setTimeout(function(){
+    if (_gameStarted) return;
+    var stallMsg = 'LOAD_STALL: no engine start after 20s, last_progress=' + _last + '%';
+    console.warn(stallMsg);
+  }, 20000);
+
   engine.startGame({
     onProgress: function(cur,tot){
       if(cur>0&&tot>0){
@@ -698,9 +822,11 @@ function initGodotGame() {
       }
     }
   }).then(function(){
+    _gameStarted=true; clearTimeout(_stallTimer);
     if(DEV) window._earlyLog('✓ Game started');
     setStatusMode('hidden');
   }, function(err){
+    _gameStarted=true; clearTimeout(_stallTimer); // stop the stall warning — we have a real, more specific error now
     if(DEV) window._earlyLog('❌ startGame: '+(err&&err.message?err.message:String(err)),'#f55');
     displayFailureNotice(err);
   });

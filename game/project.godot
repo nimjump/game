@@ -26,6 +26,7 @@ application/run/low_processor_mode=false
 ApiConfig="*res://scripts/ApiConfig.gd"
 NimiqJS="*res://scripts/NimiqJS.gd"
 VSManager="*res://scripts/VSManager.gd"
+GlobalTheme="*res://scripts/GlobalTheme.gd"
 
 [display]
 

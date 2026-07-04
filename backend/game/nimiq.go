@@ -306,10 +306,80 @@ func (s *Store) QueueReward(playerID string, amountNIM float64, reason string) (
 	log.Printf("[REWARD] saved id=%s player=%s amount=%.4f NIM reason=%s",
 		reward.ID, playerID[:min8s(playerID)], amountNIM, reason)
 
-	// Attempt to send in background
-	SafeGo("attemptSend", func() { s.attemptSend(reward) })
+	// Attempt to send via the rate-limited queue (see enqueueRewardSend below)
+	// instead of a free-running goroutine.
+	s.enqueueRewardSend(reward)
 
 	return reward, nil
+}
+
+// ── Reward send queue (rate-limited) ─────────────────────────────────────────
+//
+// Nimiq's protocol has no multi-recipient/batch transaction — unlike
+// Bitcoin's multi-output txs, a Nimiq tx has exactly one sender and one
+// recipient — so N payouts really do mean N separate on-chain transactions;
+// that part can't be collapsed into a single call/tx. What CAN be fixed is
+// how FAST we fire those N pushTransaction RPC calls at the node:
+// QueueReward/retryPendingRewards used to spawn every send in its own
+// free-running goroutine with zero coordination between them, so a burst of
+// rewards (e.g. a leaderboard payout for 20+ players at once) hit the public
+// RPC node's pushTransaction rate limit almost instantly, causing a wave of
+// "Rate limit exceeded" failures — which then all retried at the same time
+// again too, repeating the problem.
+//
+// This is a simple single-worker queue: every send request goes through this
+// channel instead of getting its own goroutine, and the one worker paces
+// itself with a fixed minimum gap between RPC calls. Order within the queue
+// doesn't matter (rewards aren't sequential/nonce-based on Nimiq — see
+// nimiqBuildAndSignTx's comment, validity_start_height + signature is what
+// makes each tx valid, not a per-account sequence number), only the pacing.
+const rewardSendGapDefault = 1500 * time.Millisecond
+
+var rewardQueueCh chan *models.PendingReward
+var rewardQueueOnce sync.Once
+
+// StartRewardQueue — starts the single background send-worker. Safe to call
+// more than once (idempotent via sync.Once); also auto-starts lazily from
+// enqueueRewardSend if this was never called explicitly.
+func (s *Store) StartRewardQueue() {
+	rewardQueueOnce.Do(func() {
+		rewardQueueCh = make(chan *models.PendingReward, 2000)
+		SafeGo("rewardSendWorker", func() { s.rewardSendWorker() })
+	})
+}
+
+// enqueueRewardSend adds a reward to the rate-limited send queue.
+func (s *Store) enqueueRewardSend(reward *models.PendingReward) {
+	s.StartRewardQueue()
+	select {
+	case rewardQueueCh <- reward:
+	default:
+		// Queue is absurdly full (2000 pending sends) — fall back to the old
+		// direct-goroutine path rather than silently dropping the reward.
+		log.Printf("[REWARD_QUEUE] queue full, sending id=%s directly", reward.ID)
+		SafeGo("attemptSend", func() { s.attemptSend(reward) })
+	}
+}
+
+// rewardSendWorker is the single worker that drains rewardQueueCh, sending
+// one at a time with a fixed gap between actual RPC calls. Gap is
+// configurable via NIMIQ_SEND_GAP_MS env var (milliseconds) for tuning
+// against whatever the RPC provider's real limit turns out to be, without a
+// code change.
+func (s *Store) rewardSendWorker() {
+	gap := rewardSendGapDefault
+	if v := os.Getenv("NIMIQ_SEND_GAP_MS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n >= 0 {
+			gap = time.Duration(n) * time.Millisecond
+		}
+	}
+	log.Printf("[REWARD_QUEUE] worker started, gap=%v", gap)
+	for reward := range rewardQueueCh {
+		s.attemptSend(reward)
+		if gap > 0 {
+			time.Sleep(gap)
+		}
+	}
 }
 
 // buildMemo constructs a human-readable tx memo (max 64 bytes) from a reward reason string.
@@ -512,7 +582,7 @@ func (s *Store) retryPendingRewards(force bool) {
 			r.Status       = models.RewardPending
 		}
 		rr := r
-		SafeGo("attemptSend", func() { s.attemptSend(rr) })
+		s.enqueueRewardSend(rr)
 	}
 }
 

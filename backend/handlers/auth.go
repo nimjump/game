@@ -36,6 +36,13 @@ func (s *Server) handleAuthVerify(ctx *fasthttp.RequestCtx) {
 		PublicKey    string `json:"public_key"`
 		Signature    string `json:"signature"`
 		DeviceID     string `json:"device_id,omitempty"`
+		// Browser/OS metadata for the admin "device support scale" view
+		// (game.DeviceBreakdown) — optional, purely informational, never
+		// validated/trusted for anything security-relevant.
+		UserAgent string `json:"user_agent,omitempty"`
+		Platform  string `json:"platform,omitempty"`
+		Screen    string `json:"screen,omitempty"`
+		DPR       string `json:"dpr,omitempty"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
@@ -73,6 +80,15 @@ func (s *Server) handleAuthVerify(ctx *fasthttp.RequestCtx) {
 	}
 
 	log.Printf("[AUTH] login success player=%s token=%s…", sess.PlayerID[:min8(sess.PlayerID)], sess.Token[:8])
+
+	// Best-effort device tracking — never blocks/fails login on error.
+	if req.UserAgent != "" || req.Platform != "" {
+		if ua := req.UserAgent; len(ua) > 200 { req.UserAgent = ua[:200] }
+		if e := s.Store.SetPlayerDevice(sess.PlayerID, req.UserAgent, req.Platform, req.Screen, req.DPR); e != nil {
+			log.Printf("[AUTH] device save failed player=%s err=%v", sess.PlayerID[:min8(sess.PlayerID)], e)
+		}
+	}
+
 	writeJSON(ctx, 200, map[string]any{
 		"ok":            true,
 		"token":         sess.Token,

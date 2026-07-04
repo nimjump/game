@@ -104,6 +104,23 @@ export default function OverviewTab({ ov }: Props) {
         </span>
       </div>
 
+      {/* Reward payouts (lifetime, site-wide) */}
+      {ov.rewards && (
+        <div className="card" style={{ gridColumn: "1 / -1", padding: "12px 20px", display: "flex", gap: 32, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ fontWeight: 600, fontSize: 13 }}>💰 NIM Payouts</span>
+          <span style={{ fontSize: 12 }}>
+            Sent: <b style={{ color: "var(--green)" }}>{ov.rewards.total_nim_sent.toFixed(2)} NIM</b>
+            <span style={{ color: "var(--text-muted)" }}> ({ov.rewards.sent_count} rewards)</span>
+          </span>
+          <span style={{ fontSize: 12 }}>
+            Pending: <b style={{ color: ov.rewards.pending_count > 0 ? "var(--yellow)" : "var(--text-muted)" }}>
+              {ov.rewards.total_nim_pending.toFixed(2)} NIM
+            </b>
+            <span style={{ color: "var(--text-muted)" }}> ({ov.rewards.pending_count} rewards)</span>
+          </span>
+        </div>
+      )}
+
       {/* Server resources — RAM + disk */}
       {ov.resources && (ov.resources.ram_total_bytes > 0 || ov.resources.disk_total_bytes > 0) && (
         <div className="card" style={{ gridColumn: "1 / -1", padding: "12px 20px" }}>

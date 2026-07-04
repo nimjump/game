@@ -188,13 +188,30 @@ func (s *Server) handleAdminPlayer(ctx *fasthttp.RequestCtx) {
 	}
 
 	// ── Reward history ────────────────────────────────────────────────────────
-	rewards, _ := s.Store.ListRewardsByPlayer(playerID, 30)
+	// ListRewardsByPlayer(playerID, 0) — limit=0 means "no cap" (see its own
+	// doc comment / the `if limit > 0` guard) — needed here so the lifetime
+	// total below isn't silently truncated to whatever the UI happens to
+	// display. Records never expire (no TTL on reward: keys), so this is a
+	// true lifetime figure, not just "recent."
+	allRewards, _ := s.Store.ListRewardsByPlayer(playerID, 0)
+	totalNIMReceived := 0.0
+	for _, r := range allRewards {
+		if r.Status == models.RewardSent {
+			totalNIMReceived += r.AmountNIM
+		}
+	}
+	rewards := allRewards
+	if len(rewards) > 30 { rewards = rewards[:30] }
 	if rewards == nil { rewards = []models.PendingReward{} }
+
+	// ── Device (last known, captured at wallet-auth verify) ────────────────────
+	device, _ := s.Store.GetPlayerDevice(playerID)
 
 	writeJSON(ctx, 200, map[string]any{
 		"player_id":    playerID,
 		"nickname":     nickname,
 		"cooldown_end": cooldownEnd,
+		"device":       device,
 		"stats": map[string]any{
 			"best_score":      bestScore,
 			"total_games":     totalGames,
@@ -202,9 +219,10 @@ func (s *Server) handleAdminPlayer(ctx *fasthttp.RequestCtx) {
 			"total_kills":     totalKills,
 			"total_platforms": totalPlatforms,
 		},
-		"daily_cap":       capStats,
-		"quests":          questsOut,
-		"quest_nim_today": totalQuestNIM,
+		"daily_cap":            capStats,
+		"quests":               questsOut,
+		"quest_nim_today":      totalQuestNIM,
+		"total_nim_received":   totalNIMReceived,
 		"quest_nim_claimed": claimedQuestNIM,
 		"leaderboard": map[string]any{
 			"daily_rank":   dailyRank,

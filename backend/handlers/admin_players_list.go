@@ -149,6 +149,15 @@ func (s *Server) handleAdminPlayersList(ctx *fasthttp.RequestCtx) {
 	weeklyRanks := s.Store.RankMapForPeriod("weekly", weeklyPeriod)
 	today := time.Now().In(game.UTC3).Format("2006-01-02")
 
+	// Lifetime NIM received per player — one full scan of "sent" rewards
+	// (not per-player, per-page-row) so this stays a single pass regardless
+	// of how many players are on the current page.
+	sentRewards, _ := s.Store.ListRewards(string(models.RewardSent))
+	nimReceived := make(map[string]float64, len(sentRewards))
+	for _, r := range sentRewards {
+		nimReceived[r.PlayerID] += r.AmountNIM
+	}
+
 	type playerOut struct {
 		PlayerID        string             `json:"player_id"`
 		Nickname        string             `json:"nickname"`
@@ -162,6 +171,7 @@ func (s *Server) handleAdminPlayersList(ctx *fasthttp.RequestCtx) {
 		DailyRank       int                `json:"daily_rank"`  // 0 = not ranked this period
 		WeeklyRank      int                `json:"weekly_rank"` // 0 = not ranked this period
 		DailyCap        game.DailyCapStats `json:"daily_cap"`
+		TotalNIMReceived float64           `json:"total_nim_received"`
 	}
 
 	out := make([]playerOut, 0, len(pageBasics))
@@ -199,6 +209,7 @@ func (s *Server) handleAdminPlayersList(ctx *fasthttp.RequestCtx) {
 			DailyRank:       dailyRanks[b.playerID],
 			WeeklyRank:      weeklyRanks[b.playerID],
 			DailyCap:        s.Store.GetDailyCapStats(b.playerID),
+			TotalNIMReceived: nimReceived[b.playerID],
 		})
 	}
 

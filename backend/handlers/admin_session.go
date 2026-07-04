@@ -123,6 +123,10 @@ func (s *Server) handleAdminLogout(ctx *fasthttp.RequestCtx) {
 // GET /backend/admin/me — lets the login page (and the app shell) check
 // whether the visitor already has a valid session.
 func (s *Server) handleAdminMe(ctx *fasthttp.RequestCtx) {
+	// Same reasoning as the no-store header on requireAdminSessionPage's
+	// redirect — this must never be served stale/cached, it's the exact
+	// check the login page uses to decide whether to bounce forward.
+	ctx.Response.Header.Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	writeJSON(ctx, 200, map[string]any{"authenticated": s.adminSessionOK(ctx)})
 }
 
@@ -169,6 +173,20 @@ func (s *Server) requireAdminSessionPage(next fasthttp.RequestHandler) fasthttp.
 			return
 		}
 		if !s.adminSessionOK(ctx) {
+			// A 302 with no Cache-Control is fair game for the browser to
+			// cache heuristically (redirects are cacheable by default per
+			// HTTP spec unless told otherwise). That's exactly the bug this
+			// was causing: visit /admin while logged out -> browser caches
+			// this "-> /login" redirect for the GET / request -> log in
+			// successfully, cookie is set fine -> hard-navigate back to
+			// /admin -> browser serves the STALE cached redirect straight
+			// back to /login without even asking the server, cookie or no
+			// cookie. Looked exactly like "I log in and it just bounces me
+			// back." Explicit no-store means this redirect is never cached,
+			// so every visit to a protected page actually re-checks the
+			// session cookie server-side like it's supposed to.
+			ctx.Response.Header.Set("Cache-Control", "no-store, no-cache, must-revalidate")
+			ctx.Response.Header.Set("Pragma", "no-cache")
 			ctx.Redirect(base+"/login", fasthttp.StatusFound)
 			return
 		}

@@ -74,6 +74,7 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/admin/config",                 s.requireAdminSession(s.handleAdminSetConfig))
 	r.POST("/backend/admin/update-mode",            s.requireAdminSession(s.handleAdminSetUpdateMode))
 	r.POST("/backend/admin/update-complete",        s.requireAdminSession(s.handleAdminCompleteUpdate))
+	r.GET("/backend/admin/device-breakdown",        s.requireAdminSession(s.handleAdminDeviceBreakdown))
 	r.GET("/backend/admin/quest-pool",              s.requireAdminSession(s.handleAdminQuestPool))
 	r.POST("/backend/admin/quest-reward",           s.requireAdminSession(s.handleAdminSetQuestReward))
 	r.POST("/backend/admin/replays/clear-all",      s.requireAdminSession(s.handleAdminClearAllReplays))
@@ -164,6 +165,7 @@ func (s *Server) Register(r *router.Router) {
 // StartBackgroundServices — starts retry loop, balance monitor, and the
 // Cloudflare IP list refresher. Called from main.go
 func (s *Server) StartBackgroundServices() {
+	s.Store.StartRewardQueue()
 	s.Store.StartRetryLoop()
 	s.Store.StartBalanceMonitor()
 	s.Store.StartUpdateScheduler()
@@ -489,6 +491,18 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 	}
 
 	// ── Save session to DB (seed claimed here) ───────────────────────────────
+	// State must reflect `flagged` right away — when flagged==true the
+	// replay-sim goroutine below never runs (see `if !flagged` a few lines
+	// down), so State would otherwise be stuck at StateCompleted forever
+	// even though Flagged=true. That mismatch is exactly why sessions
+	// caught by the fast synchronous anti-cheat check (acCheck / delta
+	// markers) never showed up in the admin "Flagged" tab (which filters by
+	// State, not Flagged) even though they were correctly flagged=true and
+	// rendered red in other tabs.
+	initialState := models.StateCompleted
+	if flagged {
+		initialState = models.StateFlagged
+	}
 	sess := &models.Session{
 		SessionID:    req.Session,
 		Seed:         gameSeed,
@@ -501,7 +515,7 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		Flagged:      flagged,
 		Reason:       reason,
 		SubmittedAt:  time.Now().Unix(),
-		State:        models.StateCompleted,
+		State:        initialState,
 		Log:          replayLog,
 		PlayerSeed:   parsedPlayerSeed,
 	}

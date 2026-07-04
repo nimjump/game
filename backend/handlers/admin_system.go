@@ -65,6 +65,12 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, cfg)
 }
 
+// GET /backend/admin/device-breakdown — how many distinct players are on
+// each platform (captured at wallet-auth verify time, see game/device.go).
+func (s *Server) handleAdminDeviceBreakdown(ctx *fasthttp.RequestCtx) {
+	writeJSON(ctx, 200, map[string]any{"platforms": s.Store.DeviceBreakdown()})
+}
+
 // GET /backend/admin/quest-pool — every quest template in the pool
 // (game/quest.go questPool), each with its default reward and the current
 // effective reward (default, unless an admin override is active).

@@ -19,7 +19,7 @@ var JUMP_SPEED   : float:
 	get: return _jump_override        if _jump_override        != -1.0 else -_vh * 1.1875
 	set(v): _jump_override        = v
 var SPRING_SPEED : float:
-	get: return _spring_override      if _spring_override      != -1.0 else -_vh * 2.0625
+	get: return _spring_override      if _spring_override      != -1.0 else -_vh * 1.9
 	set(v): _spring_override      = v
 var MOVE_SPEED   : float:
 	get: return _move_override        if _move_override        != -1.0 else _vw * 0.475
@@ -37,6 +37,19 @@ var _game_manager  : Node  = null  # GM reference — for manual platform collis
 var _gm_plat_w     : float = 0.0
 var _gm_plat_h     : float = 0.0
 var _visual_tick   : int  = 0    # increments each physics frame for visual fx (sin waves etc)
+# _visual_time — real elapsed seconds (delta-accumulated), NOT a tick count.
+# The jetpack/wings "running out" glow pulse used to drive its sine wave off
+# _visual_tick directly (sin(_visual_tick * 0.015)) — a per-TICK counter, not
+# per-SECOND. Any hitch in the visual physics_process rate (mobile browser
+# tab throttling, a GC pause, a slow frame — this runs inside a webview,
+# frame pacing is never perfectly steady there) changes how many ticks land
+# in a given real-world second, so the sine wave's actual speed wobbled with
+# frame rate instead of staying constant — that unevenness is what read as
+# "flickering / not quite smooth" on jetpack and wings alike (both go
+# through this same glow-pulse code, unlike the jetpack-only flame blink).
+# Driving it off real elapsed time instead makes the pulse rate constant
+# regardless of any frame-rate hiccups.
+var _visual_time  : float = 0.0
 var _initialized   := false
 var has_shield     := false
 var is_powered_up  := false
@@ -233,11 +246,11 @@ func _ready() -> void:
 	_base_scale = Vector2(_sc, _sc)
 	# All characters share identical physics — cosmetic-only selection.
 	# Values match the property defaults (gravity=_vh*2.25, jump=-_vh*1.1875,
-	# spring=-_vh*2.0625, move=_vw*0.475, jetpack=-_vh*0.525) so that
+	# spring=-_vh*1.9, move=_vw*0.475, jetpack=-_vh*0.525) so that
 	# set_char() applying these overrides produces the same result as having
 	# no override at all. This also eliminates server/client score divergence
 	# that arose when a non-default character index was sent in the replay.
-	var _cs := { "gravity": _vh * 2.25, "jump": -_vh * 1.1875, "spring": -_vh * 2.0625, "move": _vw * 0.475, "jetpack": -_vh * 0.525 }
+	var _cs := { "gravity": _vh * 2.25, "jump": -_vh * 1.1875, "spring": -_vh * 1.9, "move": _vw * 0.475, "jetpack": -_vh * 0.525 }
 	CHAR_STATS = [_cs, _cs, _cs, _cs, _cs]
 	add_to_group("player")
 	z_index = 100
@@ -531,6 +544,7 @@ func _physics_process(delta: float) -> void:
 	_update_glow()
 	_update_camera_drift(delta)
 	_visual_tick += 1
+	_visual_time += delta
 
 
 func simulate_tick() -> void:
@@ -1103,7 +1117,10 @@ func _update_glow() -> void:
 		# Flickering alpha when timer < 1.5 must run every frame — but only when actually flickering
 		if powerup_timer < 1.5:
 			var col : Color = Color(1.0, 0.5, 0.1, 0.7) if _powerup_is_jetpack else Color(0.3, 0.7, 1.0, 0.7)
-			col.a = 0.7 * (0.4 + 0.6 * sin(_visual_tick * 0.015))
+			# Time-based (not tick-based, see _visual_time's doc comment) —
+			# 0.9 rad/sec matches the old tick-based rate at a steady 60fps,
+			# but now stays that same speed even when frame pacing wobbles.
+			col.a = 0.7 * (0.4 + 0.6 * sin(_visual_time * 0.9))
 			if _glow_state != 1: _glow_spr.visible = true
 			_glow_spr.modulate = col
 			_glow_spr.scale    = Vector2(1.4, 1.4)

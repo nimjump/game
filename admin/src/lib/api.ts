@@ -72,6 +72,12 @@ export interface Overview {
     queue_len: number;
     max_workers: number;
   };
+  rewards?: {
+    total_nim_sent: number;
+    total_nim_pending: number;
+    sent_count: number;
+    pending_count: number;
+  };
   system: {
     goroutines: number;
     heap_mb: number;
@@ -264,6 +270,8 @@ export interface PlayerProfile {
   quests: PlayerQuest[];
   quest_nim_today: number;
   quest_nim_claimed: number;
+  total_nim_received: number; // lifetime, all "sent" rewards (not capped to recent_sessions/rewards list length)
+  device?: PlayerDevice | null;
   leaderboard: {
     daily_rank?: number;
     weekly_rank?: number;
@@ -272,6 +280,27 @@ export interface PlayerProfile {
   };
   recent_sessions: PlayerProfileSession[];
   rewards: PendingReward[];
+}
+
+export interface PlayerDevice {
+  player_id: string;
+  user_agent: string;
+  platform: string;
+  screen: string;
+  dpr: string;
+  updated_at: number;
+}
+
+export interface DeviceBreakdownEntry {
+  platform: string;
+  count: number;
+}
+
+export async function fetchDeviceBreakdown(): Promise<DeviceBreakdownEntry[]> {
+  const r = await fetch(`${BASE}/backend/admin/device-breakdown`, { cache: "no-store" });
+  if (!r.ok) throw new Error("device breakdown fetch failed");
+  const d = await r.json();
+  return d.platforms ?? [];
 }
 
 export async function searchPlayer(q: string): Promise<PlayerProfile | null> {
@@ -388,6 +417,7 @@ export interface RegisteredPlayer {
   daily_rank: number;  // 0 = not ranked this period
   weekly_rank: number; // 0 = not ranked this period
   daily_cap: DailyCapStats;
+  total_nim_received: number; // lifetime, all "sent" rewards
 }
 
 export interface PlayersListResponse {

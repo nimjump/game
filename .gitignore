@@ -10,9 +10,24 @@ export/
 
 # --- Node (admin/) ---
 node_modules/
+admin/node_modules/
 admin/dist/
 admin/.env
 admin/.env.local
+
+# --- Next.js build output ---
+.next/
+admin/.next/
+out/
+admin/out/
+*.tsbuildinfo
+next-env.d.ts
+
+# --- npm / package manager junk ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
 
 # --- Go (backend/) ---
 backend/replay-verifier/*.exe

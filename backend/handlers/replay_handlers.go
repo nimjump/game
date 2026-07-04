@@ -229,6 +229,20 @@ func (s *Server) handleAdminOverview(ctx *fasthttp.RequestCtx) {
 	}
 	sysRes := game.GetSystemResources(dbPath)
 
+	// Site-wide lifetime NIM paid out (all "sent" rewards, all reasons —
+	// coins, quests, leaderboard). See handleAdminPlayer for the same
+	// per-player figure.
+	sentRewards, _ := s.Store.ListRewards(string(models.RewardSent))
+	totalNIMPaid := 0.0
+	pendingRewards, _ := s.Store.ListRewards(string(models.RewardPending))
+	totalNIMPending := 0.0
+	for _, r := range sentRewards {
+		totalNIMPaid += r.AmountNIM
+	}
+	for _, r := range pendingRewards {
+		totalNIMPending += r.AmountNIM
+	}
+
 	writeJSON(ctx, 200, map[string]any{
 		"counts": map[string]any{
 			"total":          len(all),
@@ -237,6 +251,12 @@ func (s *Server) handleAdminOverview(ctx *fasthttp.RequestCtx) {
 			"completed":      completedCount,
 			"flagged":        flaggedCount,
 			"replay_failed":  replayFailedCount,
+		},
+		"rewards": map[string]any{
+			"total_nim_sent":    totalNIMPaid,
+			"total_nim_pending": totalNIMPending,
+			"sent_count":        len(sentRewards),
+			"pending_count":     len(pendingRewards),
 		},
 		"replay": map[string]any{
 			"binary_ok":   rs["healthy"],
@@ -302,7 +322,25 @@ func (s *Server) handleAdminSessions(ctx *fasthttp.RequestCtx) {
 			elapsed = (nowMs - sess.GameStartedAt) / 1000
 		}
 
-		if stateFilter != "" && state != stateFilter {
+		// state (string) and sess.Flagged (bool) are meant to always agree,
+		// but a few code paths over time have updated one without the other
+		// (e.g. a clean replay-retry that reset State back to "completed"
+		// without also clearing Flagged) — the admin UI's red/OK styling
+		// keys off Flagged, not State, so filtering purely by the state
+		// string let stale-Flagged sessions surface in the wrong tab (shows
+		// "✓ OK" but appears under Flagged, or vice versa). Flagged is
+		// treated as authoritative here: "flagged" tab = Flagged==true OR
+		// state=="flagged"; "completed" tab explicitly excludes anything
+		// still marked Flagged even if its state string says otherwise.
+		if stateFilter == "flagged" {
+			if !sess.Flagged && state != "flagged" {
+				continue
+			}
+		} else if stateFilter == "completed" {
+			if state != "completed" || sess.Flagged {
+				continue
+			}
+		} else if stateFilter != "" && state != stateFilter {
 			continue
 		}
 		if playerFilter != "" && !strings.Contains(
@@ -462,7 +500,14 @@ func (s *Server) handleAdminReplayRetry(ctx *fasthttp.RequestCtx) {
 			},
 		)
 	} else {
-		sess.State = models.StateCompleted
+		// Must also clear Flagged here, not just State — leaving Flagged=true
+		// stuck while State flips to "completed" is exactly the kind of
+		// desync that made sessions show up in the wrong admin tab (State
+		// and Flagged disagreeing with each other; see the "flagged" query
+		// filter fix in handleAdminSessions below).
+		sess.Flagged = false
+		sess.Reason  = ""
+		sess.State   = models.StateCompleted
 	}
 	_ = s.Store.Save(sess)
 
