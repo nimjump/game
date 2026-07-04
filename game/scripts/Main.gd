@@ -232,6 +232,22 @@ func _ready() -> void:
 
 	_check_landscape()
 
+	# BUG FIX: _setup_audio() (-> _apply_audio_settings()) used to run HERE,
+	# BEFORE _load_settings() (further down). On a fresh page load that's
+	# harmless (nothing is playing yet). But "Play Again" / any other
+	# get_tree().reload_current_scene() call creates a brand-new Main.gd
+	# instance whose _muted/_volume vars start back at their hardcoded
+	# defaults (unmuted, full volume) — and the JS-side BGM <audio> element
+	# is NOT reset by a scene reload, it just keeps looping right through it.
+	# So this call used to immediately push "unmuted, full volume" to the
+	# STILL-PLAYING bgm element (audible volume spike, live, on an actively
+	# playing sound) regardless of what the player had it set to, for the
+	# ~instant it took to reach _load_settings() + the real
+	# _apply_audio_settings() call further down — exactly the "1-2 seconds
+	# of sound on Play Again / going back to lobby, ignores the mute
+	# setting" symptom. Loading settings FIRST means the very first bus sync
+	# this instance ever sends is already correct.
+	_load_settings()
 	_setup_audio()
 
 	# iOS detection (web only) — Safari/WKWebView never implement navigator.vibrate(),
@@ -324,7 +340,8 @@ func _ready() -> void:
 	add_child(_nimiq_bridge)
 
 	# Don't wait for Nimiq — start game immediately, Nimiq loads in background
-	_load_settings()
+	# (_load_settings() already ran earlier, right before _setup_audio() —
+	# see the comment up there)
 	_build_game()
 	_start_status_poll()
 	_build_start_ui()
@@ -1419,6 +1436,14 @@ func _save_settings_flush() -> void:
 		"gyro_sensitivity": _gyro_sensitivity,
 		"vibration":       _vibration,
 		"muted":           _muted,
+		# BUG FIX: master "volume" was never saved here at all — every fresh
+		# page load (a real Nimiq Pay mini-app WebView reload happens when
+		# backing out to the host app's own lobby/home and returning, not
+		# just a literal browser refresh) silently reset it to the hardcoded
+		# default (1.0 = full), ignoring whatever the player had it set to.
+		# That's exactly a "I turned it down, then at some point it's loud
+		# again" symptom — this closes that gap.
+		"volume":          _volume,
 		"bgm_enabled":     _bgm_enabled,
 		"bgm_volume":      _bgm_volume,
 		"jump_enabled":    _jump_enabled,
@@ -1443,6 +1468,7 @@ func _load_settings() -> void:
 	if d.has("gyro_sensitivity"): _gyro_sensitivity = float(d["gyro_sensitivity"])
 	if d.has("vibration"):        _vibration        = bool(d["vibration"])
 	if d.has("muted"):            _muted            = bool(d["muted"])
+	if d.has("volume"):           _volume           = float(d["volume"])
 	if d.has("bgm_enabled"):      _bgm_enabled      = bool(d["bgm_enabled"])
 	if d.has("bgm_volume"):       _bgm_volume       = float(d["bgm_volume"])
 	if d.has("jump_enabled"):     _jump_enabled     = bool(d["jump_enabled"])
@@ -3706,6 +3732,11 @@ func _on_sound_toggled(pressed: bool) -> void:
 func _on_volume_changed(val: float) -> void:
 	_volume = val
 	_apply_audio_settings()
+	# BUG FIX: this never saved — see the "volume" field comment in
+	# _save_settings_flush()/_load_settings(). Without this, even a fixed
+	# save/load round-trip wouldn't matter — the value never made it to
+	# localStorage in the first place.
+	_save_settings()
 
 
 # ─────────────────────────────────────────────────────
@@ -3720,18 +3751,30 @@ func _setup_audio() -> void:
 func _apply_audio_settings() -> void:
 	if not OS.has_feature("web"): return
 	var master_vol := _volume if not _muted else 0.0
+	# BUG FIX: Master used to be set LAST here. _effVol() (JS side) factors in
+	# _busMute.Master when computing each channel's effective volume, so
+	# setting BGM/Jump/Damage BEFORE Master meant each of those three calls
+	# computed its volume using the OLD (not-yet-updated) Master mute state —
+	# e.g. muting: BGM/Jump/Damage's _gdSetBus calls still saw Master=unmuted
+	# and so applied a full, audible volume; only the LAST call actually
+	# flipped Master's flag, by which point nothing re-applied it back to the
+	# three channels already set (a related bug in _gdSetBus's per-sound
+	# refresh loop is fixed separately — this fixes the ordering that fed it
+	# wrong data in the first place). Setting Master FIRST means every
+	# subsequent per-channel call already sees the correct, final Master
+	# mute/volume state.
 	JavaScriptBridge.eval("""
 		if (window._gdSetBus) {
+			window._gdSetBus('Master',     %f, %s);
 			window._gdSetBus('BGM',        %f, %s);
 			window._gdSetBus('SFX_Jump',   %f, %s);
 			window._gdSetBus('SFX_Damage', %f, %s);
-			window._gdSetBus('Master',     %f, %s);
 		}
 	""" % [
+		master_vol,     str(_muted).to_lower(),
 		_bgm_volume,    str(not _bgm_enabled).to_lower(),
 		_jump_volume,   str(not _jump_enabled).to_lower(),
 		_damage_volume, str(not _damage_enabled).to_lower(),
-		master_vol,     str(_muted).to_lower()
 	], true)
 
 
@@ -3779,22 +3822,101 @@ func _change_char_settings(dir: int) -> void:
 # ─────────────────────────────────────────────────────
 #  MAIN CALLBACKS
 # ─────────────────────────────────────────────────────
+var _play_waiting_for_auth := false   # true while a Play-triggered auth wait is already pending
+
 func _on_play_pressed() -> void:
 	_start_bgm_if_needed()  # ilk etkileşim → BGM başlat
 	if _started: return
 
 	# Sign-in required — request if no auth, wait again if rejected (game must not start)
 	if _auth_token == "":
+		# BUG FIX: every repeated Play tap while waiting used to add ANOTHER
+		# pair of one-shot auth_success/auth_failed listeners (each a fresh
+		# closure, so connect() never deduped them) — harmless on its own,
+		# but also meant an impatient user mashing Play during a slow first
+		# load got zero extra feedback and we had no visibility into cases
+		# where the wait never resolved. Now: don't stack a second wait, and
+		# arm a diagnostic watchdog that logs full state as a real ERROR
+		# (captured by the client-log pipeline, no auth needed to see it in
+		# the admin Logs tab) if Play still hasn't started the game after
+		# 10s — so a silent "Play does nothing" report is diagnosable from
+		# the very next occurrence instead of needing a live repro.
+		if _play_waiting_for_auth:
+			print("[MAIN] play pressed — already waiting on auth, not re-arming")
+			return
+		_play_waiting_for_auth = true
 		print("[MAIN] play pressed — not signed in, requesting auth")
 		if is_instance_valid(_nimiq_bridge) and not _nimiq_bridge.auth_verified:
-			_nimiq_bridge._do_sign_auth()
+			# LIKELY ROOT CAUSE of "Play does nothing, only on first ever open":
+			# _do_sign_auth() -> NimiqJS.start_sign() calls window.nimiq.sign()
+			# directly, assuming an account is ALREADY connected. That's true
+			# for a RETURNING player (their wallet already has this site
+			# authorized from before), but a brand-new player has never
+			# connected — the only thing that connects them is index.html's
+			# own background nimiq.connect() call, which fires automatically
+			# ~3.5s after page load with NO direct user gesture attached to
+			# it. Wallet/WebView hosts commonly refuse to show (or silently
+			# never resolve) a "connect this new site" approval prompt unless
+			# it's triggered from a real, fresh user tap — which that
+			# background call isn't. Net effect: first-time players' address
+			# never gets set, sign() has nothing to sign with, and the whole
+			# chain just hangs with no error, exactly matching "nothing
+			# happens, only first time" (returning players skip this because
+			# their account is already connected, so sign() alone works).
+			# Fix: explicitly (re-)request the account connection HERE, at
+			# the moment of the Play tap itself — NimiqJS.request_account()
+			# does listAccounts() first (instant, no-op if already connected
+			# — the normal case for returning players) and only falls
+			# through to connect() if truly needed, and THIS call is directly
+			# inside the Play click's own handler, so the gesture is fresh.
+			_ensure_wallet_then_sign()
+			# BELT-AND-SUSPENDERS: the PLAY_STUCK diagnostic (added above) fired
+			# in the wild with signing_in_progress=false a full 10s after Play —
+			# meaning _do_sign_auth() was never even reached, i.e. something
+			# inside _ensure_wallet_then_sign()'s await chain (JS eval / the
+			# unpkg SDK import / sdk.init()/connect() with no timeout on the
+			# import itself) can stall indefinitely in the wild (blocked CDN
+			# request, flaky network, ad-blocker, etc.) with zero error surfaced
+			# back to GDScript. Rather than chase that further blind, force the
+			# actual sign-in attempt directly after a short, bounded wait no
+			# matter what the wallet-connect detour is doing — _do_sign_auth()
+			# already no-ops safely if called twice (see _signing_in_progress
+			# guard in NimiqBridge.gd), so this is a pure safety net, not a
+			# behavior change for the working case (a real Nimiq Pay connect
+			# resolves in well under 6s once the user gesture reaches it).
+			if OS.has_feature("web"):
+				var _kick := get_tree().create_timer(6.0)
+				_kick.timeout.connect(func():
+					if _started or _auth_token != "": return
+					if is_instance_valid(_nimiq_bridge) and not _nimiq_bridge.auth_verified and not bool(_nimiq_bridge.get("_signing_in_progress")):
+						print("[MAIN] wallet-connect detour still not resolved after 6s — forcing sign-in directly")
+						_nimiq_bridge._do_sign_auth()
+				)
 		# On success start game, on error/rejection reset — user can press play again
 		var _conn_s := _nimiq_bridge.connect("auth_success", func(_t, _p):
+			_play_waiting_for_auth = false
 			_on_play_pressed()   # auth received, continue normal flow
 		, CONNECT_ONE_SHOT)
 		var _conn_f := _nimiq_bridge.connect("auth_failed", func(_r):
-			pass  # handled by _on_auth_failed global handler
+			_play_waiting_for_auth = false
+			# handled by _on_auth_failed global handler
 		, CONNECT_ONE_SHOT)
+		if OS.has_feature("web"):
+			var t := get_tree().create_timer(10.0)
+			t.timeout.connect(func():
+				if _started or not _play_waiting_for_auth:
+					return  # resolved one way or another already
+				var nb := _nimiq_bridge
+				var diag := "PLAY_STUCK: 10s after Play press, game still not started. " \
+					+ "auth_token_empty=%s auth_verified=%s signing_in_progress=%s nimiq_addr_set=%s device_id_set=%s" % [
+						str(_auth_token == ""),
+						str(is_instance_valid(nb) and nb.auth_verified),
+						str(is_instance_valid(nb) and nb.get("_signing_in_progress")),
+						str(is_instance_valid(nb) and nb.nimiq_address != ""),
+						str(is_instance_valid(nb) and nb.device_id != ""),
+					]
+				push_error(diag)  # push_error -> console.error -> captured by client-log pipeline
+			)
 		return
 
 	_started = true
@@ -3806,6 +3928,49 @@ func _on_play_pressed() -> void:
 	if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
 
 	_do_start_game()
+
+
+## Ensures a wallet account is connected — gesture-safe (see the long comment
+## at its call site in _on_play_pressed) — THEN proceeds with the normal
+## challenge/sign auth flow. request_account() is cheap/instant for a
+## returning player (listAccounts() already has the account, connect() is
+## never even called), and is the real fix for a first-time player (does the
+## actual gesture-linked connect() this time, called directly from the Play
+## tap instead of an unrelated background timer).
+func _ensure_wallet_then_sign() -> void:
+	# Only take the extra request_account() detour if there's an actual
+	# Nimiq provider to connect to. In a normal browser (not inside Nimiq
+	# Pay), window.nimiq never gets set at all and _initNimiq() flags this
+	# definitively via window._nimiqProviderMissing — skip the detour
+	# entirely in that case so a plain-browser player's Play press behaves
+	# EXACTLY as before this fix (straight to _do_sign_auth(), which fails
+	# fast with no_provider and starts them as a guest), instead of taking
+	# on any extra risk/delay from a call that can't possibly succeed anyway.
+	var provider_confirmed_missing := false
+	if OS.has_feature("web"):
+		provider_confirmed_missing = bool(JavaScriptBridge.eval("!!window._nimiqProviderMissing", true))
+	if OS.has_feature("web") and nimiq_address == "" and not provider_confirmed_missing:
+		# Shortened from 20s -> 8s: the 6s force-sign-in watchdog in
+		# _on_play_pressed() already takes over past that point, so letting
+		# this run all the way to 20s just risks a stale request_account()
+		# result landing (and overwriting nimiq_address) after _do_sign_auth()
+		# already fired via the watchdog.
+		var acc := await NimiqJS.request_account(8.0)
+		if acc.get("ok", false):
+			var addr := str(acc.get("address", ""))
+			var label := str(acc.get("label", ""))
+			print("[MAIN] wallet connected via Play tap addr=%s" % addr.left(12))
+			nimiq_address = addr
+			nimiq_label    = label
+			if is_instance_valid(_nimiq_bridge):
+				_nimiq_bridge.nimiq_address = addr
+				_nimiq_bridge.nimiq_label   = label
+		else:
+			print("[MAIN] wallet connect (via Play) not completed: %s" % str(acc.get("err", "?")))
+			# Fall through anyway — _do_sign_auth()'s own no_provider/user_rejected
+			# handling already lets the player start as a guest.
+	if is_instance_valid(_nimiq_bridge):
+		_nimiq_bridge._do_sign_auth()
 
 
 # ── VS ─────────────────────────────────────────────────────────────────────────

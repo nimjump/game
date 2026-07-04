@@ -1393,9 +1393,14 @@ func _add_enemy(plat: StaticBody2D, p_diff: float = -1.0, p_score: int = -1) -> 
 	if plat.has_method("connect_enemy"):
 		plat.connect_enemy(enemy)
 	elif plat.has_signal("platform_broke"):
+		# Same fix as Platform.gd's connect_enemy() — capture instance ID, not
+		# the Node itself, to avoid the engine's "Lambda capture ... was freed"
+		# log noise when the enemy dies before the platform breaks.
+		var enemy_id := enemy.get_instance_id()
 		plat.platform_broke.connect(func():
-			if is_instance_valid(enemy) and enemy.has_method("_die"):
-				enemy.call("_die")
+			var e := instance_from_id(enemy_id)
+			if is_instance_valid(e) and e.has_method("_die"):
+				e.call("_die")
 		)
 
 	enemy.setup(etype, frames, use_diff)

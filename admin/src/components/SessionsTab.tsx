@@ -229,7 +229,7 @@ export default function SessionsTab({
                               Reject
                             </button>
                           )}
-                          {isReplayFailed && s.has_log !== false && (
+                          {(isReplayFailed || isFlagged) && s.has_log !== false && (
                             <button className="btn" disabled={busy}
                               style={{ fontSize: 11, padding: "2px 7px", background: "var(--yellow)", color: "#000" }}
                               onClick={() => setConf({

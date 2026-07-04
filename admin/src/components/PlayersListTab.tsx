@@ -347,7 +347,7 @@ function PlayerDetailModal({
           <>
             {/* Stats */}
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 18 }}>
-              <StatPill label="Total NIM received" value={Number(profile.total_nim_received.toFixed(2))} color="#4caf50" />
+              <StatPill label="Total NIM received" value={Number(nim(profile.total_nim_received))} color="#4caf50" />
               <StatPill label="Best score" value={profile.stats.best_score} color="#4caf50" />
               <StatPill label="Games" value={profile.stats.total_games} color="#6366f1" />
               <StatPill label="Kills" value={profile.stats.total_kills} color="#e0a030" />

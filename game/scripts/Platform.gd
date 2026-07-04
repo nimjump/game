@@ -226,12 +226,32 @@ func connect_enemy(enemy: Node) -> void:
 	# Give the enemy a reference to this platform — needed for patrol boundary calculation
 	# Use set() — safely assigns inherited properties too
 	enemy.set("_platform", self)
+	# BUG FIX: platform_broke can fire long after this enemy was spawned — the
+	# platform lives until it scrolls off-screen or breaks, but the enemy can
+	# be freed much earlier by an unrelated path (player stomp, projectile
+	# damage, off-screen despawn). Capturing `enemy` (a Node) directly in this
+	# lambda made Godot's engine log
+	#   "ERROR: Lambda capture at index 0 was freed. Passed 'null' instead."
+	# EVERY time platform_broke fired after the enemy was already gone — even
+	# though the is_instance_valid() guard below already made this perfectly
+	# safe at runtime. The engine logs that ERROR unconditionally whenever any
+	# captured Object was freed before the lambda runs, regardless of what the
+	# body does with it afterward — it's not a crash, just log noise, but it's
+	# real production noise on every ordinary "stomp enemy, platform breaks
+	# later" sequence, which is extremely common live gameplay.
+	# Fix: capture the enemy's instance ID (a plain int, not an Object
+	# reference) instead — Godot's lambda-capture-freed check only triggers
+	# for captured Objects, not ints. Resolve back to the object at call time
+	# via instance_from_id() + is_instance_valid(), which safely returns null
+	# for an already-freed enemy with no ERROR logged at all.
+	var enemy_id := enemy.get_instance_id()
 	platform_broke.connect(func():
-		if is_instance_valid(enemy):
-			if enemy.has_method("_fall_off_platform"):
-				enemy.call("_fall_off_platform")
-			elif enemy.has_method("_die"):
-				enemy.call("_die")
+		var e := instance_from_id(enemy_id)
+		if is_instance_valid(e):
+			if e.has_method("_fall_off_platform"):
+				e.call("_fall_off_platform")
+			elif e.has_method("_die"):
+				e.call("_die")
 	)
 
 

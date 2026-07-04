@@ -129,8 +129,14 @@
         }
         window._nimiqAddress = address ? String(address) : '';
         window._nimiqLabel   = address ? String(address).slice(0, 9) : '';
-        try { window._nimiqDeviceId = await sdk.requestDeviceIdentifier({ reason: 'NimJump score ranking' }); }
-        catch(e) { window._nimiqDeviceId = ''; }
+        // REMOVED per request: sdk.requestDeviceIdentifier({reason:'NimJump score
+        // ranking'}) used to fire here on every load — this is what triggered
+        // Nimiq Pay's native "allow device identifier" permission prompt the
+        // first time a player opened the game, citing leaderboard ranking as
+        // the reason. Dropped entirely; window._nimiqDeviceId stays '' (see
+        // init above), so guests without a connected wallet just don't get a
+        // persistent cross-session id — wallet connect is the only path to a
+        // saved rank now, no separate permission prompt.
         window._nimiqLanguage = (window.nimiqPay && window.nimiqPay.language)
           || (navigator.language ? navigator.language.split('-')[0] : 'en');
         window._nimiqData = { address: window._nimiqAddress, label: window._nimiqLabel, deviceId: window._nimiqDeviceId, _provider: nimiq };
@@ -229,7 +235,21 @@
     window._gdSetBus = function(bus, vol, muted) {
       _busVol[bus]=parseFloat(vol)||0;
       _busMute[bus]=(muted===true||muted==='true');
-      Object.keys(_sounds).forEach(function(n){ if(_sounds[n].bus===bus) _sounds[n].audio.volume=_effVol(bus); });
+      // BUG FIX: this used to only refresh sounds whose OWN bus matches the
+      // bus that just changed — but nothing is ever registered with
+      // bus==='Master' (sounds are tagged 'BGM'/'SFX_Jump'/'SFX_Damage'), so
+      // a Master-only change (the master mute toggle) matched ZERO sounds
+      // here and never touched their actual <audio>.volume at all. Master
+      // mute state itself was still recorded correctly (_effVol reads it),
+      // but any sound that doesn't recompute its volume fresh right before
+      // playing (i.e. an already-looping BGM) kept whatever volume it had
+      // from before — so toggling mute while BGM was already playing didn't
+      // reliably (im)mute it via THIS path (bgm_stop covers the mute-BGM
+      // case separately, but this is the general fix). When bus is 'Master',
+      // refresh every registered sound's volume, not just an (empty) subset.
+      Object.keys(_sounds).forEach(function(n){
+        if (bus === 'Master' || _sounds[n].bus === bus) _sounds[n].audio.volume = _effVol(_sounds[n].bus);
+      });
     };
     function _unlock(){ _unlocked=true; }
     ['touchstart','mousedown','keydown','click'].forEach(function(ev){
@@ -423,7 +443,28 @@
   // ── Backend log queue ────────────────────────────────────────────────────
   var _queue = [];
   var _timer = null;
-  var _BACKEND = '/backend/client-log';
+  // BUG FIX: this used to be the relative path '/backend/client-log', which
+  // resolves against the PAGE's own origin (window.location.origin). The
+  // game's static files are hosted on nimjump.zetashare.com, but the actual
+  // Go backend lives on a DIFFERENT domain, backbone.zetashare.com (see
+  // ApiConfig.gd's PROD_BASE) — there is no reverse-proxy making
+  // nimjump.zetashare.com/backend/* reach the backend, so every request
+  // 404'd against the game's own static host. Fix: resolve the same base URL
+  // ApiConfig.gd uses (query param ?api= > localStorage nj_api_base > the
+  // hardcoded prod backend), so this always hits the real backend regardless
+  // of which domain served the page.
+  var _API_BASE = (function(){
+    try {
+      var q = new URLSearchParams(window.location.search).get('api');
+      if (q) return q.replace(/\/+$/, '');
+    } catch(e) {}
+    try {
+      var ls = window.localStorage && window.localStorage.getItem('nj_api_base');
+      if (ls) return ls.replace(/\/+$/, '');
+    } catch(e) {}
+    return 'https://backbone.zetashare.com'; // keep in sync with ApiConfig.gd PROD_BASE
+  })();
+  var _BACKEND = _API_BASE + '/backend/client-log';
 
   function _deviceMeta() {
     return {
@@ -766,6 +807,26 @@ function initGodotGame() {
   }
   var _caps = _probeCapabilities();
 
+  // Cross-origin isolation check — this deployment sets COOP:same-origin /
+  // COEP:require-corp (see backend/main.go corsMiddleware) specifically so
+  // SharedArrayBuffer/threads work. Those headers can silently fail to reach
+  // the browser in ways the backend can't see from its own side: a CDN/proxy
+  // stripping them, or (very plausible here — this game runs inside Nimiq
+  // Pay's mini-app WebView host, see comments elsewhere in this file) a host
+  // WebView that doesn't propagate isolation to the embedded page at all.
+  // If the wasm build actually needs threads and isolation didn't land, the
+  // loader can download 100% of the bytes fine and then hang forever during
+  // WASM instantiate/thread-pool init with NO further onProgress calls and
+  // NO rejection either — which looks exactly like "stuck at some %,
+  // forever" with zero clue why. Logging this once, up front, means a
+  // LOAD_STALL for a given session can be cross-referenced against whether
+  // isolation was actually active for that same session.
+  var _coi = !!window.crossOriginIsolated;
+  var _sab = (typeof SharedArrayBuffer !== 'undefined');
+  var _coiMsg = 'COI crossOriginIsolated=' + _coi + ' SharedArrayBuffer=' + _sab;
+  if (DEV) window._earlyLog(_coiMsg, '#0ff');
+  if (window._enqueueLog) window._enqueueLog('info', _coiMsg);
+
   var missing=Engine.getMissingFeatures({threads:false});
   if(DEV) window._earlyLog('missing: ['+missing.join(',')+']');
   if (missing.length > 0) {
@@ -795,6 +856,28 @@ function initGodotGame() {
   setStatusMode('progress');
   var _last=-1;
   var _gameStarted=false;
+  var _loadStage = 'downloading';       // downloading -> download-complete -> (engine resolves or hangs after this)
+  var _lastProgressAt = Date.now();     // updated every time the % actually changes
+  var _loadStartAt = Date.now();
+
+  // Best-effort snapshot of the wasm/pck network requests via the Resource
+  // Timing API — lets a stall report distinguish "still actively
+  // downloading, just slow" from "download already finished ages ago, hung
+  // afterward in WASM compile/instantiate/thread-init" (which is the classic
+  // symptom of a cross-origin-isolation mismatch — see the COI check above).
+  function _assetTimingSummary() {
+    try {
+      var entries = performance.getEntriesByType('resource').filter(function(e){
+        return /\.(wasm|pck)(\?|$)/.test(e.name);
+      });
+      if (!entries.length) return 'assets=none-observed';
+      return entries.map(function(e){
+        var done = e.responseEnd > 0;
+        var size = e.transferSize || e.encodedBodySize || 0;
+        return (e.name.split('/').pop()) + ':' + (done ? 'done' : 'pending') + ':' + size + 'B';
+      }).join(',');
+    } catch (e) { return 'assets=probe-failed'; }
+  }
 
   // Stall detector — on a slow/flaky connection (very plausible on mobile
   // data, which is most of this game's real traffic), the .wasm/.pck
@@ -805,10 +888,31 @@ function initGodotGame() {
   // apart from a genuine compatibility failure. If nothing has happened by
   // 20s, log it once (still lets it keep trying — no reload forced, in
   // case it's just a slow-but-eventually-fine load).
+  //
+  // Upgraded to carry enough context to actually diagnose WHICH stage it
+  // died in, instead of just a frozen byte percentage: cross-origin
+  // isolation state (the #1 suspect for "downloaded fine, hung after"),
+  // how long since the % last actually moved (frozen-since vs slow-but-
+  // moving), device/network hints, and a resource-timing snapshot of the
+  // actual wasm/pck requests.
   var _stallTimer = setTimeout(function(){
     if (_gameStarted) return;
-    var stallMsg = 'LOAD_STALL: no engine start after 20s, last_progress=' + _last + '%';
+    var frozenForMs = Date.now() - _lastProgressAt;
+    var conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    var netInfo = conn ? (conn.effectiveType + '/dl=' + conn.downlink + 'Mbps') : 'unknown';
+    var stallMsg = 'LOAD_STALL: no engine start after 20s' +
+      ' last_progress=' + _last + '%' +
+      ' stage=' + _loadStage +
+      ' frozen_for_ms=' + frozenForMs +
+      ' coi=' + _coi + ' sab=' + _sab +
+      ' net=' + netInfo +
+      ' cores=' + (navigator.hardwareConcurrency || '?') +
+      ' assets=[' + _assetTimingSummary() + ']';
     console.warn(stallMsg);
+    // Explicit enqueue (not just relying on the console.warn hook) so this
+    // specific diagnostic is guaranteed to reach the admin Logs tab even if
+    // the generic console hook ever changes/misses a level.
+    if (window._enqueueLog) window._enqueueLog('warn', stallMsg);
   }, 20000);
 
   engine.startGame({
@@ -816,7 +920,11 @@ function initGodotGame() {
       if(cur>0&&tot>0){
         statusProgress.value=cur; statusProgress.max=tot;
         var pct=Math.round(cur/tot*100);
-        if(pct!==_last){_last=pct;if(DEV&&(pct%10===0||pct===100))window._earlyLog('Loading: '+pct+'%');}
+        if(pct!==_last){
+          _last=pct; _lastProgressAt=Date.now();
+          if (pct >= 100) _loadStage = 'download-complete';
+          if(DEV&&(pct%10===0||pct===100))window._earlyLog('Loading: '+pct+'%');
+        }
       } else {
         statusProgress.removeAttribute('value'); statusProgress.removeAttribute('max');
       }

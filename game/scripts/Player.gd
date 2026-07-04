@@ -507,6 +507,28 @@ func activate() -> void:
 	is_dead      = false
 	velocity     = Vector2.ZERO
 	_initialized = true
+	# BUG FIX: _gm_plat_w/_gm_plat_h (PL-01 cache, see field decl above) were
+	# only ever populated ONCE per Player node lifetime (guarded by
+	# `if _gm_plat_w == 0.0`) and never invalidated. The Player node is NOT
+	# recreated between replay plays in the same page session (seek_to_tick /
+	# start_replay_external explicitly skip freeing it), so once cached, a
+	# stale PLATFORM_W/H silently kept being used for every subsequent replay
+	# watched in that session — even though GameManager legitimately
+	# recomputes PLATFORM_W/H from VW/VH on every new session (line ~249 in
+	# GameManager.gd). If the viewport/canvas size settles to a slightly
+	# different value between the first replay watched right after page load
+	# and later replays watched without a full refresh, the manual AABB
+	# landing check (_physics_process, ~line 690) used the WRONG platform
+	# half-width/height for those later plays — producing a different
+	# landing/break result for the exact same replay log, purely depending on
+	# whether it was the first replay played this session or not. Refreshing
+	# the page (which recreates the Player node) reset the cache and made the
+	# result match the server's headless replay again — exactly the symptom
+	# reported. Fix: reset the cache here, so every new game/replay session
+	# re-reads the current, correct PLATFORM_W/H instead of trusting a value
+	# that may be from a stale viewport size.
+	_gm_plat_w = 0.0
+	_gm_plat_h = 0.0
 	if !_is_headless:
 		_anim_sprite.scale = Vector2(0.28, 0.28)
 		_anim_sprite.play("stand")

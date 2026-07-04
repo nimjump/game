@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -48,6 +49,29 @@ func anchorWorkingDir() {
 		return
 	}
 	log.Printf("[STARTUP] working directory anchored to %s", root)
+}
+
+// setupFileLogging makes ALL log.Print* output also go to backend/logs/backend.log,
+// in addition to stdout. This matters specifically because this backend is
+// commonly run as a Windows service (e.g. via NSSM/sc.exe) — a service has no
+// attached console, so anything log.Print writes normally just vanishes into
+// the void with no way to see it after the fact. Writing to a real file means
+// "what happened / why isn't it working" is always answerable by opening this
+// file, regardless of how the process was started. Appends across restarts
+// (doesn't truncate) so a crash-and-restart doesn't erase the crash reason.
+func setupFileLogging() {
+	if err := os.MkdirAll("logs", 0o755); err != nil {
+		log.Printf("[STARTUP] could not create logs dir, file logging disabled: %v", err)
+		return
+	}
+	f, err := os.OpenFile(filepath.Join("logs", "backend.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		log.Printf("[STARTUP] could not open logs/backend.log, file logging disabled: %v", err)
+		return
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, f))
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.Printf("[STARTUP] file logging enabled -> logs/backend.log")
 }
 
 // loadEnv loads key=value pairs from a .env file into the environment.
@@ -136,6 +160,10 @@ func printStartupBanner(store *game.Store) {
 func main() {
 	// Must run before anything else — see anchorWorkingDir() doc comment.
 	anchorWorkingDir()
+
+	// Right after anchoring cwd (so "logs/" lands in backend/, not wherever
+	// the service happened to be launched from) and before anything else logs.
+	setupFileLogging()
 
 	// Load .env file (optional, real env vars take priority)
 	loadEnv(".env")
