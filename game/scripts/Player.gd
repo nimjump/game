@@ -140,7 +140,7 @@ var _god_key_held     := false
 var _j_key_held       := false
 var _k_key_held       := false
 var _h_key_held       := false
-var _show_hitbox      := true
+var _show_hitbox      := false
 var _hitbox_overlay_node : Node = null
 
 class _HitboxOverlay extends Node2D:

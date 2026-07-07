@@ -42,7 +42,7 @@ const PATROL_TIME  := 1.3
 # is wrong. Flip this to false (or delete this block) to turn the overlay off.
 const DEBUG_DRAW_BOUNDS := false
 # user request: sadece hitbox'ı (çarpışma alanını) göster, bounds/metin gürültüsü olmadan
-const DEBUG_DRAW_HITBOX := true
+const DEBUG_DRAW_HITBOX := false
 
 # ── State variables ──────────────────────────────────────────────────────────────────
 var _rng           : RandomNumberGenerator = RandomNumberGenerator.new()
