@@ -49,84 +49,130 @@ func today() string {
 // SetQuestRewardOverride below) and that override lives in BadgerDB.
 func (s *Store) DailyQuests(playerID string) []models.Quest {
 	day := today()
-	overrides := s.GetAppConfig().QuestRewardOverrides
+	cfg := s.GetAppConfig()
 	quests := make([]models.Quest, 5)
+	// used — pool indices already assigned to an earlier slot in THIS same
+	// 5-quest set. Passed into generateQuest so slot i+1 knows what slot i
+	// already took. See generateQuest's BUG FIX comment: without this, two
+	// of the 5 slots could independently hash to the same questPool index
+	// and the player would see the exact same quest twice in one day.
+	used := map[int]bool{}
 	for i := range quests {
-		quests[i] = generateQuest(playerID, day, i, overrides)
+		quests[i] = generateQuest(playerID, day, i, cfg.QuestRewardOverrides, cfg.QuestTargetOverrides, used)
 	}
 	return quests
 }
 
-// questRewardKey — the AppConfig.QuestRewardOverrides map key for a given
-// quest template, e.g. "score:1500". Stable across pool reordering since
-// it's based on (type, target), not the template's index in questPool.
-func questRewardKey(qtype models.QuestType, target int) string {
-	return fmt.Sprintf("%s:%d", qtype, target)
+// questPoolKey — the AppConfig override map key for a questPool entry,
+// identified by its POSITION in the pool (e.g. "idx:7").
+//
+// BUG FIX: this used to be keyed by (qtype, target) — e.g. "score:1500" —
+// which broke the moment an admin could edit the target itself: changing a
+// template's target from 1500 to 1800 silently orphaned any existing reward
+// override (still saved under the old "score:1500" key, never looked up
+// again since the pool entry now computes "score:1800"). Keying by pool
+// index instead makes target and reward overrides for the same template
+// independent of each other and of the current target value. questPool is a
+// fixed, hand-written slice (not persisted data), so index stability only
+// requires not reordering/removing entries in source — reordering the slice
+// literal would need re-mapping saved overrides, same as before.
+func questPoolKey(idx int) string {
+	return fmt.Sprintf("idx:%d", idx)
 }
 
 // QuestPoolEntry — one questPool template plus its admin-override status,
-// for the admin panel's quest-reward editor.
+// for the admin panel's quest-reward/target editor.
 type QuestPoolEntry struct {
+	Idx              int     `json:"idx"` // stable key for override calls — see questPoolKey
 	QuestType        string  `json:"quest_type"`
-	Target           int     `json:"target"`
+	Target           int     `json:"target"`         // effective — override if set, else default
+	DefaultTarget    int     `json:"default_target"`
 	Description      string  `json:"description"`
 	DefaultRewardNIM float64 `json:"default_reward_nim"`
 	RewardNIM        float64 `json:"reward_nim"` // effective — override if set, else default
-	Overridden       bool    `json:"overridden"`
+	Overridden       bool    `json:"overridden"`        // reward overridden
+	TargetOverridden bool    `json:"target_overridden"`
 }
 
 // QuestPoolWithOverrides — every template in questPool with its current
-// effective reward (admin override if present, else the hardcoded default).
+// effective reward AND target (admin override if present, else the
+// hardcoded default for each independently).
 func (s *Store) QuestPoolWithOverrides() []QuestPoolEntry {
-	overrides := s.GetAppConfig().QuestRewardOverrides
+	cfg := s.GetAppConfig()
+	rewardOverrides := cfg.QuestRewardOverrides
+	targetOverrides := cfg.QuestTargetOverrides
 	out := make([]QuestPoolEntry, 0, len(questPool))
-	for _, t := range questPool {
-		key := questRewardKey(t.qtype, t.target)
+	for i, t := range questPool {
+		key := questPoolKey(i)
+
 		reward := t.reward
-		overridden := false
-		if v, ok := overrides[key]; ok {
+		rewardOverridden := false
+		if v, ok := rewardOverrides[key]; ok {
 			reward = v
-			overridden = true
+			rewardOverridden = true
 		}
+
+		target := t.target
+		targetOverridden := false
+		if v, ok := targetOverrides[key]; ok {
+			target = v
+			targetOverridden = true
+		}
+
 		out = append(out, QuestPoolEntry{
+			Idx:              i,
 			QuestType:        string(t.qtype),
-			Target:           t.target,
+			Target:           target,
+			DefaultTarget:    t.target,
 			Description:      t.desc,
 			DefaultRewardNIM: t.reward,
 			RewardNIM:        reward,
-			Overridden:       overridden,
+			Overridden:       rewardOverridden,
+			TargetOverridden: targetOverridden,
 		})
 	}
 	return out
 }
 
 // SetQuestRewardOverride — admin-triggered. Sets (or, with rewardNIM == nil,
-// clears) the NIM reward for the questPool template matching (qtype, target).
-// Returns an error if no such template exists (typo-guard — the admin UI
-// should only ever send back (qtype, target) pairs it got from
-// QuestPoolWithOverrides, but this keeps a bad manual API call from silently
-// creating a dead override that never matches anything).
-func (s *Store) SetQuestRewardOverride(qtype string, target int, rewardNIM *float64) error {
-	found := false
-	for _, t := range questPool {
-		if string(t.qtype) == qtype && t.target == target {
-			found = true
-			break
-		}
+// clears) the NIM reward for the questPool entry at poolIdx.
+func (s *Store) SetQuestRewardOverride(poolIdx int, rewardNIM *float64) error {
+	if poolIdx < 0 || poolIdx >= len(questPool) {
+		return fmt.Errorf("no quest template at idx=%d", poolIdx)
 	}
-	if !found {
-		return fmt.Errorf("no quest template matches quest_type=%s target=%d", qtype, target)
-	}
-
 	cfg := s.GetAppConfig()
 	if cfg.QuestRewardOverrides == nil {
 		cfg.QuestRewardOverrides = map[string]float64{}
 	}
-	key := questRewardKey(models.QuestType(qtype), target)
+	key := questPoolKey(poolIdx)
 	if rewardNIM == nil {
 		delete(cfg.QuestRewardOverrides, key)
 	} else {
 		cfg.QuestRewardOverrides[key] = *rewardNIM
+	}
+	return s.SaveAppConfig(cfg)
+}
+
+// SetQuestTargetOverride — admin-triggered. Sets (or, with target == nil,
+// clears) the goal number for the questPool entry at poolIdx (e.g. change
+// "score:1500" template to require 1800). Independent of the reward
+// override — see questPoolKey's comment for why they no longer share a key.
+func (s *Store) SetQuestTargetOverride(poolIdx int, target *int) error {
+	if poolIdx < 0 || poolIdx >= len(questPool) {
+		return fmt.Errorf("no quest template at idx=%d", poolIdx)
+	}
+	if target != nil && *target <= 0 {
+		return fmt.Errorf("target must be > 0")
+	}
+	cfg := s.GetAppConfig()
+	if cfg.QuestTargetOverrides == nil {
+		cfg.QuestTargetOverrides = map[string]int{}
+	}
+	key := questPoolKey(poolIdx)
+	if target == nil {
+		delete(cfg.QuestTargetOverrides, key)
+	} else {
+		cfg.QuestTargetOverrides[key] = *target
 	}
 	return s.SaveAppConfig(cfg)
 }
@@ -194,18 +240,38 @@ var questPool = []questTemplate{
 }
 
 // generateQuest deterministically picks a quest for a specific player+day+slot.
-// overrides is AppConfig.QuestRewardOverrides (may be nil — just means no
-// admin overrides are active, every template uses its hardcoded default).
-func generateQuest(playerID, day string, idx int, overrides map[string]float64) models.Quest {
+// rewardOverrides/targetOverrides are AppConfig.QuestRewardOverrides /
+// QuestTargetOverrides (either may be nil — just means no admin override of
+// that kind is active, every template uses its hardcoded default).
+func generateQuest(playerID, day string, idx int, rewardOverrides map[string]float64, targetOverrides map[string]int, used map[int]bool) models.Quest {
 	h    := md5.Sum([]byte(fmt.Sprintf("%s:%s:%d", playerID, day, idx)))
 	seed := int(h[0])<<8 | int(h[1])
 
-	offset := (idx * (len(questPool) / 5)) % len(questPool)
-	t      := questPool[(seed+offset)%len(questPool)]
+	offset  := (idx * (len(questPool) / 5)) % len(questPool)
+	poolIdx := (seed + offset) % len(questPool)
+
+	// BUG FIX: seed is independent per idx (idx is part of the hash input),
+	// so with 39 pool entries and 5 slots there was ~23% chance (birthday
+	// paradox) that two slots landed on the same poolIdx — same quest type,
+	// target, and description assigned twice in one day's set of 5 (only
+	// the quest ID's idx-suffix differed, so the player just saw a visible
+	// duplicate). Deterministically probe forward to the next free pool
+	// slot instead of allowing a repeat within this player+day's set.
+	for used[poolIdx] {
+		poolIdx = (poolIdx + 1) % len(questPool)
+	}
+	used[poolIdx] = true
+
+	t   := questPool[poolIdx]
+	key := questPoolKey(poolIdx)
 
 	reward := t.reward
-	if v, ok := overrides[questRewardKey(t.qtype, t.target)]; ok {
+	if v, ok := rewardOverrides[key]; ok {
 		reward = v
+	}
+	target := t.target
+	if v, ok := targetOverrides[key]; ok {
+		target = v
 	}
 
 	ph   := md5.Sum([]byte(playerID))
@@ -215,7 +281,7 @@ func generateQuest(playerID, day string, idx int, overrides map[string]float64) 
 		ID:          id,
 		Type:        t.qtype,
 		Description: t.desc,
-		Target:      t.target,
+		Target:      target,
 		RewardNIM:   reward,
 		Day:         day,
 	}

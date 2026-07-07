@@ -79,35 +79,57 @@ func (s *Server) handleAdminQuestPool(ctx *fasthttp.RequestCtx) {
 }
 
 // POST /backend/admin/quest-reward
-// Body: {"quest_type":"score","target":1500,"reward_nim":5.0}
+// Body: {"idx":0,"reward_nim":5.0}
 // Omit reward_nim (or send null) to RESET that template back to its
 // hardcoded default reward instead of overriding it.
+// NOTE: keyed by pool index (`idx`, from QuestPoolWithOverrides), not
+// quest_type/target anymore — see questPoolKey's comment in game/quest.go.
 func (s *Server) handleAdminSetQuestReward(ctx *fasthttp.RequestCtx) {
 	var req struct {
-		QuestType string   `json:"quest_type"`
-		Target    int      `json:"target"`
+		Idx       int      `json:"idx"`
 		RewardNIM *float64 `json:"reward_nim"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
 		return
 	}
-	if req.QuestType == "" {
-		writeErr(ctx, 400, "quest_type is required")
-		return
-	}
 	if req.RewardNIM != nil && *req.RewardNIM < 0 {
 		writeErr(ctx, 400, "reward_nim must be >= 0")
 		return
 	}
-	if err := s.Store.SetQuestRewardOverride(req.QuestType, req.Target, req.RewardNIM); err != nil {
+	if err := s.Store.SetQuestRewardOverride(req.Idx, req.RewardNIM); err != nil {
 		writeErr(ctx, 400, err.Error())
 		return
 	}
 	if req.RewardNIM != nil {
-		log.Printf("[ADMIN] quest reward override set type=%s target=%d reward=%.4f NIM", req.QuestType, req.Target, *req.RewardNIM)
+		log.Printf("[ADMIN] quest reward override set idx=%d reward=%.4f NIM", req.Idx, *req.RewardNIM)
 	} else {
-		log.Printf("[ADMIN] quest reward override RESET type=%s target=%d", req.QuestType, req.Target)
+		log.Printf("[ADMIN] quest reward override RESET idx=%d", req.Idx)
+	}
+	writeJSON(ctx, 200, map[string]any{"quests": s.Store.QuestPoolWithOverrides()})
+}
+
+// POST /backend/admin/quest-target
+// Body: {"idx":0,"target":1800}
+// Omit target (or send null) to RESET that template back to its hardcoded
+// default target instead of overriding it.
+func (s *Server) handleAdminSetQuestTarget(ctx *fasthttp.RequestCtx) {
+	var req struct {
+		Idx    int  `json:"idx"`
+		Target *int `json:"target"`
+	}
+	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+		writeErr(ctx, 400, "bad_json")
+		return
+	}
+	if err := s.Store.SetQuestTargetOverride(req.Idx, req.Target); err != nil {
+		writeErr(ctx, 400, err.Error())
+		return
+	}
+	if req.Target != nil {
+		log.Printf("[ADMIN] quest target override set idx=%d target=%d", req.Idx, *req.Target)
+	} else {
+		log.Printf("[ADMIN] quest target override RESET idx=%d", req.Idx)
 	}
 	writeJSON(ctx, 200, map[string]any{"quests": s.Store.QuestPoolWithOverrides()})
 }

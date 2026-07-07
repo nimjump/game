@@ -38,8 +38,8 @@ const CONFIG_FILE_NAME := "config.cfg"
 #  Örnek:  const PROD_BASE := "https://api.nimjump.io"
 #  Örnek:  const PROD_BASE := "http://1.2.3.4:8080"
 # ════════════════════════════════════════════════════════════════════════
-const PROD_BASE     := "https://backbone.zetashare.com"   # <-- backend API URL'i
-const PROD_GAME_URL := "https://nimjump.zetashare.com"     # <-- oyunun public URL'i (share/replay/VS invite linkleri)
+const PROD_BASE     := "https://late-knives-bake.loca.lt"   # <-- backend API URL'i
+const PROD_GAME_URL := "https://late-knives-bake.loca.lt"     # <-- oyunun public URL'i (share/replay/VS invite linkleri)
 
 # Local-dev-only last-resort values. These are intentionally NOT "the"
 # production backend — real deployments must set NIMJUMP_API_BASE / --api=
@@ -198,6 +198,79 @@ func _trim_slash(u: String) -> String:
 	while u.ends_with("/"):
 		u = u.substr(0, u.length() - 1)
 	return u
+
+
+# ── App-origin request signing ──────────────────────────────────────────────
+# Every request to /backend/* (except CORS preflight, which the browser
+# sends on its own) must carry a fresh app_ts/app_sig pair — an HMAC-SHA256
+# over the request path + timestamp, keyed by a secret shared with the
+# backend (see backend/handlers/appsig.go — APP_SIGNING_KEY there MUST match
+# the one below exactly). Enforced server-side in main.go's corsMiddleware
+# for every non-admin /backend route.
+#
+# Honesty note: this key is compiled into the exported client, which anyone
+# can download — it is NOT unextractable from a determined reverse-
+# engineer, because no secret shipped to every visitor's browser/binary can
+# be. What it reliably does: reject the overwhelming majority of scripts/
+# bots/scanners that hit our JSON endpoints directly without ever having run
+# the real game, since a request with no signature (or a wrong/expired one)
+# never reaches a single handler.
+const APP_SIGNING_KEY := "nJ9x!kQ7vR2vT8pL0zC5wA1sD4fG6hJ3kM9nB7vX2cQ5wE8rT1yU4iO7pA0sD3fG"
+
+## Appends app_ts/app_sig query params to a full backend URL (already
+## containing scheme+host+path+optional existing query string). Call this
+## around EVERY /backend/* request the client makes — HTTP or the vsroom
+## live/watch WebSocket URLs (those start as a plain HTTP GET before
+## upgrading, so the same server-side check applies to them too).
+func sign_url(url: String) -> String:
+	var path := url
+	var qs_idx := url.find("?")
+	if qs_idx >= 0:
+		path = url.substr(0, qs_idx)
+	# Strip scheme+host so the signed path is stable regardless of which
+	# host/port the backend happens to be reached at (dev vs prod) — only
+	# the "/backend/..." part is ever actually signed, matching exactly
+	# what the server reads via ctx.Path().
+	var backend_idx := path.find("/backend")
+	var signed_path := path.substr(backend_idx) if backend_idx >= 0 else path
+	var ts := int(Time.get_unix_time_from_system())
+	var msg := signed_path + ":" + str(ts)
+	var crypto := Crypto.new()
+	var sig : PackedByteArray = crypto.hmac_digest(HashingContext.HASH_SHA256, APP_SIGNING_KEY.to_utf8_buffer(), msg.to_utf8_buffer())
+	var sep := "&" if qs_idx >= 0 else "?"
+	return url + sep + "app_ts=" + str(ts) + "&app_sig=" + sig.hex_encode()
+
+
+## Additional listener you can connect to any HTTPRequest's
+## request_completed signal ALONGSIDE your own normal handler (Godot signals
+## support multiple listeners — this doesn't replace or consume anything).
+## Fires one clear, actionable "check your device's clock" toast on the
+## specific `clock_skew` rejection (backend/handlers/appsig.go — the
+## signature is otherwise correct, just outside the accepted time window),
+## instead of every call site across the codebase separately surfacing it
+## as a generic "network error".
+##
+## Usage: http.request_completed.connect(ApiConfig.check_clock_skew)
+##        (in addition to your own .connect(func(...): ...) for that request)
+var _clock_skew_toast_shown_at : float = -1000.0
+const _CLOCK_SKEW_TOAST_COOLDOWN := 15.0  # seconds — avoid spamming if several requests fail in a burst
+
+func check_clock_skew(_result: int, code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	if code != 403 or body.size() == 0: return
+	var j := JSON.new()
+	if j.parse(body.get_string_from_utf8()) != OK: return
+	var d = j.get_data()
+	if typeof(d) == TYPE_DICTIONARY and str(d.get("error", "")) == "clock_skew":
+		_maybe_show_clock_skew_toast()
+
+func _maybe_show_clock_skew_toast() -> void:
+	var now := Time.get_ticks_msec() / 1000.0
+	if now - _clock_skew_toast_shown_at < _CLOCK_SKEW_TOAST_COOLDOWN:
+		return
+	_clock_skew_toast_shown_at = now
+	var t := Toast.get_instance()
+	if t:
+		t.show_toast("Your device's clock looks incorrect — please check your date & time settings, then try again.", Toast.Kind.WARN)
 
 
 ## Share score via Web Share API (mobile native sheet) or clipboard fallback.

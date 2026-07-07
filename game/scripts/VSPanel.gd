@@ -6,12 +6,17 @@ extends CanvasLayer
 ## Flow reminder (see backend/game/vsroom.go for the authoritative state
 ## machine): create room (pay if entry>0) → play your round (fixed seed) →
 ## share invite link → opponent joins, pays, plays → whoever finishes last
-## (or the 24h sweep) settles the pot. Everything here is just HTTP polling —
-## there is no live/real-time connection, by design.
+## (or the 24h sweep) settles the pot. The room list/detail views here are
+## just HTTP polling. The one exception is live spectating: while a
+## participant is actively playing their round, the room is flagged `live`
+## (see backend/handlers/vs_live.go) and a "Watch Live" button appears,
+## emitting watch_requested so Main.gd can open the actual WebSocket-backed
+## spectator view (VSSpectator.gd).
 
 signal closed
 signal play_requested(room_id: String, role: String, seed: String)
 signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int)
+signal watch_requested(room_id: String)
 
 var BACKEND_URL : String = ApiConfig.base_url()
 const UITheme    := preload("res://scripts/UITheme.gd")
@@ -969,6 +974,9 @@ func _make_room_row(r: Dictionary, ref: float) -> Control:
 		UITheme.apply_label(entry_amt_lbl, _COL_TEXT_DARK, int(ref * 0.026))
 		top_row.add_child(entry_amt_lbl)
 
+	if bool(r.get("live", false)):
+		top_row.add_child(_make_live_badge(ref))
+
 	var status_lbl := Label.new()
 	status_lbl.text = _status_text(r)
 	UITheme.apply_label(status_lbl, _COL_TEXT_MID, int(ref * 0.022))
@@ -976,6 +984,26 @@ func _make_room_row(r: Dictionary, ref: float) -> Control:
 
 	row.add_child(UITheme.lucide_icon("arrow-right", int(ref * 0.024), _COL_TEXT_MID))
 	return card
+
+
+## Small red "● LIVE" pill — shown wherever a room is currently being
+## streamed by whoever's playing their round (see `live` field, populated
+## server-side from backend/handlers/vs_live.go's in-memory relay state).
+func _make_live_badge(ref: float) -> Control:
+	var wrap := PanelContainer.new()
+	var sb := StyleBoxFlat.new()
+	sb.bg_color = Color(0.85, 0.15, 0.15, 1.0)
+	sb.set_corner_radius_all(int(ref * 0.02))
+	sb.content_margin_left   = ref * 0.014
+	sb.content_margin_right  = ref * 0.014
+	sb.content_margin_top    = ref * 0.004
+	sb.content_margin_bottom = ref * 0.004
+	wrap.add_theme_stylebox_override("panel", sb)
+	var lbl := Label.new()
+	lbl.text = "● LIVE"
+	UITheme.apply_label(lbl, Color(1, 1, 1), int(ref * 0.02))
+	wrap.add_child(lbl)
+	return wrap
 
 
 func _status_text(r: Dictionary) -> String:
@@ -1208,6 +1236,20 @@ func _render_room_detail(r: Dictionary, ref: float) -> void:
 	UITheme.apply_label(status_lbl, _COL_ICON, int(ref * 0.026))
 	cv.add_child(status_lbl)
 
+	if bool(r.get("live", false)):
+		var watch_row := HBoxContainer.new()
+		watch_row.add_theme_constant_override("separation", int(ref * 0.010))
+		cv.add_child(watch_row)
+		watch_row.add_child(_make_live_badge(ref))
+		var watch_btn := Button.new()
+		watch_btn.text = "Watch Live"
+		watch_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		_warm_btn(watch_btn, 8)
+		watch_row.add_child(watch_btn)
+		watch_btn.pressed.connect(func():
+			watch_requested.emit(room_id)
+		)
+
 	var my_txt : String = str(my_score) if my_score != null else "—"
 	var opp_txt : String = str(opp_score) if opp_score != null else "—"
 	var opp_addr2 : String = str(r.get("opponent_id" if is_creator else "creator_id", ""))
@@ -1422,6 +1464,7 @@ func _create_room(entry_nim: float, is_private: bool, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -1431,7 +1474,7 @@ func _create_room(entry_nim: float, is_private: bool, cb: Callable) -> void:
 			cb.call(false)
 	)
 	var body_str := JSON.stringify({"entry_nim": entry_nim, "is_private": is_private})
-	http.request(BACKEND_URL + "/backend/vsroom/create", _headers(true), HTTPClient.METHOD_POST, body_str)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/create"), _headers(true), HTTPClient.METHOD_POST, body_str)
 
 
 ## Public browse list — open rooms anyone can join (private rooms never
@@ -1440,6 +1483,7 @@ func _fetch_open(cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -1449,7 +1493,7 @@ func _fetch_open(cb: Callable) -> void:
 				return
 		cb.call([])
 	)
-	http.request(BACKEND_URL + "/backend/vsroom/open", _headers())
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/open"), _headers())
 
 
 ## Appends a "Load more" button to `container` if fewer than `total` rooms
@@ -1485,6 +1529,7 @@ func _fetch_mine(offset: int, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -1495,13 +1540,14 @@ func _fetch_mine(offset: int, cb: Callable) -> void:
 				return
 		cb.call([], 0)
 	)
-	http.request(BACKEND_URL + "/backend/vsroom/mine?limit=%d&offset=%d" % [_MINE_PAGE_SIZE, offset], _headers())
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/mine?limit=%d&offset=%d" % [_MINE_PAGE_SIZE, offset]), _headers())
 
 
 func _fetch_room(room_id: String, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -1518,13 +1564,14 @@ func _fetch_room(room_id: String, cb: Callable) -> void:
 				return
 		cb.call(false, {})
 	)
-	http.request(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode(), _headers())
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode()), _headers())
 
 
 func _join_room(room_id: String, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -1538,19 +1585,20 @@ func _join_room(room_id: String, cb: Callable) -> void:
 				return
 		cb.call(false, {})
 	)
-	http.request(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/join", _headers(true), HTTPClient.METHOD_POST, "{}")
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/join"), _headers(true), HTTPClient.METHOD_POST, "{}")
 
 
 func _confirm_payment(room_id: String, tx_hash: String, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 20.0   # RPC lookup server-side can take a moment
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		cb.call(result == HTTPRequest.RESULT_SUCCESS and code == 200)
 	)
 	var body_str := JSON.stringify({"tx_hash": tx_hash})
-	http.request(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/pay", _headers(true), HTTPClient.METHOD_POST, body_str)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/pay"), _headers(true), HTTPClient.METHOD_POST, body_str)
 
 
 # ── Mutual forfeit ───────────────────────────────────────────────────────────
@@ -1563,6 +1611,7 @@ func _request_forfeit(room_id: String, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -1572,7 +1621,7 @@ func _request_forfeit(room_id: String, cb: Callable) -> void:
 				return
 		cb.call(false, {})
 	)
-	http.request(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/forfeit", _headers(true), HTTPClient.METHOD_POST, "{}")
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/forfeit"), _headers(true), HTTPClient.METHOD_POST, "{}")
 
 
 # ── Watch replay ─────────────────────────────────────────────────────────────
@@ -1589,6 +1638,7 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if not is_instance_valid(btn): return
@@ -1616,7 +1666,7 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 		hide_panel.call_deferred()
 		closed.emit.call_deferred()
 	)
-	http.request(BACKEND_URL + "/backend/replay/" + session_id_e, _headers())
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/replay/" + session_id_e), _headers())
 
 
 # ── Nimiq avatars ────────────────────────────────────────────────────────────

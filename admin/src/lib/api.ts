@@ -469,12 +469,15 @@ export async function saveAppConfig(patch: Partial<{
 // ── Quest reward pool (admin-editable NIM rewards per quest template) ──────────
 
 export interface QuestPoolEntry {
+  idx: number; // stable key for setQuestReward/setQuestTarget calls
   quest_type: string;
-  target: number;
+  target: number;         // effective — override if set, else default
+  default_target: number;
   description: string;
   default_reward_nim: number;
   reward_nim: number; // effective — override if set, else default
-  overridden: boolean;
+  overridden: boolean;         // reward overridden
+  target_overridden: boolean;
 }
 
 export async function fetchQuestPool(): Promise<QuestPoolEntry[]> {
@@ -485,13 +488,25 @@ export async function fetchQuestPool(): Promise<QuestPoolEntry[]> {
 }
 
 // Pass rewardNIM = null to reset that template back to its hardcoded default.
-export async function setQuestReward(questType: string, target: number, rewardNIM: number | null): Promise<QuestPoolEntry[]> {
+export async function setQuestReward(idx: number, rewardNIM: number | null): Promise<QuestPoolEntry[]> {
   const r = await fetch(`${BASE}/backend/admin/quest-reward`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ quest_type: questType, target, reward_nim: rewardNIM }),
+    body: JSON.stringify({ idx, reward_nim: rewardNIM }),
   });
   if (!r.ok) throw new Error("quest reward save failed");
+  const d = await r.json();
+  return d.quests ?? [];
+}
+
+// Pass target = null to reset that template's goal number back to default.
+export async function setQuestTarget(idx: number, target: number | null): Promise<QuestPoolEntry[]> {
+  const r = await fetch(`${BASE}/backend/admin/quest-target`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ idx, target }),
+  });
+  if (!r.ok) throw new Error("quest target save failed");
   const d = await r.json();
   return d.quests ?? [];
 }
@@ -833,6 +848,10 @@ export interface VSRoom {
   expires_at: number;
   creator_forfeit_requested?: boolean;
   opponent_forfeit_requested?: boolean;
+  // Live — true while a participant is actively streaming their run via the
+  // live relay (backend/handlers/vs_live.go). Transient — computed fresh on
+  // every response, never persisted.
+  live?: boolean;
 }
 
 // fetchVSRooms — paginated: a single player can open unlimited paid rooms,

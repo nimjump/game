@@ -728,6 +728,16 @@ function initGodotGame() {
       canvas.height=Math.round(rect.height*dpr);
       if(DEV) window._earlyLog('DPR capped: '+dpr.toFixed(2)+' (native='+(window.devicePixelRatio||1).toFixed(2)+')');
     }
+    // Diagnostic: catch real WebGL context-lost events. Won't catch a hard
+    // process-level crash, but if the Firefox/webview crash is a recoverable
+    // context loss rather than a full process kill, this finally gives us a
+    // visible log line instead of a silent reload.
+    canvas.addEventListener('webglcontextlost', function(e){
+      e.preventDefault();
+      console.error('WEBGL_CONTEXT_LOST', e);
+      if (window._earlyLog) window._earlyLog('❌ WEBGL_CONTEXT_LOST','#f55');
+      if (window._enqueueLog) window._enqueueLog('error', 'WEBGL_CONTEXT_LOST');
+    }, false);
   })();
 
   if (typeof Engine === 'undefined') {
@@ -736,11 +746,20 @@ function initGodotGame() {
   }
 
   // Better WebGL context for WebView
+  // NOTE: desynchronized:true is disabled on Firefox/Gecko. It skips
+  // compositor vsync to reduce input latency, but on Gecko (and some
+  // WebKit-based system webviews) this has been the trigger for a GPU
+  // process crash right at first-frame/framebuffer allocation, which
+  // Firefox then "recovers" from by silently reloading the page — no JS
+  // error, no time to flush logs. Chrome/Blink tolerates it fine, hence
+  // the Chrome-works/Firefox-crashes split. Disabling it only costs a
+  // tiny bit of input latency, not real rendering performance.
+  var _isGecko = /Firefox/i.test(navigator.userAgent) && !/Seamonkey/i.test(navigator.userAgent);
   var _origCtx=HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext=function(type,attrs){
     if(type==='webgl2'||type==='webgl'||type==='webgl-experimental'){
       attrs=Object.assign({
-        powerPreference:'high-performance', desynchronized:true,
+        powerPreference:'high-performance', desynchronized: !_isGecko,
         preserveDrawingBuffer:false, antialias:false,
         depth:true, stencil:false, alpha:false,
       },attrs||{});

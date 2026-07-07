@@ -261,6 +261,7 @@ func _fetch_prizes_then_lb() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 5.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -273,7 +274,7 @@ func _fetch_prizes_then_lb() -> void:
 				_weekly_prizes = [wp.get("first", 500.0), wp.get("second", 300.0), wp.get("third", 100.0)]
 		_fetch_lb()
 	)
-	http.request(BACKEND_URL + "/backend/leaderboard/prizes")
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/leaderboard/prizes"))
 
 
 func _fetch_lb() -> void:
@@ -281,6 +282,7 @@ func _fetch_lb() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 6.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -291,7 +293,7 @@ func _fetch_lb() -> void:
 		_show_error("Could not connect to server. Code: %d" % code)
 		Toast.network_error("leaderboard code=%d" % code)
 	)
-	http.request(BACKEND_URL + "/backend/leaderboard?period=%s&limit=10" % _cur_period)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/leaderboard?period=%s&limit=10" % _cur_period))
 
 
 ## ── Warm bej buton helper'ları ─────────────────────────────────────────────
@@ -803,6 +805,7 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 	add_child(http)
 	_replay_cancelled    = false
 	_pending_replay_http = http
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		_pending_replay_http = null
 		http.queue_free()
@@ -841,7 +844,7 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 		hide_panel.call_deferred()
 		closed.emit.call_deferred()
 	)
-	http.request(BACKEND_URL + "/backend/replay/" + session_id_e)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/replay/" + session_id_e))
 
 
 func _request_connect(btn: Button, _lbl: Label) -> void:

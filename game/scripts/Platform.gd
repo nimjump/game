@@ -53,7 +53,12 @@ func setup(ptype: PlatformType, texture: Texture2D, plat_size: Vector2, broken_t
 	_normal_tex   = texture
 	_break_tex    = broken_tex
 	# Breaks with fewer jumps as difficulty increases: 6 → 3
-	MAX_JUMPS = max(3, int(6 - diff * 3))
+	# NOTE: int() truncates rather than rounds, so 6 - diff*3 was dropping a
+	# full jump the instant diff left 0.0 (score 0 → 1 already crossed the
+	# 6→5 boundary). round() moves each cutoff to the midpoint (diff ≈ 0.167,
+	# 0.5, 0.833 → score ≈ 500, 1500, 2500) so the drop happens once, in the
+	# middle of each difficulty band, instead of at the very first point.
+	MAX_JUMPS = max(3, int(round(6.0 - diff * 3.0)))
 
 	var rect := RectangleShape2D.new()
 	rect.size = plat_size
@@ -260,6 +265,7 @@ func _start_break() -> void:
 	_breaking    = true
 	_break_timer = BREAK_TIME
 	collision_layer = 0
+
 	emit_signal("platform_broke")
 	_spawn_debris()
 

@@ -33,9 +33,15 @@ var CHAR_STATS : Array[Dictionary] = []
 var is_dead        := false
 var _manual_tick   := false
 var _game_manager  : Node  = null  # GM reference — for manual platform collision
-# PL-01: cached GM properties — avoid .get() overhead every tick
-var _gm_plat_w     : float = 0.0
-var _gm_plat_h     : float = 0.0
+# NOT cached on purpose: PLATFORM_W/PLATFORM_H are read directly from
+# _game_manager every tick in the landing-check block below. This used to be
+# cached here (PL-01) to skip two float reads a tick — a negligible saving —
+# but caching state that outlives a single tick, on a Player node that
+# persists across repeated replay views in the same page session, is exactly
+# the class of bug this whole file has been fighting (see the _prev_velocity_y
+# and _was_on_floor fixes elsewhere). Every cache here is one more place a
+# reset can be forgotten. Reading directly costs nothing measurable and can
+# never go stale.
 var _visual_tick   : int  = 0    # increments each physics frame for visual fx (sin waves etc)
 # _visual_time — real elapsed seconds (delta-accumulated), NOT a tick count.
 # The jetpack/wings "running out" glow pulse used to drive its sine wave off
@@ -172,6 +178,20 @@ var _visual_rng       : RandomNumberGenerator = RandomNumberGenerator.new()  # v
 
 var _was_on_floor     := false
 var _prev_velocity_y  := 0.0
+# DETERMINISM FIX: snapshot of velocity.y taken at the very start of this
+# tick, i.e. the TRUE previous tick's final velocity. is_stomping() must use
+# this instead of _prev_velocity_y — that variable gets overwritten with
+# THIS tick's post-physics velocity at the bottom of simulate_tick(), and
+# GameManager runs `player.simulate_tick()` BEFORE `for e in _enemies:
+# e.simulate_tick()` in the same tick. So by the time an enemy calls
+# is_stomping() (from its own simulate_tick(), later in the same GM tick),
+# _prev_velocity_y no longer holds "last tick's velocity" — it already holds
+# "this tick's velocity", which can be a freshly-bounced upward value if the
+# player landed on a platform earlier in this same tick. That misclassifies
+# a legitimate stomp as a non-stomp (or vice versa). _tick_entry_velocity_y
+# is captured before ANY of this tick's physics runs, so it's stable and
+# correct regardless of what happens to velocity later in the same tick.
+var _tick_entry_velocity_y := 0.0
 var _trail_timer      := 0.0
 const TRAIL_INTERVAL  := 0.04
 const TRAIL_TICKS      := 5   # ticks between trail spawns (≈ TRAIL_INTERVAL at 60fps)
@@ -507,28 +527,46 @@ func activate() -> void:
 	is_dead      = false
 	velocity     = Vector2.ZERO
 	_initialized = true
-	# BUG FIX: _gm_plat_w/_gm_plat_h (PL-01 cache, see field decl above) were
-	# only ever populated ONCE per Player node lifetime (guarded by
-	# `if _gm_plat_w == 0.0`) and never invalidated. The Player node is NOT
-	# recreated between replay plays in the same page session (seek_to_tick /
-	# start_replay_external explicitly skip freeing it), so once cached, a
-	# stale PLATFORM_W/H silently kept being used for every subsequent replay
-	# watched in that session — even though GameManager legitimately
-	# recomputes PLATFORM_W/H from VW/VH on every new session (line ~249 in
-	# GameManager.gd). If the viewport/canvas size settles to a slightly
-	# different value between the first replay watched right after page load
-	# and later replays watched without a full refresh, the manual AABB
-	# landing check (_physics_process, ~line 690) used the WRONG platform
-	# half-width/height for those later plays — producing a different
-	# landing/break result for the exact same replay log, purely depending on
-	# whether it was the first replay played this session or not. Refreshing
-	# the page (which recreates the Player node) reset the cache and made the
-	# result match the server's headless replay again — exactly the symptom
-	# reported. Fix: reset the cache here, so every new game/replay session
-	# re-reads the current, correct PLATFORM_W/H instead of trusting a value
-	# that may be from a stale viewport size.
-	_gm_plat_w = 0.0
-	_gm_plat_h = 0.0
+	# NOTE: PLATFORM_W/PLATFORM_H used to be cached here (see field comment
+	# above) with a reset-on-activate() as a bandaid. There's no cache left
+	# to reset anymore — the landing check now reads _game_manager.PLATFORM_W/H
+	# directly every tick, so this class of bug can't happen again.
+
+	# BUG FIX (the real "first jump sometimes doesn't count" bug): landing on
+	# a platform only calls on_player_landed() — the thing that actually
+	# increments the platform's break counter — if `_prev_velocity_y > _vh *
+	# 0.0625` (see the landing block, ~line 758). _prev_velocity_y was NEVER
+	# reset here, same stale-across-replay-plays class of bug as the
+	# PLATFORM_W/H cache above: since the Player node persists across
+	# repeated replay views in the same page session, this variable kept
+	# whatever value it had at the exact instant the PREVIOUS replay ended
+	# (could be anything — mid-fall, mid-jump, any sign/magnitude). On the
+	# very first landing of a NEW replay, THAT leftover value — not the
+	# current run's own fall speed — decided whether this gate passed. If it
+	# happened to sit below the threshold, the first landing was silently
+	# never counted at all, requiring one fewer real bounce to reach
+	# MAX_JUMPS on that platform — exactly the "first jump sometimes counted
+	# by the platform, sometimes not" behavior reported, independent of any
+	# float-boundary tie-break. Reset it here so every new game/replay
+	# starts this gate clean, just like a live "Play Again" full scene
+	# reload already does for free (since that path recreates Player from
+	# scratch, defaults included) — this only mattered for the
+	# no-scene-reload replay-viewing path.
+	_prev_velocity_y = 0.0
+	# Same reason as _prev_velocity_y above — this is the newer sibling
+	# variable used by is_stomping(); must not leak a value from whatever
+	# replay/session ran before this one.
+	_tick_entry_velocity_y = 0.0
+
+	# DEFENSIVE: same stale-across-replay-views risk class as the two fixes
+	# above — _was_on_floor drives just_landed/just_jumped edge detection
+	# (~line 798-800). Currently only feeds squash/stretch VFX (cosmetic), so
+	# this isn't a confirmed score/determinism bug today, but it's one future
+	# gameplay hook away from becoming one, and it costs nothing to reset it
+	# alongside the other two so every new game/replay starts every
+	# landing-adjacent gate from a clean, identical state.
+	_was_on_floor = false
+
 	if !_is_headless:
 		_anim_sprite.scale = Vector2(0.28, 0.28)
 		_anim_sprite.play("stand")
@@ -572,6 +610,10 @@ func _physics_process(delta: float) -> void:
 func simulate_tick() -> void:
 	const delta := 1.0 / 60.0   # fixed delta — deterministic physics independent of frame drops
 	if is_dead or not _initialized: return
+
+	# DETERMINISM FIX: capture the true previous-tick velocity BEFORE this
+	# tick changes it. See the comment on _tick_entry_velocity_y above.
+	_tick_entry_velocity_y = velocity.y
 
 	# PL-02: _gm_in_replay cached — re-read each tick (replay mode can change mid-game)
 	# Direct field access avoids .get() string lookup
@@ -706,11 +748,10 @@ func simulate_tick() -> void:
 
 		# PL-01: direct field access — avoids .get() string hash every tick
 		var platforms : Array = _game_manager._platforms
-		if _gm_plat_w == 0.0:
-			_gm_plat_w = _game_manager.PLATFORM_W
-			_gm_plat_h = _game_manager.PLATFORM_H
-		var pw : float = _gm_plat_w
-		var ph : float = _gm_plat_h
+		# NOT cached — read live every tick (see field-declaration comment).
+		var pw : float = _game_manager.PLATFORM_W
+		var ph : float = _game_manager.PLATFORM_H
+		const LAND_EPS := 0.05
 		if platforms != null:
 			for plat in platforms:
 				if not is_instance_valid(plat): continue
@@ -726,7 +767,19 @@ func simulate_tick() -> void:
 				# condition: was above (or inside) plat top in prev frame AND now at or below plat top
 				# Extended: p_bottom_prev <= plat_bottom covers the case where player
 				# tunneled through the entire platform thickness in one tick.
-				if p_bottom_prev <= plat_bottom and p_bottom >= plat_top:
+				#
+				# HARDENING: added a tiny epsilon (0.05px in this game's virtual
+				# coordinate space) to both sides of the comparison. This was a
+				# STRICT boundary check on continuously-accumulated floats —
+				# exactly on the tick where the player's swept segment just
+				# grazes plat_top (most likely right at spawn, when the player
+				# starts sitting exactly ON the platform with zero gap), a
+				# sub-0.01-unit rounding difference could flip "landed" from
+				# true to false or vice versa on that one tick, which is
+				# indistinguishable from a real missed/extra landing from the
+				# outside. The epsilon makes the tie resolve the same way
+				# every time instead of being exactly on the knife's edge.
+				if p_bottom_prev <= plat_bottom + LAND_EPS and p_bottom >= plat_top - LAND_EPS:
 					# Land on platform top
 					global_position.y = plat_top - p_hh
 					landed = true
@@ -742,7 +795,21 @@ func simulate_tick() -> void:
 	if landed:
 		velocity.y = JUMP_SPEED * (1.35 if _jump_boost else 1.0)
 		emit_signal("jumped")
-		if _prev_velocity_y > _vh * 0.0625:
+		# BUG FIX: this gate used to require _prev_velocity_y > _vh * 0.0625 —
+		# i.e. "must have been falling reasonably fast" — before counting the
+		# landing toward the platform's break counter at all. Reported bug:
+		# jumping UP onto a platform at a steep/shallow angle (arc barely
+		# clears the platform's top edge before immediately coming back down
+		# onto it) legitimately lands with only a SMALL fall velocity — that
+		# real, physical landing was silently never counted, so platforms
+		# reached this way could never break no matter how many times you
+		# actually bounced on them. The gate conflated "how far did I fall
+		# before touching down" with "did I actually land" — those aren't the
+		# same thing, and only the latter should matter. Lowered to a tiny
+		# epsilon that only filters out the genuine non-cases (moving upward,
+		# or exactly stationary — floating-point noise, not a real landing),
+		# without rejecting legitimate shallow-arc landings.
+		if _prev_velocity_y > 0.001:
 			if _landed_collider and _landed_collider.has_method("on_player_landed"):
 				_landed_collider.on_player_landed()
 
@@ -955,7 +1022,12 @@ func full_heal() -> void:
 
 
 func is_stomping() -> bool:
-	return _prev_velocity_y > _vh * 0.04
+	# DETERMINISM FIX: was reading _prev_velocity_y, but by the time an enemy
+	# calls this (later in the same GM tick, after player.simulate_tick() has
+	# already run and already overwritten _prev_velocity_y with THIS tick's
+	# outcome), that no longer means "previous tick". Use the tick-entry
+	# snapshot instead — see _tick_entry_velocity_y declaration.
+	return _tick_entry_velocity_y > _vh * 0.04
 
 
 func hit_enemy() -> void:
@@ -967,6 +1039,13 @@ func hit_enemy() -> void:
 		_glow_state = -1
 		emit_signal("collected_item", "shield_lost")
 		_hurt_flash = 0.8
+		# BUG FIX: real damage below grants _invincible = 1.2 so a persistent
+		# hazard (standing on a spike, sitting in overlapping rain/dirt damage
+		# across multiple ticks) can't hit twice in a row. Losing the shield
+		# used to skip this entirely — the very next tick, still overlapping
+		# the same hazard, would find has_shield already false and take a
+		# REAL life immediately. Shield break now gets the same grace window.
+		_invincible = 1.2
 		if is_instance_valid(_anim_sprite): _anim_sprite.play("hurt")
 		return
 	lives -= 1

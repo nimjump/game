@@ -129,7 +129,7 @@ func (s *Server) handleAdminDevice(ctx *fasthttp.RequestCtx) {
 func (s *Server) handleAdminOverview(ctx *fasthttp.RequestCtx) {
 	all := s.Store.List(false, 0)
 
-	var pendingCount, activeCount, completedCount, flaggedCount int
+	var completedCount, flaggedCount int
 
 	type summary struct {
 		SessionID   string `json:"session_id"`
@@ -147,31 +147,21 @@ func (s *Server) handleAdminOverview(ctx *fasthttp.RequestCtx) {
 		ElapsedSec  int64  `json:"elapsed_sec,omitempty"`
 	}
 
+	// activeSessions / "pending" / "active" counts — this used to track
+	// mid-match sessions via the StatePending state (GameStartedAt set,
+	// not yet submitted). Removed: no session was ever actually saved with
+	// StatePending (see game/store.go's comment for why), so this always
+	// showed 0 active sessions regardless of how many people were really
+	// playing. activeSessions stays permanently empty and is kept in the
+	// response below only so an admin frontend reading these JSON keys
+	// doesn't break.
 	activeSessions := make([]summary, 0)
 	submitted := make([]summary, 0)
-	nowMs := time.Now().UnixMilli()
 
 	for _, sess := range all {
 		state := string(sess.State)
-		elapsed := int64(0)
 
 		switch sess.State {
-		case models.StatePending:
-			if sess.GameStartedAt > 0 {
-				activeCount++
-				state = "active"
-				elapsed = (nowMs - sess.GameStartedAt) / 1000
-				activeSessions = append(activeSessions, summary{
-					SessionID:  sess.SessionID,
-					PlayerID:   sess.PlayerID,
-					Nickname:   sess.Nickname,
-					State:      "active",
-					CreatedAt:  sess.CreatedAt,
-					ElapsedSec: elapsed,
-				})
-			} else {
-				pendingCount++
-			}
 		case models.StateCompleted:
 			completedCount++
 		case models.StateFlagged:
@@ -192,7 +182,6 @@ func (s *Server) handleAdminOverview(ctx *fasthttp.RequestCtx) {
 				Reason:      sess.Reason,
 				CreatedAt:   sess.CreatedAt,
 				SubmittedAt: sess.SubmittedAt,
-				ElapsedSec:  elapsed,
 			})
 		}
 	}
@@ -246,8 +235,8 @@ func (s *Server) handleAdminOverview(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, map[string]any{
 		"counts": map[string]any{
 			"total":          len(all),
-			"pending":        pendingCount,
-			"active":         activeCount,
+			"pending":        0, // see handleAdminOverview's activeSessions comment — dead concept, kept for API shape
+			"active":         0, // see handleAdminOverview's activeSessions comment — dead concept, kept for API shape
 			"completed":      completedCount,
 			"flagged":        flaggedCount,
 			"replay_failed":  replayFailedCount,
@@ -294,7 +283,6 @@ func (s *Server) handleAdminSessions(ctx *fasthttp.RequestCtx) {
 	}
 
 	all := s.Store.List(false, 0)
-	nowMs := time.Now().UnixMilli()
 
 	type sessionOut struct {
 		SessionID   string `json:"session_id"`
@@ -316,11 +304,11 @@ func (s *Server) handleAdminSessions(ctx *fasthttp.RequestCtx) {
 	var out []sessionOut
 	for _, sess := range all {
 		state := string(sess.State)
+		// ElapsedSec / "active" state — used to reflect a mid-match session
+		// via StatePending+GameStartedAt. Removed along with that dead state
+		// (see game/store.go's comment); ElapsedSec is now always 0 but kept
+		// in the struct/JSON for API-shape stability.
 		elapsed := int64(0)
-		if sess.State == models.StatePending && sess.GameStartedAt > 0 {
-			state = "active"
-			elapsed = (nowMs - sess.GameStartedAt) / 1000
-		}
 
 		// state (string) and sess.Flagged (bool) are meant to always agree,
 		// but a few code paths over time have updated one without the other

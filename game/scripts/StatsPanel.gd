@@ -39,6 +39,7 @@ func setup(gm: Node) -> void:
 	_gm = gm
 	_http = HTTPRequest.new()
 	add_child(_http)
+	_http.request_completed.connect(ApiConfig.check_clock_skew)
 	_http.request_completed.connect(_on_stats_response)
 	_build_ui()
 	hide()
@@ -635,17 +636,18 @@ func _refresh() -> void:
 	if is_instance_valid(_http) and _http.get_http_client_status() == HTTPClient.STATUS_DISCONNECTED:
 		var headers : PackedStringArray = []
 		headers.append("Authorization: Bearer " + _auth_token)
-		_http.request(url, headers)
+		_http.request(ApiConfig.sign_url(url), headers)
 
 	# Fetch reward history
 	if _player_id != "" and _player_id != "Guest":
 		if not is_instance_valid(_http_rewards):
 			_http_rewards = HTTPRequest.new()
 			add_child(_http_rewards)
+			_http_rewards.request_completed.connect(ApiConfig.check_clock_skew)
 			_http_rewards.request_completed.connect(_on_rewards_response)
 		if _http_rewards.get_http_client_status() == HTTPClient.STATUS_DISCONNECTED:
 			var rurl := BACKEND_URL + "/backend/rewards/history?player_id=" + _player_id.uri_encode()
-			_http_rewards.request(rurl, PackedStringArray(["Authorization: Bearer " + _auth_token]))
+			_http_rewards.request(ApiConfig.sign_url(rurl), PackedStringArray(["Authorization: Bearer " + _auth_token]))
 
 
 func _on_stats_response(_result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
@@ -945,6 +947,7 @@ func _fetch_and_watch(session_id: String, btn: Button) -> void:
 	http.timeout = 10.0
 	add_child(http)
 
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if not is_instance_valid(btn):
@@ -986,7 +989,7 @@ func _fetch_and_watch(session_id: String, btn: Button) -> void:
 
 	var url     := BACKEND_URL + "/backend/replay/" + session_id.uri_encode()
 	var headers := PackedStringArray(["Authorization: Bearer " + _auth_token])
-	http.request(url, headers)
+	http.request(ApiConfig.sign_url(url), headers)
 
 
 # ---------------------------------------------------------------------------

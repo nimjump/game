@@ -227,6 +227,7 @@ func _fetch_quests() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -241,7 +242,7 @@ func _fetch_quests() -> void:
 	var headers : PackedStringArray = []
 	if _auth_token != "":
 		headers.append("Authorization: Bearer " + _auth_token)
-	http.request(BACKEND_URL + "/backend/quests?player_id=" + _player_id.uri_encode(), headers)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/quests?player_id=" + _player_id.uri_encode()), headers)
 
 
 func _claim_quest(quest_id: String, claim_btn: Button) -> void:
@@ -263,6 +264,7 @@ func _claim_quest(quest_id: String, claim_btn: Button) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -282,7 +284,7 @@ func _claim_quest(quest_id: String, claim_btn: Button) -> void:
 	var headers : PackedStringArray = ["Content-Type: application/json"]
 	if _auth_token != "":
 		headers.append("Authorization: Bearer " + _auth_token)
-	http.request(BACKEND_URL + "/backend/quests/claim_all", headers, HTTPClient.METHOD_POST, body_str)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/quests/claim_all"), headers, HTTPClient.METHOD_POST, body_str)
 
 
 # ── Quest listesi ─────────────────────────────────────────────────

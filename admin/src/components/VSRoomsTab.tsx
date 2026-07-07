@@ -209,6 +209,15 @@ export default function VSRoomsTab() {
                 <td style={{ padding: "10px 14px", fontFamily: "monospace", fontSize: 12 }}>
                   {r.id}
                   {r.is_private && <span style={{ marginLeft: 6, fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase" }}>private</span>}
+                  {r.live && (
+                    <span style={{
+                      marginLeft: 6, fontSize: 10, fontWeight: 700, color: "#fff",
+                      background: "var(--red, #d32f2f)", borderRadius: 4, padding: "1px 6px",
+                      textTransform: "uppercase", letterSpacing: "0.03em",
+                    }} title="Someone is actively playing this round right now — streaming live">
+                      ● live
+                    </span>
+                  )}
                 </td>
                 <td style={{ padding: "10px 14px" }}>{r.entry_nim > 0 ? `${nim(r.entry_nim)} NIM` : "Free"}</td>
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>

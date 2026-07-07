@@ -77,6 +77,7 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/admin/device-breakdown",        s.requireAdminSession(s.handleAdminDeviceBreakdown))
 	r.GET("/backend/admin/quest-pool",              s.requireAdminSession(s.handleAdminQuestPool))
 	r.POST("/backend/admin/quest-reward",           s.requireAdminSession(s.handleAdminSetQuestReward))
+	r.POST("/backend/admin/quest-target",           s.requireAdminSession(s.handleAdminSetQuestTarget))
 	r.POST("/backend/admin/replays/clear-all",      s.requireAdminSession(s.handleAdminClearAllReplays))
 	r.GET("/backend/admin/replay-binary",           s.requireAdminSession(s.handleAdminReplayBinaryStatus))
 	r.POST("/backend/admin/replay-binary",          s.requireAdminSession(s.handleAdminReplayBinaryUpload))
@@ -143,11 +144,9 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/rewards/history",           rl(s.handleRewardHistory))
 	r.POST("/backend/client-log",               rl(s.handleClientLog))
 
-	// VS — real-time 1v1 (legacy, dormant — kept in case it's revived)
-	r.POST("/backend/vs/join",                  rl(s.handleVSJoin))
-	r.GET("/backend/vs/ws/{room_id}",           s.handleVSWebSocket)  // no rate-limit — WS upgrade
-
-	// VS Rooms — async 1v1 challenge with optional NIM entry fee
+	// VS Rooms — async 1v1 challenge with optional NIM entry fee, plus a
+	// live spectator relay (see vs_live.go) for whichever side is currently
+	// playing their round.
 	r.POST("/backend/vsroom/create",            rl(s.handleVSRoomCreate))
 	r.GET("/backend/vsroom/mine",               rl(s.handleVSRoomMine))
 	r.GET("/backend/vsroom/open",               rl(s.handleVSRoomOpen))
@@ -156,6 +155,12 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/vsroom/{id}/pay",          rl(s.handleVSRoomConfirmPayment))
 	r.POST("/backend/vsroom/{id}/cancel",       rl(s.handleVSRoomCancel))
 	r.POST("/backend/vsroom/{id}/forfeit",      rl(s.handleVSRoomForfeit))
+	// Rate-limited like every other route (guards the handshake itself
+	// against reconnect-storm/scan abuse — the already-open WS connection's
+	// own frame traffic afterward is unaffected). Origin is separately
+	// checked at upgrade time in vs_live.go's CheckOrigin.
+	r.GET("/backend/vsroom/{id}/live",          rl(s.handleVSRoomLivePlay))  // player streams their run
+	r.GET("/backend/vsroom/{id}/watch",         rl(s.handleVSRoomLiveWatch)) // spectator
 	r.GET("/backend/admin/vs-rooms",                     s.requireAdminSession(s.handleAdminVSRooms))
 	r.POST("/backend/admin/vs-rooms/sweep",              s.requireAdminSession(s.handleAdminVSRoomsSweep))
 	r.POST("/backend/admin/vs-rooms/reconcile-payments", s.requireAdminSession(s.handleAdminVSRoomsReconcile))
@@ -164,6 +169,16 @@ func (s *Server) Register(r *router.Router) {
 
 // StartBackgroundServices — starts retry loop, balance monitor, and the
 // Cloudflare IP list refresher. Called from main.go
+//
+// BUG FIX: game.StartLeaderboardPayoutLoop() (auto-pays daily/weekly winners
+// every 15 min) was fully implemented but never actually called from here —
+// so leaderboard winners were only ever paid if an admin manually hit
+// /bj/leaderboard/pay-winners, silently, forever. Now started alongside the
+// other background services.
+//
+// (There used to also be a StartCleanupLoop() call queued up for stale
+// "pending" sessions — removed along with the rest of the dead StatePending
+// code; see game/store.go's comment for why that state was never reachable.)
 func (s *Server) StartBackgroundServices() {
 	s.Store.StartRewardQueue()
 	s.Store.StartRetryLoop()
@@ -172,8 +187,9 @@ func (s *Server) StartBackgroundServices() {
 	s.Store.StartDeployJobScheduler()
 	s.Store.StartVSRoomSweep()
 	s.Store.StartVSPaymentReconciler()
+	s.Store.StartLeaderboardPayoutLoop()
 	StartCloudflareIPRefresher()
-	log.Printf("[STARTUP] background services started (retry loop + balance monitor + update scheduler + deploy job scheduler + vs room sweep + vs payment reconciler + cloudflare ip refresher)")
+	log.Printf("[STARTUP] background services started (retry loop + balance monitor + update scheduler + deploy job scheduler + vs room sweep + vs payment reconciler + leaderboard payout loop + cloudflare ip refresher)")
 }
 
 // GET /backend/developer-mode — public, read-only status endpoint. Also

@@ -34,8 +34,25 @@ func _ready() -> void:
 	_vh = GameConstants.VH
 	collision_layer = 4
 	collision_mask  = 1
-	monitoring  = true
-	monitorable = true
+	# DETERMINISM FIX: pickup is handled exclusively by GameManager's
+	# tick-accurate loop — _check_interactables() finds overlap with a plain
+	# AABB/circle test against the player's tick position and then manually
+	# calls _on_body_entered() (see GameManager._trigger_interactable() and
+	# _register_interactable(), which itself does `area.monitoring = false`
+	# right after every item is spawned). That means Area2D's own physics-
+	# server collision detection was never actually meant to be used for
+	# gameplay: it fires once per RENDERED FRAME, not once per simulation
+	# tick, so it's frame-rate/frame-timing dependent and can behave
+	# differently between live play and any replay or headless run.
+	# Previously this connected body_entered AND left monitoring on in
+	# _ready(), relying on GameManager to turn it back off a few lines later
+	# in every spawn path — true today, but one forgotten `monitoring = false`
+	# in a future spawn path (or any spawn order change) would silently bring
+	# back frame-based, non-deterministic pickups. Defaulting monitoring off
+	# and never connecting the signal removes that whole class of risk instead
+	# of relying on every caller remembering to disable it.
+	monitoring  = false
+	monitorable = false
 
 	# CollisionShape2D is always added — required for mechanics in headless mode
 	var cs := CircleShape2D.new()
@@ -44,7 +61,6 @@ func _ready() -> void:
 	col.shape = cs
 	add_child(col)
 
-	body_entered.connect(_on_body_entered)
 	add_to_group("items")
 
 	# Do not create any visual nodes in headless mode

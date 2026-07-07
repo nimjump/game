@@ -9,7 +9,6 @@ import (
 type SessionState string
 
 const (
-	StatePending      SessionState = "pending"
 	StateCompleted    SessionState = "completed"
 	StateFlagged      SessionState = "flagged"
 	StateReplayFailed SessionState = "replay_failed"
@@ -19,22 +18,21 @@ const (
 // Seed is stored as int64 in DB but serialized as string in JSON
 // (JS float64 precision loss: 2^53 < max int64).
 type Session struct {
-	SessionID     string
-	Seed          int64
-	State         SessionState
-	PlayerID      string // nimiq address
-	Nickname      string // display name (first 8 chars)
-	ClientScore   int
-	ServerScore   int
-	Ticks         int
-	Char          int
-	PlayerSeed    int64
-	Log           string
-	Flagged       bool
-	Reason        string
-	CreatedAt     int64
-	SubmittedAt   int64
-	GameStartedAt int64  // unix ms — client sends in encrypted payload; backend checks ticks/60 vs elapsed
+	SessionID      string
+	Seed           int64
+	State          SessionState
+	PlayerID       string // nimiq address
+	Nickname       string // display name (first 8 chars)
+	ClientScore    int
+	ServerScore    int
+	Ticks          int
+	Char           int
+	PlayerSeed     int64
+	Log            string
+	Flagged        bool
+	Reason         string
+	CreatedAt      int64
+	SubmittedAt    int64
 	TotalKills     int
 	TotalPlatforms int
 	ReplayError    string // non-empty when replay simulation failed after all retries
@@ -61,7 +59,6 @@ type sessionJSON struct {
 	Reason         string       `json:"reason,omitempty"`
 	CreatedAt      int64        `json:"created_at"`
 	SubmittedAt    int64        `json:"submitted_at,omitempty"`
-	GameStartedAt  int64        `json:"game_started_at,omitempty"`
 	TotalKills     int          `json:"total_kills,omitempty"`
 	TotalPlatforms int          `json:"total_platforms,omitempty"`
 	ReplayError    string       `json:"replay_error,omitempty"`
@@ -71,22 +68,26 @@ type sessionJSON struct {
 }
 
 // sessionLegacyJSON is for reading old DB records where seed was stored as number.
+//
+// NOTE: old records on disk may still contain a "game_started_at" key from
+// before that field was removed from the Go model — json.Unmarshal simply
+// ignores JSON keys with no matching struct field, so those old bytes decode
+// fine here, the value is just dropped.
 type sessionLegacyJSON struct {
-	SessionID     string       `json:"session_id"`
-	Seed          int64        `json:"seed"`
-	State         SessionState `json:"state"`
-	PlayerID      string       `json:"player_id,omitempty"`
-	Nickname      string       `json:"nickname,omitempty"`
-	ClientScore   int          `json:"client_score"`
-	ServerScore   int          `json:"server_score"`
-	Ticks         int          `json:"ticks"`
-	Char          int          `json:"char"`
-	Log           string       `json:"log,omitempty"`
-	Flagged       bool         `json:"flagged"`
-	Reason        string       `json:"reason,omitempty"`
-	CreatedAt     int64        `json:"created_at"`
-	SubmittedAt   int64        `json:"submitted_at,omitempty"`
-	GameStartedAt int64        `json:"game_started_at,omitempty"`
+	SessionID   string       `json:"session_id"`
+	Seed        int64        `json:"seed"`
+	State       SessionState `json:"state"`
+	PlayerID    string       `json:"player_id,omitempty"`
+	Nickname    string       `json:"nickname,omitempty"`
+	ClientScore int          `json:"client_score"`
+	ServerScore int          `json:"server_score"`
+	Ticks       int          `json:"ticks"`
+	Char        int          `json:"char"`
+	Log         string       `json:"log,omitempty"`
+	Flagged     bool         `json:"flagged"`
+	Reason      string       `json:"reason,omitempty"`
+	CreatedAt   int64        `json:"created_at"`
+	SubmittedAt int64        `json:"submitted_at,omitempty"`
 }
 
 func (s Session) MarshalJSON() ([]byte, error) {
@@ -110,7 +111,6 @@ func (s Session) MarshalJSON() ([]byte, error) {
 		Reason:         s.Reason,
 		CreatedAt:      s.CreatedAt,
 		SubmittedAt:    s.SubmittedAt,
-		GameStartedAt:  s.GameStartedAt,
 		TotalKills:     s.TotalKills,
 		TotalPlatforms: s.TotalPlatforms,
 		ReplayError:    s.ReplayError,
@@ -146,7 +146,6 @@ func (s *Session) UnmarshalJSON(data []byte) error {
 			s.Reason         = j.Reason
 			s.CreatedAt      = j.CreatedAt
 			s.SubmittedAt    = j.SubmittedAt
-			s.GameStartedAt  = j.GameStartedAt
 			s.TotalKills     = j.TotalKills
 			s.TotalPlatforms = j.TotalPlatforms
 			s.ReplayError    = j.ReplayError
@@ -161,20 +160,19 @@ func (s *Session) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &leg); err != nil {
 		return err
 	}
-	s.SessionID     = leg.SessionID
-	s.Seed          = leg.Seed
-	s.State         = leg.State
-	s.PlayerID      = leg.PlayerID
-	s.Nickname      = leg.Nickname
-	s.ClientScore   = leg.ClientScore
-	s.ServerScore   = leg.ServerScore
-	s.Ticks         = leg.Ticks
-	s.Char          = leg.Char
-	s.Log           = leg.Log
-	s.Flagged       = leg.Flagged
-	s.Reason        = leg.Reason
-	s.CreatedAt     = leg.CreatedAt
-	s.SubmittedAt   = leg.SubmittedAt
-	s.GameStartedAt = leg.GameStartedAt
+	s.SessionID   = leg.SessionID
+	s.Seed        = leg.Seed
+	s.State       = leg.State
+	s.PlayerID    = leg.PlayerID
+	s.Nickname    = leg.Nickname
+	s.ClientScore = leg.ClientScore
+	s.ServerScore = leg.ServerScore
+	s.Ticks       = leg.Ticks
+	s.Char        = leg.Char
+	s.Log         = leg.Log
+	s.Flagged     = leg.Flagged
+	s.Reason      = leg.Reason
+	s.CreatedAt   = leg.CreatedAt
+	s.SubmittedAt = leg.SubmittedAt
 	return nil
 }

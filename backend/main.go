@@ -353,13 +353,76 @@ func corsMiddleware(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 				// together with credentials. Only matters when the admin app
 				// runs standalone in dev (ADMIN_PORT, not proxied through
 				// this backend); in production the proxy makes everything
-				// same-origin and this reflection is moot.
+				// same-origin and this reflection is moot. Gated by the same
+				// allowlist as the public API below — reflecting an
+				// arbitrary Origin back with credentials enabled would
+				// otherwise let ANY website ride the admin's session cookie.
 				if origin := string(ctx.Request.Header.Peek("Origin")); origin != "" {
+					if !handlers.IsAllowedOrigin(origin) {
+						ctx.SetStatusCode(fasthttp.StatusForbidden)
+						ctx.SetBodyString(`{"error":"origin_not_allowed"}`)
+						return
+					}
 					ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
 					ctx.Response.Header.Set("Access-Control-Allow-Credentials", "true")
 				}
 			} else {
-				ctx.Response.Header.Set("Access-Control-Allow-Origin", "*")
+				// Public game API — no wildcard anymore. A real browser
+				// always sends a genuine Origin on cross-origin requests, so
+				// this reliably blocks other websites'/apps' JS from calling
+				// our API even though it can't stop a non-browser script
+				// that simply forges the header (see origin.go's doc
+				// comment — there's no way around that for a public client).
+				if origin := string(ctx.Request.Header.Peek("Origin")); origin != "" {
+					if !handlers.IsAllowedOrigin(origin) {
+						ctx.SetStatusCode(fasthttp.StatusForbidden)
+						ctx.SetBodyString(`{"error":"origin_not_allowed"}`)
+						return
+					}
+					ctx.Response.Header.Set("Access-Control-Allow-Origin", origin)
+				}
+				// No Origin header at all (native export, some in-app
+				// WebViews, server-to-server) — nothing to validate or
+				// reflect; falls through to the app-signature check below,
+				// which is the real, always-on gate for this class of
+				// request.
+				//
+				// App-signature check — every real (non-preflight) request
+				// to the public API must carry app_ts/app_sig, a fresh
+				// HMAC computed by the actual game client (see
+				// ApiConfig.gd's sign_url()). This is the one check that
+				// applies uniformly regardless of Origin/WebView/native —
+				// see appsig.go's doc comment for exactly what it does and
+				// doesn't guarantee. Skipped for OPTIONS so CORS preflight
+				// (which browsers send with no say from our own request
+				// code) is never itself blocked by this.
+				// /backend/client-log is exempt: it's a fire-and-forget error
+				// logger called from raw JS in the page's <head> bootstrap
+				// (index.html), before Godot/GDScript (and therefore
+				// ApiConfig.sign_url()) is even running — including it
+				// would mean the one thing meant to catch early bootstrap
+				// failures could never actually be called during them.
+				// Low stakes either way: it's a write-only diagnostic sink,
+				// still behind the Origin check above and the rate limiter.
+				if string(ctx.Method()) != "OPTIONS" && path != "/backend/client-log" {
+					ts := string(ctx.QueryArgs().Peek("app_ts"))
+					sig := string(ctx.QueryArgs().Peek("app_sig"))
+					switch handlers.VerifyAppSignature(path, ts, sig) {
+					case handlers.AppSigClockSkew:
+						// A real client, correct secret, just a wrong system
+						// clock — tell it exactly that (distinct error code)
+						// so the game can show one clear, actionable toast
+						// instead of a generic "network error" (see
+						// ApiConfig.gd's wrap_completed()).
+						ctx.SetStatusCode(fasthttp.StatusForbidden)
+						ctx.SetBodyString(`{"error":"clock_skew"}`)
+						return
+					case handlers.AppSigInvalid:
+						ctx.SetStatusCode(fasthttp.StatusForbidden)
+						ctx.SetBodyString(`{"error":"app_signature_invalid"}`)
+						return
+					}
+				}
 			}
 			ctx.Response.Header.Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 			ctx.Response.Header.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")

@@ -40,6 +40,22 @@ var auth_expires_at : int = 0   # unix timestamp
 # instead of letting them race.
 var _signing_in_progress := false
 
+# BUG FIX: NimiqBridge is a plain child node created fresh every time Main.gd
+# runs (see Main._ready(), and "Play Again" -> get_tree().reload_current_scene()
+# recreating Main.gd — and this bridge with it — every single round). Each
+# fresh instance starts with auth_token=="" / auth_verified==false and only
+# regains them once _try_restore_session()'s async HTTP call to
+# /backend/auth/me resolves. Main._on_play_pressed() checks `_auth_token ==
+# ""` the INSTANT Play is pressed — with no way to tell "restore is still in
+# flight, this will be true in a moment" apart from "genuinely never signed
+# in" apart from this flag. Without it, a fast enough Play press right after
+# a round restarts (very plausible — nothing stops the player from tapping
+# Play again immediately) wins the race against the restore call and
+# re-triggers a full new sign challenge even though the session was already
+# perfectly valid — this is exactly the intermittent (network-timing-
+# dependent) "sometimes asks to sign again mid-session" bug reported.
+var _restoring_session := false
+
 
 func _ready() -> void:
 	if OS.has_feature("web"):
@@ -171,12 +187,15 @@ func _try_restore_session() -> void:
 	var token  = JavaScriptBridge.eval("localStorage.getItem('%s')" % LS_AUTH_TOKEN, true)
 	var pid    = JavaScriptBridge.eval("localStorage.getItem('%s')" % LS_AUTH_PID, true)
 	if token == null or str(token) == "null" or str(token) == "": return
+	_restoring_session = true
 	# Ask backend if token is valid
 	var http := HTTPRequest.new()
 	http.timeout = 5.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
+		_restoring_session = false  # resolved one way or another — see field comment above
 		# Network error / timeout — backend unreachable, do not touch token
 		if result != HTTPRequest.RESULT_SUCCESS or code == 0:
 			var stored_exp : int = int(str(JavaScriptBridge.eval("parseInt(localStorage.getItem('nj_auth_exp') || '0', 10)", true)))
@@ -223,7 +242,7 @@ func _try_restore_session() -> void:
 		auth_expires_at = 0
 		# poll() is waiting on auth_verified — it will call _do_sign_auth() when loop ends
 	)
-	http.request(BACKEND_URL + "/backend/auth/me?token=" + str(token).uri_encode())
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/auth/me?token=" + str(token).uri_encode()))
 
 
 ## Releases the _signing_in_progress lock and (optionally) emits auth_failed.
@@ -280,6 +299,7 @@ func _do_sign_auth() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
@@ -299,7 +319,7 @@ func _do_sign_auth() -> void:
 		# 2. Call window.nimiq.sign(challenge)
 		_sign_and_verify(challenge)
 	)
-	http.request(BACKEND_URL + "/backend/auth/challenge")
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/auth/challenge"))
 
 
 ## Calls window.nimiq.sign() and sends result to backend
@@ -345,6 +365,7 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if auth_verified or _active_verify_challenge != challenge:
@@ -425,7 +446,7 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 		"screen":        screen_str,
 		"dpr":           dpr_str,
 	})
-	http.request(BACKEND_URL + "/backend/auth/verify",
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/auth/verify"),
 		["Content-Type: application/json"], HTTPClient.METHOD_POST, body)
 
 
@@ -435,6 +456,7 @@ func _register_wallet_async(player_id: String, address: String) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, _b):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
@@ -446,7 +468,7 @@ func _register_wallet_async(player_id: String, address: String) -> void:
 	var reg_headers := PackedStringArray(["Content-Type: application/json"])
 	if auth_token != "":
 		reg_headers.append("Authorization: Bearer " + auth_token)
-	http.request(BACKEND_URL + "/backend/wallet/register",
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/wallet/register"),
 		reg_headers, HTTPClient.METHOD_POST, body)
 
 

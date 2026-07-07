@@ -4,7 +4,7 @@ import {
   fetchAppConfig, saveAppConfig, setUpdateMode, completeUpdate, clearAllReplays,
   fetchReplayBinaryStatus, uploadReplayBinary, deleteReplayBinaryFile,
   fetchGoldenReplays, deleteGoldenReplay, runGoldenSelfTest, fetchDeterminismLint,
-  fetchQuestPool, setQuestReward,
+  fetchQuestPool, setQuestReward, setQuestTarget,
   type AppConfig, type ReplayBinaryStatus, type GoldenReplay, type GoldenReplayResult,
   type DeterminismFinding, type QuestPoolEntry,
 } from "@/lib/api";
@@ -37,19 +37,20 @@ export default function SystemTab() {
   // ── Quest reward overrides ──────────────────────────────────────────
   const [questPool,   setQuestPool]   = useState<QuestPoolEntry[]>([]);
   const [questLoading,setQuestLoading]= useState(true);
-  const [questInputs, setQuestInputs] = useState<Record<string, string>>({});
-  const [questSavingKey, setQuestSavingKey] = useState<string | null>(null);
-
-  const questKey = (q: { quest_type: string; target: number }) => `${q.quest_type}:${q.target}`;
+  const [questInputs, setQuestInputs] = useState<Record<number, string>>({});
+  const [targetInputs, setTargetInputs] = useState<Record<number, string>>({});
+  const [questSavingKey, setQuestSavingKey] = useState<string | null>(null); // `${idx}:reward` or `${idx}:target`
 
   const loadQuestPool = async () => {
     setQuestLoading(true);
     try {
       const quests = await fetchQuestPool();
       setQuestPool(quests);
-      const inputs: Record<string, string> = {};
-      for (const q of quests) inputs[questKey(q)] = String(q.reward_nim);
+      const inputs: Record<number, string> = {};
+      const targets: Record<number, string> = {};
+      for (const q of quests) { inputs[q.idx] = String(q.reward_nim); targets[q.idx] = String(q.target); }
       setQuestInputs(inputs);
+      setTargetInputs(targets);
     } catch {
       // non-fatal — quest rewards panel just stays empty
     } finally {
@@ -61,18 +62,23 @@ export default function SystemTab() {
     setQuestPool(quests);
     setQuestInputs(prev => {
       const next = { ...prev };
-      for (const q of quests) next[questKey(q)] = String(q.reward_nim);
+      for (const q of quests) next[q.idx] = String(q.reward_nim);
+      return next;
+    });
+    setTargetInputs(prev => {
+      const next = { ...prev };
+      for (const q of quests) next[q.idx] = String(q.target);
       return next;
     });
   }
 
   async function doSaveQuestReward(q: QuestPoolEntry) {
-    const key = questKey(q);
-    const n = parseFloat(questInputs[key]);
+    const key = `${q.idx}:reward`;
+    const n = parseFloat(questInputs[q.idx]);
     if (!Number.isFinite(n) || n < 0) { alert("Reward must be a number ≥ 0."); return; }
     setQuestSavingKey(key);
     try {
-      syncQuestInputs(await setQuestReward(q.quest_type, q.target, n));
+      syncQuestInputs(await setQuestReward(q.idx, n));
     } catch (e) {
       alert("Error: " + String(e));
     } finally {
@@ -81,10 +87,36 @@ export default function SystemTab() {
   }
 
   async function doResetQuestReward(q: QuestPoolEntry) {
-    const key = questKey(q);
+    const key = `${q.idx}:reward`;
     setQuestSavingKey(key);
     try {
-      syncQuestInputs(await setQuestReward(q.quest_type, q.target, null));
+      syncQuestInputs(await setQuestReward(q.idx, null));
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setQuestSavingKey(null);
+    }
+  }
+
+  async function doSaveQuestTarget(q: QuestPoolEntry) {
+    const key = `${q.idx}:target`;
+    const n = parseInt(targetInputs[q.idx], 10);
+    if (!Number.isFinite(n) || n <= 0) { alert("Target must be a whole number > 0."); return; }
+    setQuestSavingKey(key);
+    try {
+      syncQuestInputs(await setQuestTarget(q.idx, n));
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setQuestSavingKey(null);
+    }
+  }
+
+  async function doResetQuestTarget(q: QuestPoolEntry) {
+    const key = `${q.idx}:target`;
+    setQuestSavingKey(key);
+    try {
+      syncQuestInputs(await setQuestTarget(q.idx, null));
     } catch (e) {
       alert("Error: " + String(e));
     } finally {
@@ -423,29 +455,51 @@ export default function SystemTab() {
             </thead>
             <tbody>
               {questPool.map(q => {
-                const key = questKey(q);
-                const busy = questSavingKey === key;
+                const rewardKey = `${q.idx}:reward`;
+                const targetKey = `${q.idx}:target`;
+                const rewardBusy = questSavingKey === rewardKey;
+                const targetBusy = questSavingKey === targetKey;
                 return (
-                  <tr key={key}>
+                  <tr key={q.idx}>
                     <td style={{ fontFamily: "monospace", fontSize: 11 }}>{q.quest_type}</td>
-                    <td style={{ fontSize: 12 }}>{q.target}</td>
-                    <td style={{ fontSize: 12 }}>{q.description}</td>
-                    <td style={{ fontSize: 12, color: "var(--text-muted)" }}>{q.default_reward_nim}</td>
                     <td>
-                      <input type="number" min={0} step="any" value={questInputs[key] ?? ""}
-                        onChange={e => setQuestInputs(prev => ({ ...prev, [key]: e.target.value }))}
+                      <input type="number" min={1} step={1} value={targetInputs[q.idx] ?? ""}
+                        onChange={e => setTargetInputs(prev => ({ ...prev, [q.idx]: e.target.value }))}
+                        style={{ width: 70, padding: "3px 6px", fontSize: 12 }} />
+                      {q.target_overridden && <span className="badge badge-yellow" style={{ fontSize: 10, marginLeft: 4 }}>ovr</span>}
+                      <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                        <button className="btn" style={{ fontSize: 10, padding: "1px 6px" }}
+                          disabled={targetBusy || targetInputs[q.idx] === String(q.target)}
+                          onClick={() => doSaveQuestTarget(q)}>
+                          {targetBusy ? "…" : "Save"}
+                        </button>
+                        {q.target_overridden && (
+                          <button className="btn" style={{ fontSize: 10, padding: "1px 6px" }}
+                            disabled={targetBusy} onClick={() => doResetQuestTarget(q)}>
+                            Reset
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                    <td style={{ fontSize: 12 }}>{q.description}</td>
+                    <td style={{ fontSize: 12, color: "var(--text-muted)" }}>
+                      target {q.default_target} / {q.default_reward_nim} NIM
+                    </td>
+                    <td>
+                      <input type="number" min={0} step="any" value={questInputs[q.idx] ?? ""}
+                        onChange={e => setQuestInputs(prev => ({ ...prev, [q.idx]: e.target.value }))}
                         style={{ width: 80, padding: "3px 6px", fontSize: 12 }} />
                       {q.overridden && <span className="badge badge-yellow" style={{ fontSize: 10, marginLeft: 6 }}>overridden</span>}
                     </td>
                     <td style={{ display: "flex", gap: 6 }}>
                       <button className="btn" style={{ fontSize: 11, padding: "2px 8px" }}
-                        disabled={busy || questInputs[key] === String(q.reward_nim)}
+                        disabled={rewardBusy || questInputs[q.idx] === String(q.reward_nim)}
                         onClick={() => doSaveQuestReward(q)}>
-                        {busy ? "…" : "Save"}
+                        {rewardBusy ? "…" : "Save"}
                       </button>
                       {q.overridden && (
                         <button className="btn" style={{ fontSize: 11, padding: "2px 8px" }}
-                          disabled={busy} onClick={() => doResetQuestReward(q)}>
+                          disabled={rewardBusy} onClick={() => doResetQuestReward(q)}>
                           Reset
                         </button>
                       )}

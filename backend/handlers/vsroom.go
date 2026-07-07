@@ -85,7 +85,24 @@ func (s *Server) handleVSRoomGet(ctx *fasthttp.RequestCtx) {
 	// before playing their own round. Strip it unless the caller is actually
 	// one of the room's two participants.
 	viewRoom := game.StripVSSeed(*room, playerID)
+	viewRoom.Live = IsVSRoomLive(viewRoom.ID)
 	resp := map[string]any{"ok": true, "room": viewRoom, "invite_url": vsRoomInviteURL(room.ID)}
+
+	// While the room is actually live, hand out the real seed + a signed
+	// watch ticket regardless of participant status. This isn't a new leak:
+	// watching the live input stream itself already fully reveals the
+	// platform/enemy layout in real time as it plays out, seed number or
+	// not, so gating the raw seed specifically no longer protects anything
+	// once a round is genuinely in progress — the StripVSSeed protection
+	// above still fully applies before anyone's played (waiting_opponent /
+	// awaiting_*_play with nobody streaming yet), which is the case that
+	// actually matters (scouting the layout before your own attempt).
+	if viewRoom.Live {
+		viewRoomWithSeed := viewRoom
+		viewRoomWithSeed.Seed = room.Seed
+		resp["room"] = viewRoomWithSeed
+		resp["watch_ticket"] = MakeWatchTicket(viewRoom.ID)
+	}
 
 	// If the caller is a participant who still needs to pay, include the same
 	// pay_to/pay_amount/pay_memo fields create/join return — lets the panel
@@ -214,6 +231,9 @@ func (s *Server) handleVSRoomMine(ctx *fasthttp.RequestCtx) {
 		writeErr(ctx, 500, "list_failed")
 		return
 	}
+	for i := range rooms {
+		rooms[i].Live = IsVSRoomLive(rooms[i].ID)
+	}
 	writeJSON(ctx, 200, map[string]any{
 		"ok": true, "rooms": rooms, "total": total, "offset": offset, "limit": limit,
 	})
@@ -240,6 +260,7 @@ func (s *Server) handleVSRoomOpen(ctx *fasthttp.RequestCtx) {
 	rooms := make([]models.VSRoom, len(page))
 	for i, r := range page {
 		rooms[i] = game.StripVSSeed(r, "")
+		rooms[i].Live = IsVSRoomLive(rooms[i].ID)
 	}
 	writeJSON(ctx, 200, map[string]any{
 		"ok": true, "rooms": rooms, "total": total, "offset": offset, "limit": limit,
@@ -275,6 +296,9 @@ func (s *Server) handleAdminVSRooms(ctx *fasthttp.RequestCtx) {
 	}
 	limit, offset := queryPage(ctx, 100)
 	rooms, total := game.PaginateVSRooms(all, limit, offset)
+	for i := range rooms {
+		rooms[i].Live = IsVSRoomLive(rooms[i].ID)
+	}
 	writeJSON(ctx, 200, map[string]any{
 		"ok": true, "rooms": rooms, "total": total, "offset": offset, "limit": limit,
 	})

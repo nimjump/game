@@ -66,6 +66,13 @@ type VSRoom struct {
 
 	CreatedAt int64 `json:"created_at"`
 	ExpiresAt int64 `json:"expires_at"` // CreatedAt + 24h
+
+	// Live — true while a participant is actively streaming their run via
+	// the live relay (see backend/handlers/vs_live.go). Transient — computed
+	// fresh on every response (handlers.IsVSRoomLive), never persisted to
+	// BadgerDB, so this deliberately has no json tag omitempty concerns; it's
+	// always set to the current truth right before serialization.
+	Live bool `json:"live"`
 }
 
 // IsFree — true if this room has no entry fee (pure friendly match).

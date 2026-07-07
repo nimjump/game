@@ -51,10 +51,19 @@ type AppConfig struct {
 	DailyEarnCapNIM float64 `json:"daily_earn_cap_nim,omitempty"`
 
 	// QuestRewardOverrides — admin-editable NIM reward per quest template,
-	// keyed by "<questType>:<target>" (e.g. "score:1500"), overriding the
-	// hardcoded reward in questPool (game/quest.go). A key with no entry
-	// here just uses questPool's default. See effectiveQuestReward().
+	// keyed by "idx:<poolIndex>" (the template's position in questPool, see
+	// questPoolKey in game/quest.go — NOT "<questType>:<target>" anymore,
+	// since the target itself is now independently overridable via
+	// QuestTargetOverrides below and a target-keyed map would orphan itself
+	// the moment an admin changed that same template's target). A key with
+	// no entry here just uses questPool's hardcoded default reward.
 	QuestRewardOverrides map[string]float64 `json:"quest_reward_overrides,omitempty"`
+
+	// QuestTargetOverrides — admin-editable goal number per quest template
+	// (e.g. change "Score 1500 points" to require 1800), keyed the same way
+	// as QuestRewardOverrides ("idx:<poolIndex>", see questPoolKey). A key
+	// with no entry here just uses questPool's hardcoded default target.
+	QuestTargetOverrides map[string]int `json:"quest_target_overrides,omitempty"`
 
 	// CoinNIMRate — admin-editable "1 in-game coin = how many NIM" rate,
 	// applied to QuestCoins collected during a run (see handleSubmit in

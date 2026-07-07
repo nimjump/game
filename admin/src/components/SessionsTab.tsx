@@ -1,8 +1,19 @@
 "use client";
 import Link from "next/link";
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { retryReplay, adminSessionAction, saveGoldenReplay, type Session, type SessionAction } from "@/lib/api";
 import NimiqAvatar from "@/components/NimiqAvatar";
+
+// ── Sorting ─────────────────────────────────────────────────────────────────
+// Backend always returns sessions pre-sorted by server_score desc (see
+// Store.List in backend/game/store.go) with no sort/order query param — so
+// sorting by Date or by either score column is done client-side here, over
+// whatever page of sessions is already in memory. Clicking a sortable header
+// toggles asc/desc; clicking a different header switches to it (desc first).
+type SortKey = "date" | "client_score" | "server_score";
+const SORT_LABELS: Record<SortKey, string> = {
+  date: "Date", client_score: "Client", server_score: "Server",
+};
 
 function fmt(ts: number) {
   if (!ts) return "—";
@@ -51,6 +62,27 @@ export default function SessionsTab({
   const [conf, setConf] = useState<{
     id: string; action: SessionAction; detail: string;
   } | null>(null);
+  const [sortKey, setSortKey] = useState<SortKey | null>(null);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+
+  const toggleSort = (key: SortKey) => {
+    if (sortKey === key) {
+      setSortDir(d => (d === "desc" ? "asc" : "desc"));
+    } else {
+      setSortKey(key);
+      setSortDir("desc");
+    }
+  };
+
+  const sortedSessions = useMemo(() => {
+    if (!sortKey) return sessions;
+    const mul = sortDir === "asc" ? 1 : -1;
+    return [...sessions].sort((a, b) => {
+      const av = sortKey === "date" ? (a.submitted_at ?? 0) : a[sortKey];
+      const bv = sortKey === "date" ? (b.submitted_at ?? 0) : b[sortKey];
+      return (av - bv) * mul;
+    });
+  }, [sessions, sortKey, sortDir]);
 
   const set = (id: string, st: "loading" | "ok" | "err", msg = "") => {
     setRowState(p => ({ ...p, [id]: st }));
@@ -124,16 +156,22 @@ export default function SessionsTab({
                 <th>#</th>
                 <th>Player</th>
                 <th>Status</th>
-                <th>Client</th>
-                <th>Server</th>
+                <th onClick={() => toggleSort("client_score")} style={{ cursor: "pointer", userSelect: "none" }}>
+                  {SORT_LABELS.client_score}{sortKey === "client_score" ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+                </th>
+                <th onClick={() => toggleSort("server_score")} style={{ cursor: "pointer", userSelect: "none" }}>
+                  {SORT_LABELS.server_score}{sortKey === "server_score" ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+                </th>
                 <th>Diff</th>
                 <th>Ticks</th>
-                <th>Date</th>
+                <th onClick={() => toggleSort("date")} style={{ cursor: "pointer", userSelect: "none" }}>
+                  {SORT_LABELS.date}{sortKey === "date" ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+                </th>
                 <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {sessions.map((s, i) => {
+              {sortedSessions.map((s, i) => {
                 const st   = rowState[s.session_id];
                 const msg  = rowMsg[s.session_id] ?? "";
                 const busy = st === "loading";

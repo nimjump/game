@@ -3,6 +3,7 @@ package game
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"time"
 
@@ -61,6 +62,37 @@ func dailyPeriodKey(t time.Time) string {
 func weeklyPeriodKey(t time.Time) string {
 	year, week := t.ISOWeek()
 	return fmt.Sprintf("%d-W%02d", year, week)
+}
+
+// periodBoundsForType — returns start/end Unix timestamps for a period,
+// resolving an empty `period` to the CURRENT day/week instead of skipping
+// filtering entirely.
+//
+// BUG FIX: previously, callers (GetLeaderboardPaged / RankMapForPeriod) did:
+//
+//	if periodType != "alltime" && period != "" { startTs, endTs = periodBounds(period) }
+//
+// so an empty `period` string left startTs at 0, and the downstream filter
+// (`if startTs > 0 && ...`) never ran at all — a "daily" request silently
+// became "alltime". This is why the daily leaderboard was showing scores
+// from the whole week (and beyond): any call site that forgot to pre-fill
+// `period` (e.g. the admin players-list rank lookup) fell through to
+// unfiltered data. Now the empty case is resolved to a real window up
+// front, so every caller gets correctly bounded results regardless of
+// whether it remembered to pass `period`.
+func periodBoundsForType(periodType, period string) (int64, int64) {
+	if periodType == "alltime" {
+		return 0, 0
+	}
+	if period == "" {
+		daily, weekly := CurrentPeriods()
+		if periodType == "weekly" {
+			period = weekly
+		} else {
+			period = daily
+		}
+	}
+	return periodBounds(period)
 }
 
 // periodBounds — returns start and end Unix timestamps for a period
@@ -128,14 +160,15 @@ func (s *Store) GetLeaderboard(periodType, period string, limit int) ([]LBEntry,
 func (s *Store) RankMapForPeriod(periodType, period string) map[string]int {
 	all := s.List(false, 0)
 
-	var startTs, endTs int64
-	if periodType != "alltime" && period != "" {
-		startTs, endTs = periodBounds(period)
-	}
+	startTs, endTs := periodBoundsForType(periodType, period)
 
 	best := map[string]models.Session{}
 	for _, sess := range all {
-		if sess.Flagged || sess.ServerScore <= 0 || sess.State == models.StatePending {
+		// (StatePending removed — no session is ever saved with that state,
+		// every session is created as either Completed or Flagged at submit
+		// time; ServerScore<=0 already excludes anything that never got a
+		// real replay-verified score.)
+		if sess.Flagged || sess.ServerScore <= 0 {
 			continue
 		}
 		if startTs > 0 && (sess.SubmittedAt < startTs || sess.SubmittedAt >= endTs) {
@@ -172,15 +205,16 @@ func (s *Store) RankMapForPeriod(periodType, period string) map[string]int {
 func (s *Store) GetLeaderboardPaged(periodType, period string, limit, offset int, selfPlayerID string) ([]LBEntry, error) {
 	all := s.List(false, 0)
 
-	var startTs, endTs int64
-	if periodType != "alltime" && period != "" {
-		startTs, endTs = periodBounds(period)
-	}
+	startTs, endTs := periodBoundsForType(periodType, period)
 
 	// Find best score per player
 	best := map[string]models.Session{}
 	for _, sess := range all {
-		if sess.Flagged || sess.ServerScore <= 0 || sess.State == models.StatePending {
+		// (StatePending removed — no session is ever saved with that state,
+		// every session is created as either Completed or Flagged at submit
+		// time; ServerScore<=0 already excludes anything that never got a
+		// real replay-verified score.)
+		if sess.Flagged || sess.ServerScore <= 0 {
 			continue
 		}
 		if startTs > 0 && (sess.SubmittedAt < startTs || sess.SubmittedAt >= endTs) {
@@ -394,6 +428,130 @@ func (s *Store) ListWinners() ([]models.PeriodWinners, error) {
 		return out[i].ClosedAt > out[j].ClosedAt
 	})
 	return out, err
+}
+
+// PreviousClosedPeriod — the most recently ENDED period key for the given
+// type: yesterday for "daily", last ISO week for anything else (weekly).
+// Used as the default in handleLeaderboardPayWinners so an omitted `period`
+// pays out the period that just closed, not the one still in progress.
+func PreviousClosedPeriod(periodType string) string {
+	now := time.Now().In(utc3)
+	if periodType == "weekly" {
+		return weeklyPeriodKey(now.AddDate(0, 0, -7))
+	}
+	return dailyPeriodKey(now.AddDate(0, 0, -1))
+}
+
+// ── Automatic payout ────────────────────────────────────────────────────────
+//
+// Previously the ONLY way winners got paid was someone manually hitting
+// POST /bj/leaderboard/pay-winners from the admin panel — there was no
+// scheduler anywhere calling it. If nobody remembered to click it for a
+// given day/week, that period's winners simply never got paid, silently,
+// forever (no error, no missing-payout alert — the money just never left
+// the queue because nothing ever asked for it). This adds a background
+// loop that pays out each day/week automatically right after it closes.
+
+const keyLBPaidPfx = "lb:paid:" // marks a period as "already paid out"
+
+func lbPaidKey(period string) []byte { return []byte(keyLBPaidPfx + period) }
+
+// IsPeriodPaid — has this period already been paid out?
+func (s *Store) IsPeriodPaid(period string) bool {
+	paid := false
+	_ = s.db.View(func(txn *badger.Txn) error {
+		_, err := txn.Get(lbPaidKey(period))
+		paid = err == nil
+		return nil
+	})
+	return paid
+}
+
+// MarkPeriodPaid — records that a period's payout has been processed, so
+// the automatic loop (which checks every few minutes) and a manual admin
+// retry never double-pay the same period.
+func (s *Store) MarkPeriodPaid(period string) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(lbPaidKey(period), []byte("1"))
+	})
+}
+
+// PayWinnersForPeriod — computes (or reuses) the winners snapshot for the
+// given period and queues NIM rewards for anyone with a non-zero prize.
+// Idempotent per period via the lb:paid: marker: calling it twice for the
+// same period (once from the automatic loop, once from an admin manual
+// re-trigger) queues rewards only once. Returns how many winners were
+// queued (0 without error if the period was already paid, or had no
+// eligible winners).
+func (s *Store) PayWinnersForPeriod(periodType, period string) (int, error) {
+	if s.IsPeriodPaid(period) {
+		return 0, nil
+	}
+
+	pw, err := s.GetWinners(period)
+	if err != nil || pw == nil {
+		pw, err = s.SnapshotWinners(periodType, period)
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	queued := 0
+	for _, w := range pw.Winners {
+		if w.PrizeNIM <= 0 {
+			continue
+		}
+		reason := fmt.Sprintf("leaderboard:%s:%s:rank%d", periodType, period, w.Rank)
+		if _, rerr := s.QueueReward(w.PlayerID, w.PrizeNIM, reason); rerr == nil {
+			queued++
+		} else {
+			log.Printf("[LEADERBOARD_PAYOUT] QueueReward failed player=%s period=%s rank=%d: %v",
+				w.PlayerID, period, w.Rank, rerr)
+		}
+	}
+
+	// Mark paid even if queued==0 (e.g. nobody scored that period) so we
+	// don't keep re-snapshotting the same empty period forever.
+	if merr := s.MarkPeriodPaid(period); merr != nil {
+		log.Printf("[LEADERBOARD_PAYOUT] failed to mark period=%s as paid: %v", period, merr)
+	}
+	return queued, nil
+}
+
+// StartLeaderboardPayoutLoop — runs in the background, checks every 15
+// minutes whether yesterday's daily period and last week's weekly period
+// have been paid, and pays them automatically if not. Call this once at
+// startup next to StartCleanupLoop.
+//
+// 15 min (not exactly midnight) is deliberate: it's simpler and more
+// robust than trying to fire exactly at the UTC+3 day/week boundary, and
+// since payout is idempotent (lb:paid: marker) there's no harm in checking
+// often — worst case, winners get paid a few minutes late.
+func (s *Store) StartLeaderboardPayoutLoop() {
+	go func() {
+		s.checkAndPayClosedPeriods()
+		ticker := time.NewTicker(15 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			s.checkAndPayClosedPeriods()
+		}
+	}()
+}
+
+func (s *Store) checkAndPayClosedPeriods() {
+	dp := PreviousClosedPeriod("daily")
+	if n, err := s.PayWinnersForPeriod("daily", dp); err != nil {
+		log.Printf("[LEADERBOARD_PAYOUT] daily period=%s error: %v", dp, err)
+	} else if n > 0 {
+		log.Printf("[LEADERBOARD_PAYOUT] daily period=%s paid %d winners", dp, n)
+	}
+
+	wp := PreviousClosedPeriod("weekly")
+	if n, err := s.PayWinnersForPeriod("weekly", wp); err != nil {
+		log.Printf("[LEADERBOARD_PAYOUT] weekly period=%s error: %v", wp, err)
+	} else if n > 0 {
+		log.Printf("[LEADERBOARD_PAYOUT] weekly period=%s paid %d winners", wp, n)
+	}
 }
 
 // CurrentPeriods — returns current daily and weekly period keys (UTC+3)

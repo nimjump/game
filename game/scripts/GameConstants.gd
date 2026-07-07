@@ -22,3 +22,12 @@ extends RefCounted
 
 const VW := 600.0
 const VH := 800.0
+
+## Global movement-speed multiplier applied to every enemy's patrol/chase/
+## hover speed (see the speed block in Enemy.gd's setup). Deliberately does
+## NOT touch the player — Player.MOVE_SPEED is untouched by design. Single
+## knob so a global creature-speed pass stays a one-line change instead of
+## touching each creature individually. Purely a multiplier on top of
+## already-deterministic (_vw/_vh/difficulty based) formulas, so it does not
+## break the client/server replay determinism contract above.
+const SPEED_BUFF := 1.10

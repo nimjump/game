@@ -129,6 +129,31 @@ const _TEX_TORCH_ON_B := preload("res://assets/pack/torch_on_b.png")
 # ── Backend state ──────────────────────────────────────────────────
 var _play_btn      : Button = null   # PLAY button reference
 var _vs_panel      : CanvasLayer = null
+
+# ── VS live spectating — see _watch_vs_live() and friends below. Reuses the
+# real replay player/HUD (same one "Watch Replay" uses); these vars are just
+# the small amount of extra state needed for the WebSocket connection,
+# reconnect-with-backoff, and the viewer-count/paused-banner overlay.
+var _vs_watch_ws              : WebSocketPeer = null
+var _vs_watch_room_id         : String  = ""
+var _vs_watch_started         : bool    = false   # has _start_replay actually fired yet?
+var _vs_watch_reconnecting    : bool    = false
+var _vs_watch_reconnect_delay : float   = 1.0
+const _VS_WATCH_RECONNECT_MAX_DELAY := 10.0
+var _vs_watch_hud             : CanvasLayer = null
+var _vs_watch_viewer_lbl      : Label = null
+var _vs_watch_banner          : Control = null
+var _vs_watch_banner_lbl      : Label = null
+var _vs_watch_seed_val        : int = 0
+var _vs_watch_player_seed     : int = 0
+# True right after opening a socket (first connect OR any reconnect) until
+# its first binary message has been handled. That first message is always
+# "the full backlog as of right now" — on the very first connection this
+# starts playback fresh; on a RECONNECT it must REPLACE the existing log
+# (live_replace_log), not append to it, or the RLE stream would be
+# duplicated. Every message after that first one on the same connection is
+# a genuine incremental update (live_append).
+var _vs_watch_awaiting_initial_chunk : bool = true
 var _backend_ok    : bool   = true   # no longer used for ping — always true
 var _ping_retry_timer: SceneTreeTimer = null  # auto-retry handle
 var _torch_rects   : Array  = []     # [left_torch, right_torch] TextureRect nodes
@@ -347,27 +372,21 @@ func _ready() -> void:
 	_build_start_ui()
 	_init_game()
 	_apply_audio_settings()
-	# Every web visit: silently try to open the Nimiq Pay app via deep link.
-	# If the app isn't installed this just does nothing — the page stays put
-	# and the player keeps playing in the browser as normal.
-	if OS.has_feature("web"):
-		var deep_link := ApiConfig.nimiq_deep_link()
-		JavaScriptBridge.eval("""
-			(function() {
-				try {
-					console.log('[NimiqDeep] trying to open app:', '%s');
-					var iframe = document.createElement('iframe');
-					iframe.style.display = 'none';
-					iframe.src = '%s';
-					document.body.appendChild(iframe);
-					setTimeout(function() {
-						if (iframe && iframe.parentNode) iframe.remove();
-					}, 2000);
-				} catch (e) {
-					console.warn('[NimiqDeep] attempt failed (app probably not installed)', e);
-				}
-			})();
-		""" % [deep_link, deep_link], true)
+	# BUG FIX: this used to auto-probe the Nimiq Pay app on EVERY web visit by
+	# injecting a hidden <iframe src="nimiqpay://..."> — a custom, unregistered
+	# URL scheme. Inside the real Nimiq Pay app that scheme is presumably known
+	# and harmless, but in any other embedded WebView (in-app browsers like
+	# Instagram/Twitter/Facebook, or a plain Android System WebView) navigating
+	# a frame to an unhandled custom scheme commonly trips the host's native
+	# "unknown URL scheme" error-recovery path — which on a lot of WebView
+	# hosts means reloading the current page. That's exactly the "Godot loads,
+	# then the page reloads" bug reported in normal (non-Nimiq-Pay) WebViews.
+	# This silent auto-probe was also pure redundancy: the "Open in Nimiq Pay"
+	# banner (index.html) already fires the identical deep link via
+	# window.location.href on an explicit button click — a top-level,
+	# user-gesture navigation, which is the safe/standard way to trigger a
+	# custom-scheme deep link. Removed the automatic iframe probe entirely;
+	# the button-triggered path covers the real use case without the risk.
 	# Web replay mode: ?replay=SESSION_ID in URL → fetch and auto-start replay
 	if OS.has_feature("web"):
 		var session_id : String = str(JavaScriptBridge.eval(
@@ -375,18 +394,21 @@ func _ready() -> void:
 		if session_id != "" and session_id != "null":
 			_web_fetch_and_start_replay(session_id)
 
-		# VS invite link: ?vs=ROOM_ID → auto-open VS popup with invite
-		var vs_invite : String = str(JavaScriptBridge.eval(
-			"(function(){ var m = location.search.match(/[?&]vs=([^&]+)/); return m ? decodeURIComponent(m[1]) : ''; })()", true))
-		if vs_invite != "" and vs_invite != "null":
-			await get_tree().create_timer(0.5).timeout   # let UI settle first
-			_on_vs_pressed_with_invite(vs_invite)
+		# NOTE: VS invite links are handled by _check_vsroom_deeplink() (called
+		# from _ready(), see below) via the real "?vsroom=<id>" param that the
+		# backend actually generates (vsRoomInviteURL in vsroom.go). This used
+		# to also have a second, separate "?vs=<id>" handler here that called
+		# a function (_on_vs_pressed_with_invite) which never existed anywhere
+		# in this file — dead/orphaned code from an earlier iteration, and no
+		# real invite link has ever used "?vs=". Removed rather than fixed
+		# forward, since _check_vsroom_deeplink() already covers this fully.
 
 
 func _web_fetch_and_start_replay(session_id: String) -> void:
 	var http := HTTPRequest.new()
 	add_child(http)
 	var url := ApiConfig.base_url() + "/backend/replay/" + session_id
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _headers, body):
 		http.queue_free()
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
@@ -410,7 +432,7 @@ func _web_fetch_and_start_replay(session_id: String) -> void:
 		print("[WEB_REPLAY] starting replay seed=%d char=%d bytes=%d" % [seed_val, char_idx, raw.size()])
 		await _start_replay(seed_val, raw, char_idx, "web")
 	)
-	http.request(url)
+	http.request(ApiConfig.sign_url(url))
 
 
 ## Headless server replay: parse args, simulate, write JSON result file, quit.
@@ -893,6 +915,7 @@ func _fetch_nickname(player_id: String, token: String) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 5.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if code == 401: _on_auth_expired(); return
@@ -906,7 +929,7 @@ func _fetch_nickname(player_id: String, token: String) -> void:
 		_rebuild_settings_if_open()
 	)
 	var url := ApiConfig.base_url() + "/backend/nickname?player_id=" + player_id.uri_encode()
-	http.request(url, ["Authorization: Bearer " + token])
+	http.request(ApiConfig.sign_url(url), ["Authorization: Bearer " + token])
 
 
 ## Send nickname to backend
@@ -915,6 +938,7 @@ func _set_nickname_async(nickname: String, token: String, on_done: Callable) -> 
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
@@ -934,7 +958,7 @@ func _set_nickname_async(nickname: String, token: String, on_done: Callable) -> 
 		on_done.call(true, "")
 	)
 	var body := JSON.stringify({"nickname": nickname})
-	http.request(ApiConfig.base_url() + "/backend/nickname",
+	http.request(ApiConfig.sign_url(ApiConfig.base_url() + "/backend/nickname"),
 		["Content-Type: application/json", "Authorization: Bearer " + token],
 		HTTPClient.METHOD_POST, body)
 
@@ -1081,6 +1105,8 @@ func _process(_delta: float) -> void:
 	# If calibration screen is open, update the angle label
 	if is_instance_valid(_calib_layer):
 		_calib_tick()
+	if is_instance_valid(_vs_watch_ws) or _vs_watch_reconnecting:
+		_vs_watch_poll(_delta)
 
 
 ## Native mobile (Android/iOS) touch tracking
@@ -1092,22 +1118,10 @@ func _input(event: InputEvent) -> void:
 	if event is InputEventScreenTouch:
 		if event.pressed:
 			_native_touch_x = event.position.x
-			# 4 parmak = debug panel aç/kapat
-			if event.index == 3:
-				if is_instance_valid(_dbg_layer):
-					_dbg_layer.queue_free(); _dbg_layer = null
-				else:
-					_open_overlay_debug()
 		else:
 			_native_touch_x = -1.0
 	elif event is InputEventScreenDrag:
 		_native_touch_x = event.position.x
-	# PC'de test için: F9
-	elif event is InputEventKey and event.pressed and event.keycode == KEY_F9:
-		if is_instance_valid(_dbg_layer):
-			_dbg_layer.queue_free(); _dbg_layer = null
-		else:
-			_open_overlay_debug()
 
 
 # ─────────────────────────────────────────────────────
@@ -1123,7 +1137,7 @@ var _calib_saved_gm      : Node         = null
 var _calib_saved_player  : Node         = null
 var _calib_saved_started : bool         = false
 var _calib_saved_hud_vis : bool         = false
-var _replay_source       : String       = ""  # "game_over" | "leaderboard" | "stats" | "web"
+var _replay_source       : String       = ""  # "game_over" | "leaderboard" | "stats" | "web" | "vs" | "vs_live"
 var _block_lb_replay     : bool         = false  # block late LB HTTP responses when play is pressed
 var _calib_gm            : Node2D       = null
 var _calib_real_player   : CharacterBody2D = null
@@ -2543,7 +2557,306 @@ func _build_vs_panel() -> void:
 		_block_lb_replay = false
 		await _start_replay(seed, log, char_idx, "vs", player_seed)
 	)
+	_vs_panel.connect("watch_requested", _watch_vs_live)
 	_sync_panels()
+
+
+# ═════════════════════════════════════════════════════════════════════════
+#  VS LIVE SPECTATING
+# ═════════════════════════════════════════════════════════════════════════
+# Called by VSPanel when the player presses "Watch Live" on a room that's
+# currently flagged `live` (see backend/handlers/vs_live.go). Rather than a
+# bespoke scoreboard view, this connects to /backend/vsroom/{id}/watch and
+# feeds the incoming raw input bytes straight into the SAME deterministic
+# replay player used by "Watch Replay" — see GameManager.gd's
+# live_start_watch/live_append/live_replace_log. The player/platforms/HUD
+# you see are the real game, just driven by a log that keeps growing
+# instead of being a fixed recording, and it naturally can't "seek" past
+# data that hasn't arrived yet since there's nothing there to decode.
+#
+# Robustness: if the spectator's OWN connection drops, this reconnects with
+# capped exponential backoff and swaps in the fresh backlog the server
+# always resends. If the PLAYING side's connection drops (their internet,
+# not ours), the server tells us via a `{"t":"status","playing":false}`
+# control message — we show a "Waiting for player..." banner and just
+# freeze on the last frame; if they reconnect, a `playing:true` message
+# clears the banner and play resumes seamlessly. Either way the viewer can
+# hit Exit at any time to bail back to the VS panel.
+
+func _watch_vs_live(room_id: String) -> void:
+	if _started: return
+	if is_instance_valid(_vs_panel): _vs_panel.call("hide_panel")
+
+	_vs_watch_room_id         = room_id
+	_vs_watch_started         = false
+	_vs_watch_reconnecting    = false
+	_vs_watch_reconnect_delay = 1.0
+
+	_block_lb_replay = false
+	_build_vs_watch_hud()
+	_vs_watch_set_banner("Connecting to live match...", true)
+	_vs_watch_fetch_and_connect()
+
+
+## Fetches the room fresh from the real HTTP API (rate-limited, Origin-
+## checked — see main.go's corsMiddleware) to get the current seed and a
+## short-lived signed watch_ticket (see backend/handlers/vs_live_security.go),
+## THEN opens the WebSocket with that ticket attached. Called before every
+## connection attempt, including reconnects — a stale ticket from an earlier
+## fetch would eventually expire and get rejected, so always fetching fresh
+## right before connecting sidesteps that entirely and also means a long
+## disconnect naturally re-syncs the seed/live-status too.
+func _vs_watch_fetch_and_connect() -> void:
+	var http := HTTPRequest.new()
+	add_child(http)
+	var url := ApiConfig.base_url() + "/backend/vsroom/" + _vs_watch_room_id.uri_encode()
+	http.request_completed.connect(ApiConfig.check_clock_skew)
+	http.request_completed.connect(func(result, code, _headers, body):
+		http.queue_free()
+		if _vs_watch_room_id == "": return   # exited while the request was in flight
+		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
+			_vs_watch_schedule_reconnect()
+			return
+		var j := JSON.new()
+		if j.parse(body.get_string_from_utf8()) != OK:
+			_vs_watch_schedule_reconnect()
+			return
+		var d : Dictionary = j.get_data()
+		var room : Dictionary = d.get("room", {})
+		var ticket : String = str(d.get("watch_ticket", ""))
+		var seed_val : int = int(str(room.get("seed", "0")))
+		if ticket == "" or seed_val == 0:
+			# Room isn't (or is no longer) live — the server only issues a
+			# ticket + real seed while someone's actually streaming. Nothing
+			# to watch right now; keep retrying with backoff in case the
+			# player is just about to start (or resumes after a drop).
+			_vs_watch_schedule_reconnect()
+			return
+		_vs_watch_seed_val    = seed_val
+		# Deterministic — the actual playing client derives its own visual/
+		# particle RNG the exact same way from the room seed (see
+		# _init_game_from_seed: `player_seed = game_seed ^ 0xDEADBEEF`), so
+		# the server doesn't need to send it separately.
+		_vs_watch_player_seed = seed_val ^ 0xDEADBEEF
+		_vs_watch_open_socket(ticket)
+	)
+	http.request(ApiConfig.sign_url(url))
+
+
+func _vs_watch_open_socket(ticket: String) -> void:
+	var base := ApiConfig.base_url()
+	var ws_base := base.replace("https://", "wss://").replace("http://", "ws://")
+	# Signed like every other /backend request — the WS upgrade starts as a
+	# plain HTTP GET before hijacking, so it goes through the exact same
+	# app-signature check in main.go's corsMiddleware as anything else.
+	var url := ApiConfig.sign_url("%s/backend/vsroom/%s/watch?ticket=%s" % [ws_base, _vs_watch_room_id.uri_encode(), ticket.uri_encode()])
+	_vs_watch_awaiting_initial_chunk = true
+	_vs_watch_ws = WebSocketPeer.new()
+	var err := _vs_watch_ws.connect_to_url(url)
+	if err != OK:
+		_vs_watch_ws = null
+		_vs_watch_schedule_reconnect()
+
+
+func _vs_watch_schedule_reconnect() -> void:
+	if _vs_watch_room_id == "": return   # already torn down (user exited)
+	_vs_watch_reconnecting = true
+	_vs_watch_set_banner("Connection lost — reconnecting...", true)
+	var delay := _vs_watch_reconnect_delay
+	_vs_watch_reconnect_delay = minf(_vs_watch_reconnect_delay * 1.7, _VS_WATCH_RECONNECT_MAX_DELAY)
+	await get_tree().create_timer(delay).timeout
+	if _vs_watch_room_id == "": return   # exited while we were waiting
+	_vs_watch_reconnecting = false
+	_vs_watch_fetch_and_connect()
+
+
+func _vs_watch_poll(_delta: float) -> void:
+	if _vs_watch_reconnecting: return
+	if not is_instance_valid(_vs_watch_ws): return
+	_vs_watch_ws.poll()
+	var state := _vs_watch_ws.get_ready_state()
+	if state == WebSocketPeer.STATE_OPEN:
+		while _vs_watch_ws.get_available_packet_count() > 0:
+			var was_string := _vs_watch_ws.was_string_packet()
+			var pkt : PackedByteArray = _vs_watch_ws.get_packet()
+			if was_string:
+				_vs_watch_handle_control(pkt.get_string_from_utf8())
+			else:
+				_vs_watch_handle_bytes(pkt)
+	elif state == WebSocketPeer.STATE_CLOSED:
+		_vs_watch_ws = null
+		# Distinguish "we intentionally closed it" (room id already cleared
+		# by _vs_watch_exit) from an actual drop worth reconnecting.
+		if _vs_watch_room_id != "":
+			_vs_watch_schedule_reconnect()
+
+
+func _vs_watch_handle_bytes(bytes: PackedByteArray) -> void:
+	if bytes.is_empty(): return
+	if _vs_watch_awaiting_initial_chunk:
+		_vs_watch_awaiting_initial_chunk = false
+		if not _vs_watch_started:
+			# Very first connection ever for this watch session — actually
+			# start the real replay player.
+			_vs_watch_started = true
+			_vs_watch_start_playback(bytes)
+		else:
+			# A RECONNECT's backlog — replace the whole log in place rather
+			# than appending, since this is a fresh copy of everything from
+			# the start, not new bytes since last time.
+			if is_instance_valid(_gm):
+				_gm.call("live_replace_log", bytes)
+	else:
+		if is_instance_valid(_gm):
+			_gm.call("live_append", bytes)
+
+
+## Kicks off the real replay player on the first chunk of data (which may be
+## the reconnect backlog too, if we're re-entering after our own socket
+## dropped and reconnected before the very first _start_replay call ever
+## happened — rare, but handled the same way either way).
+func _vs_watch_start_playback(initial_log: PackedByteArray) -> void:
+	_replay_source = "vs_live"
+	_enter_replay_ui_pre()
+	if _gm.is_connected("replay_finished", _exit_replay_ui):
+		_gm.disconnect("replay_finished", _exit_replay_ui)
+	_gm.call("set_replay_paused", true)
+	# Nickname "viewer" (not a custom "vs_live" string) — deliberately reuses
+	# the exact same GameManager code path every other spectated replay
+	# already uses (leaderboard/stats/vs replay-viewing): if the streamed
+	# player actually dies mid-round, GameManager freezes on that frame
+	# instead of clearing the scene/emitting replay_finished, which is
+	# exactly the behavior we want here too. _live_watch_mode (set right
+	# below) is the separate, additional flag that only affects what
+	# happens when input bytes simply run out (not a real death) — see the
+	# log-exhausted branch in _simulate_gm_tick.
+	_gm.call("start_replay_external", _vs_watch_seed_val, initial_log, 0, "viewer", _vs_watch_player_seed)
+	_gm.call("live_start_watch")   # must be after start_replay_external (which resets the flag)
+	_gm.call("set_replay_speed", 1.0)
+	await get_tree().process_frame
+	await _show_replay_countdown()
+	_gm.call("set_replay_paused", false)
+	_gm.call("live_mark_active")
+	# Deliberately NOT connecting replay_finished here — a live watch never
+	# "finishes" on its own (see the freeze-not-end branch in
+	# _simulate_gm_tick); the viewer always leaves via the Exit button.
+	_build_replay_bar()
+	_vs_watch_set_banner("", false)
+
+
+func _vs_watch_handle_control(raw: String) -> void:
+	var parsed = JSON.parse_string(raw)
+	if typeof(parsed) != TYPE_DICTIONARY: return
+	var d : Dictionary = parsed
+	match str(d.get("t", "")):
+		"viewers":
+			if is_instance_valid(_vs_watch_viewer_lbl):
+				var n : int = int(d.get("n", 0))
+				_vs_watch_viewer_lbl.text = "👁 %d watching" % n
+		"status":
+			var playing : bool = bool(d.get("playing", false))
+			if playing:
+				_vs_watch_set_banner("", false)
+			else:
+				_vs_watch_set_banner("Waiting for player to resume — their connection may have dropped...", true)
+		"live_start":
+			pass
+
+
+## Small always-on-top overlay: viewer count (top corner) + an optional
+## "waiting" banner. Built once per watch session, freed on exit.
+func _build_vs_watch_hud() -> void:
+	if is_instance_valid(_vs_watch_hud): _vs_watch_hud.queue_free()
+	_vs_watch_hud = CanvasLayer.new()
+	_vs_watch_hud.layer = 26   # above the replay bar (25)
+	add_child(_vs_watch_hud)
+
+	var root := Control.new()
+	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_vs_watch_hud.add_child(root)
+
+	_vs_watch_viewer_lbl = Label.new()
+	_vs_watch_viewer_lbl.text = "👁 — watching"
+	_vs_watch_viewer_lbl.anchor_left = 1.0; _vs_watch_viewer_lbl.anchor_right = 1.0
+	_vs_watch_viewer_lbl.offset_left  = -_p(0.32)
+	_vs_watch_viewer_lbl.offset_right = -_p(0.02)
+	_vs_watch_viewer_lbl.offset_top    = _p(0.02)
+	_vs_watch_viewer_lbl.offset_bottom = _p(0.07)
+	_vs_watch_viewer_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
+	UITheme.apply_label(_vs_watch_viewer_lbl, Color(1, 1, 1), int(_p(0.026)))
+	root.add_child(_vs_watch_viewer_lbl)
+
+	var exit_btn := Button.new()
+	exit_btn.text = "Exit"
+	exit_btn.anchor_left = 0.0; exit_btn.anchor_right = 0.0
+	exit_btn.offset_left  = _p(0.02)
+	exit_btn.offset_right = _p(0.20)
+	exit_btn.offset_top    = _p(0.02)
+	exit_btn.offset_bottom = _p(0.07)
+	exit_btn.pressed.connect(_vs_watch_exit)
+	root.add_child(exit_btn)
+
+	_vs_watch_banner = PanelContainer.new()
+	var bs := StyleBoxFlat.new()
+	bs.bg_color = Color(0, 0, 0, 0.72)
+	bs.set_corner_radius_all(int(_p(0.02)))
+	bs.content_margin_left   = _p(0.02)
+	bs.content_margin_right  = _p(0.02)
+	bs.content_margin_top    = _p(0.012)
+	bs.content_margin_bottom = _p(0.012)
+	_vs_watch_banner.add_theme_stylebox_override("panel", bs)
+	_vs_watch_banner.anchor_left = 0.5; _vs_watch_banner.anchor_right = 0.5
+	_vs_watch_banner.anchor_top  = 0.0; _vs_watch_banner.anchor_bottom = 0.0
+	_vs_watch_banner.offset_left   = -_p(0.42)
+	_vs_watch_banner.offset_right  =  _p(0.42)
+	_vs_watch_banner.offset_top    = _p(0.10)
+	_vs_watch_banner.offset_bottom = _p(0.16)
+	_vs_watch_banner_lbl = Label.new()
+	_vs_watch_banner_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_vs_watch_banner_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	UITheme.apply_label(_vs_watch_banner_lbl, Color(1, 1, 1), int(_p(0.024)))
+	_vs_watch_banner.add_child(_vs_watch_banner_lbl)
+	_vs_watch_banner.visible = false
+	root.add_child(_vs_watch_banner)
+
+
+func _vs_watch_set_banner(text: String, visible_now: bool) -> void:
+	if not is_instance_valid(_vs_watch_banner_lbl): return
+	_vs_watch_banner_lbl.text = text
+	_vs_watch_banner.visible = visible_now and text != ""
+
+
+## Exit button — tears down the socket, GM live-watch flags, and HUD, then
+## returns to the VS panel showing this room's detail view.
+func _vs_watch_exit() -> void:
+	var room_id := _vs_watch_room_id
+	_vs_watch_room_id = ""   # signals pending reconnect attempts to stop
+	_vs_watch_reconnecting = false
+	if is_instance_valid(_vs_watch_ws):
+		_vs_watch_ws.close()
+	_vs_watch_ws = null
+	if is_instance_valid(_gm):
+		_gm.call("live_stop_watch")
+		if _gm.is_connected("replay_finished", _exit_replay_ui):
+			_gm.disconnect("replay_finished", _exit_replay_ui)
+		# stop_replay() is the same real teardown the normal replay-bar Exit
+		# button uses — halts simulation, clears the scene, resets replay
+		# state. Without this the live-watch GameManager could keep quietly
+		# ticking in the background after we've already navigated away.
+		_gm.call("stop_replay")
+	if is_instance_valid(_vs_watch_hud):
+		_vs_watch_hud.queue_free()
+		_vs_watch_hud = null
+	_vs_watch_viewer_lbl = null
+	_vs_watch_banner     = null
+	_vs_watch_banner_lbl = null
+	_vs_watch_started = false
+	_exit_replay_ui()
+	if is_instance_valid(_vs_panel):
+		_vs_panel.call("show_panel")
+		if _vs_panel.has_method("open_room") and room_id != "":
+			_vs_panel.call("open_room", room_id)
 
 
 ## Called by VSPanel when the player presses "Play" on their side of a room.
@@ -3830,7 +4143,30 @@ func _on_play_pressed() -> void:
 
 	# Sign-in required — request if no auth, wait again if rejected (game must not start)
 	if _auth_token == "":
-		# BUG FIX: every repeated Play tap while waiting used to add ANOTHER
+		# BUG FIX: "sometimes Play asks to sign in again mid-session, ~1 in
+		# 5-6 rounds" — root cause: "Play Again" -> reload_current_scene()
+		# recreates Main.gd (and NimiqBridge as its fresh child) every single
+		# round. A brand-new NimiqBridge starts with auth_token=="" and only
+		# regains it once _try_restore_session()'s async /backend/auth/me
+		# call resolves. If the player taps Play again quickly enough after
+		# a round ends, that restore call may still be in flight — at that
+		# exact instant _auth_token=="" looks IDENTICAL to "genuinely never
+		# signed in," so a brand new sign challenge got triggered even
+		# though the still-valid session was about to restore a moment
+		# later. Give an in-flight restore a couple seconds to finish before
+		# treating this as a real "not signed in" case — this was a pure
+		# timing race, not an actual auth invalidation, so it only showed up
+		# intermittently depending on how fast the restore HTTP call
+		# happened to resolve.
+		if is_instance_valid(_nimiq_bridge) and _nimiq_bridge.get("_restoring_session"):
+			print("[MAIN] play pressed — session restore in flight, waiting briefly")
+			var _waited := 0.0
+			while is_instance_valid(_nimiq_bridge) and _nimiq_bridge.get("_restoring_session") and _waited < 3.0:
+				await get_tree().create_timer(0.1).timeout
+				_waited += 0.1
+			_on_play_pressed()  # re-check now that restore has (hopefully) resolved
+			return
+		# every repeated Play tap while waiting used to add ANOTHER
 		# pair of one-shot auth_success/auth_failed listeners (each a fresh
 		# closure, so connect() never deduped them) — harmless on its own,
 		# but also meant an impatient user mashing Play during a slow first
@@ -3974,213 +4310,11 @@ func _ensure_wallet_then_sign() -> void:
 
 
 # ── VS ─────────────────────────────────────────────────────────────────────────
-
-var _vs_popup       : Control = null
-var _vs_status_lbl  : Label   = null
-var _vs_invite_btn  : Button  = null
-
-func _on_vs_pressed_with_invite(invite_id: String) -> void:
-	_show_vs_waiting_popup()
-	if is_instance_valid(_vs_status_lbl):
-		_vs_status_lbl.text = "Joining room..."
-	var nick := _player_nickname if _player_nickname != "" else \
-		(nimiq_label if nimiq_label != "" else "Player")
-	VSManager.matched.connect(_on_vs_matched, CONNECT_ONE_SHOT)
-	VSManager.match_timeout.connect(_on_vs_timeout, CONNECT_ONE_SHOT)
-	VSManager.error.connect(_on_vs_error, CONNECT_ONE_SHOT)
-	VSManager.opponent_left.connect(_on_vs_opponent_left_menu, CONNECT_ONE_SHOT)
-	VSManager.countdown.connect(_on_vs_countdown)
-	VSManager.join(nick, invite_id)
-
-
-func _on_vs_pressed() -> void:
-	if _started: return
-	_show_vs_waiting_popup()
-	var nick := _player_nickname if _player_nickname != "" else \
-		(nimiq_label if nimiq_label != "" else "Player")
-	# Check for invite param in URL
-	var invite := ""
-	if OS.has_feature("web"):
-		var url_raw = JavaScriptBridge.eval("window.location.search", true)
-		if url_raw != null:
-			var url_str := str(url_raw)
-			var idx := url_str.find("vs=")
-			if idx >= 0:
-				invite = url_str.substr(idx + 3).split("&")[0]
-
-	# Connect VSManager signals
-	VSManager.matched.connect(_on_vs_matched, CONNECT_ONE_SHOT)
-	VSManager.match_timeout.connect(_on_vs_timeout, CONNECT_ONE_SHOT)
-	VSManager.error.connect(_on_vs_error, CONNECT_ONE_SHOT)
-	VSManager.opponent_left.connect(_on_vs_opponent_left_menu, CONNECT_ONE_SHOT)
-	VSManager.countdown.connect(_on_vs_countdown)
-
-	VSManager.join(nick, invite)
-
-
-func _show_vs_waiting_popup() -> void:
-	if is_instance_valid(_vs_popup):
-		_vs_popup.queue_free()
-
-	var ref := minf(minf(_vw, _vh), GameConstants.VW)
-	_vs_popup = Control.new()
-	_anchored(_vs_popup, Control.PRESET_FULL_RECT)
-	_vs_popup.z_index = 30
-	_ui_root.add_child(_vs_popup)
-
-	var dim := ColorRect.new()
-	dim.color = Color(0, 0, 0, 0.70)
-	_anchored(dim, Control.PRESET_FULL_RECT)
-	_vs_popup.add_child(dim)
-
-	var pc := PanelContainer.new()
-	var pw := _p(0.80)
-	var ph := _p(0.42)
-	pc.anchor_left = 0.5; pc.anchor_right  = 0.5
-	pc.anchor_top  = 0.5; pc.anchor_bottom = 0.5
-	pc.offset_left   = -pw * 0.5; pc.offset_right  = pw * 0.5
-	pc.offset_top    = -ph * 0.5; pc.offset_bottom = ph * 0.5
-	UITheme.apply_panel(pc)
-	_vs_popup.add_child(pc)
-
-	var vbox := VBoxContainer.new()
-	vbox.add_theme_constant_override("separation", int(_p(0.016)))
-	pc.add_child(vbox)
-
-	var mc := _make_margin_container(int(_p(0.030)))
-	mc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	mc.size_flags_vertical   = Control.SIZE_EXPAND_FILL
-	pc.add_child(mc)
-
-	var inner := VBoxContainer.new()
-	inner.add_theme_constant_override("separation", int(_p(0.018)))
-	inner.alignment = BoxContainer.ALIGNMENT_CENTER
-	mc.add_child(inner)
-
-	var title := Label.new()
-	title.text = "VS MODE"
-	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	UITheme.apply_label(title, UITheme.COL_GOLD, int(_p(0.054)))
-	inner.add_child(title)
-
-	_vs_status_lbl = Label.new()
-	_vs_status_lbl.text = "Looking for opponent..."
-	_vs_status_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_vs_status_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD
-	UITheme.apply_label(_vs_status_lbl, UITheme.COL_TEXT_DIM, int(_p(0.030)))
-	inner.add_child(_vs_status_lbl)
-
-	# Invite link button (hidden until room_id known)
-	_vs_invite_btn = Button.new()
-	_vs_invite_btn.text = "Copy Invite Link"
-	_vs_invite_btn.add_theme_font_size_override("font_size", int(_p(0.028)))
-	_vs_invite_btn.visible = false
-	UITheme.apply_ghost_button(_vs_invite_btn)
-	inner.add_child(_vs_invite_btn)
-	_vs_invite_btn.pressed.connect(func():
-		var url := VSManager.get_invite_url()
-		if url != "" and OS.has_feature("web"):
-			JavaScriptBridge.eval("navigator.clipboard && navigator.clipboard.writeText('%s')" % url, true)
-		_vs_invite_btn.text = "Copied!"
-		await get_tree().create_timer(1.0).timeout
-		if is_instance_valid(_vs_invite_btn):
-			_vs_invite_btn.text = "Copy Invite Link"
-	)
-
-	var cancel_btn := Button.new()
-	cancel_btn.text = "Cancel"
-	cancel_btn.add_theme_font_size_override("font_size", int(_p(0.030)))
-	UITheme.apply_ghost_button(cancel_btn)
-	inner.add_child(cancel_btn)
-	cancel_btn.pressed.connect(_close_vs_popup)
-
-
-func _close_vs_popup() -> void:
-	VSManager.disconnect_room()
-	if is_instance_valid(_vs_popup):
-		_vs_popup.queue_free()
-		_vs_popup = null
-	# Disconnect lingering signals
-	for sig in ["matched","match_timeout","error","opponent_left","countdown"]:
-		var s := VSManager.get(sig) as Signal
-		if s and s.is_connected(_get_vs_handler(sig)):
-			pass  # one-shot signals disconnect automatically
-
-
-func _get_vs_handler(_sig: String) -> Callable:
-	return func(): pass  # placeholder
-
-
-func _on_vs_matched(seed: String, slot: int, opponent: String) -> void:
-	if not is_instance_valid(_vs_status_lbl): return
-	_vs_status_lbl.text = "Opponent found: %s\nGet ready..." % opponent
-	if is_instance_valid(_vs_invite_btn):
-		_vs_invite_btn.visible = false
-	# Show invite button for slot 0 while waiting
-	if slot == 0 and VSManager.get_invite_url() != "":
-		if is_instance_valid(_vs_invite_btn):
-			_vs_invite_btn.visible = true
-
-
-func _on_vs_timeout() -> void:
-	if is_instance_valid(_vs_status_lbl):
-		_vs_status_lbl.text = "No opponent found.\nShare the invite link."
-	if is_instance_valid(_vs_invite_btn) and VSManager.get_invite_url() != "":
-		_vs_invite_btn.visible = true
-
-
-func _on_vs_error(msg: String) -> void:
-	if is_instance_valid(_vs_status_lbl):
-		if msg.begins_with("join_request_failed") or msg.begins_with("join_failed") or msg.begins_with("ws_connect_failed"):
-			_vs_status_lbl.text = "Connection failed"
-			Toast.network_error("vs %s" % msg)
-		else:
-			_vs_status_lbl.text = "Error. " + msg
-
-
-func _on_vs_opponent_left_menu() -> void:
-	_close_vs_popup()
-
-
-func _on_vs_countdown(n: int) -> void:
-	if not is_instance_valid(_vs_popup): return
-	if n > 0:
-		if is_instance_valid(_vs_status_lbl):
-			_vs_status_lbl.text = str(n)
-			_vs_status_lbl.add_theme_font_size_override("font_size", int(_p(0.14)))
-	else:
-		# n==0 → GO! — close popup, start game in VS mode
-		_close_vs_popup_silent()
-		# Disconnect countdown signal
-		if VSManager.countdown.is_connected(_on_vs_countdown):
-			VSManager.countdown.disconnect(_on_vs_countdown)
-		_start_vs_game()
-
-
-func _close_vs_popup_silent() -> void:
-	if is_instance_valid(_vs_popup):
-		_vs_popup.queue_free()
-		_vs_popup = null
-
-
-func _start_vs_game() -> void:
-	if _started: return
-	_started = true
-	_block_lb_replay = true
-	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
-	if is_instance_valid(_stats_panel):       _stats_panel.hide_panel()
-	if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
-
-	# Apply VS seed to GM before starting
-	var vs_seed := int(VSManager._seed) if VSManager._seed != "" else 0
-	if vs_seed != 0 and is_instance_valid(_gm):
-		_gm.call("vs_apply_seed", vs_seed)
-
-	_do_start_game()
-	# Activate VS mode in GM after game starts
-	await get_tree().process_frame
-	if is_instance_valid(_gm):
-		_gm.call("vs_start")
+# The legacy real-time WebSocket VS system (VSManager autoload + this popup
+# flow) has been removed entirely — it was never reachable from the shipped
+# menu anyway. VS is now exclusively the VSRoom system (VSPanel.gd,
+# _build_vs_panel/_open_vs_panel elsewhere in this file), which also carries
+# a live spectator relay for watching a match in progress.
 
 
 ## Polls /backend/developer-mode periodically for update_active. Doesn't
@@ -4199,6 +4333,7 @@ func _check_server_status() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
@@ -4212,7 +4347,7 @@ func _check_server_status() -> void:
 		if msg != "":
 			_update_message = msg
 	)
-	http.request(BACKEND_URL + "/backend/developer-mode")
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/developer-mode"))
 
 
 func _do_start_game(forced_seed: int = 0) -> void:
@@ -5329,58 +5464,10 @@ func _spawn_transition_creature(biome_id: String) -> void:
 
 
 # ─────────────────────────────────────────────────────
+# NOTE: the touch/keyboard-triggered "OVERLAY DEBUG" panel (4-finger tap /
+# F9, showing _player.debug_get_info() reference points) was removed —
+# no longer needed and was erroring when opened.
 # ─────────────────────────────────────────────────────
-#  DEBUG OVERLAY
-# ─────────────────────────────────────────────────────
-var _dbg_layer  : CanvasLayer = null
-
-func _open_overlay_debug() -> void:
-	if is_instance_valid(_dbg_layer): return
-	if not is_instance_valid(_player): return
-
-	var info : Dictionary = _player.call("debug_get_info")
-	var sy   : float = info.get("sy", 0.0)
-	var sw   : float = info.get("sw", 20.0)
-	var jp   : Vector2 = info.get("jp_pos", Vector2(0, sy))
-	var wl   : Vector2 = info.get("wl_pos", Vector2(sw * 0.55, sy))
-
-	_dbg_layer = CanvasLayer.new()
-	_dbg_layer.layer = 100
-	add_child(_dbg_layer)
-
-	var bg := ColorRect.new()
-	bg.color = Color(0, 0, 0, 0.72)
-	bg.anchor_right = 1.0; bg.anchor_bottom = 1.0
-	_dbg_layer.add_child(bg)
-
-	var root := VBoxContainer.new()
-	root.anchor_left = 0.0; root.anchor_right = 1.0
-	root.anchor_top  = 0.0; root.anchor_bottom = 0.0
-	root.offset_left = 20; root.offset_right = -20
-	root.offset_top  = 60
-	root.add_theme_constant_override("separation", 14)
-	_dbg_layer.add_child(root)
-
-	var title := Label.new()
-	title.text = "OVERLAY DEBUG"
-	title.add_theme_font_size_override("font_size", 22)
-	title.add_theme_color_override("font_color", Color.YELLOW)
-	root.add_child(title)
-
-	var ref_lbl := Label.new()
-	ref_lbl.text = "sy=%.1f  sw=%.1f  jp=%s  wl=%s" % [sy, sw, jp, wl]
-	ref_lbl.add_theme_font_size_override("font_size", 16)
-	ref_lbl.add_theme_color_override("font_color", Color.WHITE)
-	root.add_child(ref_lbl)
-
-	var close_btn := Button.new()
-	close_btn.text = "Close"
-	close_btn.pressed.connect(func():
-		if is_instance_valid(_dbg_layer):
-			_dbg_layer.queue_free()
-			_dbg_layer = null
-	)
-	root.add_child(close_btn)
 
 
 func _update_torch_state() -> void:

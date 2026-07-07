@@ -2,23 +2,6 @@ extends Node2D
 
 static var _is_headless : bool = DisplayServer.get_name() == "headless"
 
-# ── [CRASH DEBUG] ──────────────────────────────────────────────────────────
-# Toggle this to true to write a flush-every-tick trace log. print() output
-# is buffered and gets lost on a hard native crash (0xc0000005) — this file
-# is fsync'd after every single line, so whatever line is LAST in the file
-# is the last tick that ran before the crash. Pinpoints exact tick + enemy.
-# Set back to false once the bug is found; it's slow (disk I/O every tick).
-static var _CRASH_DEBUG := true
-static var _crash_log : FileAccess = null
-func _crash_debug_open() -> void:
-	if not _CRASH_DEBUG: return
-	_crash_log = FileAccess.open("user://crash_trace.log", FileAccess.WRITE)
-	printerr("[CRASH_DEBUG] trace log -> ", ProjectSettings.globalize_path("user://crash_trace.log"))
-func _crash_debug_line(s: String) -> void:
-	if not _CRASH_DEBUG or _crash_log == null: return
-	_crash_log.store_line(s)
-	_crash_log.flush()
-# ─────────────────────────────────────────────────────────────────────────
 
 ## Headless replay sim runs thousands of ticks in one frame — queue_free() never
 ## flushes until a frame ends, so nodes pile up and the worker times out.
@@ -57,8 +40,10 @@ var JETPACK_GAP : float = 9999.0
 const DIFFICULTY_RATE := 0.00012
 const ENEMY_BASE_PROB  := 0.25
 const ENEMY_MAX_PROB   := 0.40
-const ITEM_BASE_PROB   := 0.22
 const BROKEN_BASE_PROB := 0.05
+const CARD_PROB        := 0.02   # Şans kartı — item'dan bağımsız, sabit %2
+# ITEM_BASE_PROB kaldırıldı — item çıkma ihtimali artık _item_spawn_prob()
+# içinde, nimiq/carrot/golden_carrot ağırlıklarından dinamik hesaplanıyor.
 
 # ── Referanslar ─────────────────────────────────────────────────────
 var camera      : Camera2D
@@ -181,16 +166,49 @@ var _replay_speed_acc : float = 0.0
 var _replay_nickname  : String = ""
 # ── Player's own seed preserved before replay (used when returning to lobby) ──
 
-# ── VS mode ──────────────────────────────────────────────────────────
-var _vs_active        : bool   = false
-var _vs_tick          : int    = 0      # local tick counter for VS
-var _vs_last_rdir     : int    = 0      # cached rdir for current tick
-var _ghost_sprite     : Sprite2D = null  # opponent ghost visual
-var _ghost_x          : float  = 0.0
-var _ghost_y          : float  = 0.0
-var _ghost_dir        : int    = 0      # last received input dir
-const _VS_GHOST_ALPHA : float  = 0.45
-const _VS_GHOST_COLOR : Color  = Color(0.4, 0.8, 1.0, _VS_GHOST_ALPHA)
+# ── VS live streaming — SENDER side (VSRoom system — see vs_room_id/vs_role
+# below and backend/handlers/vs_live.go). A small client-side WebSocket that
+# streams this player's OWN run to the server while they're actually
+# playing their VS round, so spectators watching /backend/vsroom/{id}/watch
+# see it live. Replaces the old real-time-match ghost-opponent system
+# entirely (that whole VSManager-based block lived here before and has been
+# removed along with VSManager.gd/vs.go).
+#
+# What gets sent is not score/position snapshots — it's the exact same
+# RLE-encoded input bytes already being written into _replay_log during
+# RECORDING (see the "RECORDING: RLE log" block in _simulate_gm_tick). A
+# spectator's client appends these straight onto its OWN _replay_log and
+# runs the real deterministic replay player (PLAYING mode) — so watching a
+# live VS match is pixel-for-pixel the actual game, not a stand-in view.
+#
+# One wrinkle: the RLE encoder can still be mutating the LAST byte in
+# _replay_log (extending the current run's count as long as the same input
+# stays held), so that byte isn't safe to send yet — only bytes strictly
+# before it are guaranteed final ("sealed"). _vs_live_sent_len tracks how
+# many bytes have already been sent; every flush sends up to
+# size()-1 (holding the possibly-still-growing last byte back), except the
+# final flush on game end, which sends everything since no more ticks are
+# coming to mutate it.
+var _vs_live_ws        : WebSocketPeer = null
+var _vs_live_sent_len  : int = 0
+var _vs_live_flush_ctr : int = 0
+const _VS_LIVE_FLUSH_EVERY := 6   # ~10Hz — plenty responsive, keeps WS message count low
+
+# ── VS live streaming — RECEIVER side (spectating). Set by Main.gd right
+# before it starts the real replay player on a live/still-growing log (see
+# live_start_watch/live_append/live_replace_log below). When true, running
+# out of decodable input bytes freezes playback (waits for more) instead of
+# ending the match — the crucial difference from watching a normal, already-
+# finished replay.
+var _live_watch_mode : bool = false
+# _live_watch_active — narrower than _live_watch_mode: true only once the
+# steady-state watch loop has actually begun (countdown finished, first
+# unpause done). live_append()/live_replace_log() only auto-resume playback
+# when this is true — otherwise a chunk arriving mid-countdown (while
+# Main.gd has deliberately paused playback at spawn for the 3-2-1 overlay)
+# would prematurely unpause it.
+var _live_watch_active : bool = false
+
 var _pre_replay_seed        : int = 0
 var _pre_replay_player_seed : int = 0
 var _pre_replay_char        : int = 0
@@ -233,8 +251,6 @@ var _sim_cam_y : float = 0.0
 
 
 func init(p_cam, p_player, _p_score, _p_best, _p_final, p_main, p_seed: int = -1, p_skip_session: bool = false) -> void:
-	print("[GM_INIT] reached, _CRASH_DEBUG=", _CRASH_DEBUG)
-	_crash_debug_open()
 	camera    = p_cam
 	player    = p_player
 	main_node = p_main
@@ -342,8 +358,7 @@ func _load_all_textures() -> void:
 		"idle": [_t(en+"spikeball/idle1.png"), _t(en+"spikeball/idle2.png")],
 	}
 	_enemy_frames[Enemy.EnemyType.SPRINGMAN] = {
-		"idle": [_t(en+"springman/stand.png"), _t(en+"springman/hurt.png"),
-				 _t(en+"springman/stand.png")],
+		"idle": [_t(en+"springman/stand.png")],
 		"hurt": [_t(en+"springman/hurt.png")],
 	}
 	_enemy_frames[Enemy.EnemyType.SUN] = {
@@ -507,30 +522,11 @@ func _run_one_tick() -> void:
 	_simulate_gm_tick()
 	# GM-RT: compute player_ready once; direct field access avoids .get() string lookup
 	var player_ready : bool = is_instance_valid(player) and player._initialized
-	if _CRASH_DEBUG:
-		var p_pos  := player.global_position if is_instance_valid(player) else Vector2.ZERO
-		var p_vel  := player.velocity if is_instance_valid(player) else Vector2.ZERO
-		_crash_debug_line("TICK %d | player_ready=%s pos=(%.1f,%.1f) vel=(%.1f,%.1f) is_dead=%s lives=%s shield=%s poweredup=%s | score=%d highest_y=%.1f | enemies=%d platforms=%d" % [
-			_replay_tick_count, player_ready, p_pos.x, p_pos.y, p_vel.x, p_vel.y,
-			(player.get("is_dead") if is_instance_valid(player) else null),
-			(player.get("lives") if is_instance_valid(player) else null),
-			(player.get("has_shield") if is_instance_valid(player) else null),
-			(player.get("is_powered_up") if is_instance_valid(player) else null),
-			score, highest_y, _enemies.size(), _platforms.size()
-		])
 	if player_ready:
 		player.simulate_tick()
 		# Enemies ticked only when player is ready — keeps tick count equal in NORMAL and REPLAY
 		for e in _enemies:
 			if is_instance_valid(e):
-				if _CRASH_DEBUG:
-					var etype : int = e.get("enemy_type")
-					var ename : String = Enemy.EnemyType.keys()[etype] if etype >= 0 and etype < Enemy.EnemyType.size() else "?"
-					_crash_debug_line("  enemy id=%d type=%s(%d) pos=(%.1f,%.1f) setup=%s can_fly=%s stun=%.2f overlap=%s plat_valid=%s -> simulate_tick()" % [
-						e.get_instance_id(), ename, etype, e.global_position.x, e.global_position.y,
-						e.get("_setup_done"), e.get("can_fly"), e.get("_stun_timer"), e.get("_overlap_triggered"),
-						is_instance_valid(e.get("_platform"))
-					])
 				e.simulate_tick()
 	# Platform break timers — fixed tick instead of Godot delta (deterministic at 2x/4x)
 	for i in range(_platforms.size() - 1, -1, -1):
@@ -547,11 +543,14 @@ func _run_one_tick() -> void:
 		_check_interactables()
 	_tick_spring_resets()
 
-	# ── VS: send local input + update ghost position ─────────────────
-	if _vs_active and player_ready and _replay_mode == ReplayMode.RECORDING:
-		_vs_tick += 1
-		VSManager.send_input(_vs_tick, _vs_last_rdir)
-		_vs_update_ghost()
+	# ── VS live streaming: relay this player's own input bytes to spectators ──
+	if vs_room_id != "" and player_ready and _replay_mode == ReplayMode.RECORDING:
+		_vs_live_poll()
+		if is_instance_valid(_vs_live_ws) and _vs_live_ws.get_ready_state() == WebSocketPeer.STATE_OPEN:
+			_vs_live_flush_ctr += 1
+			if _vs_live_flush_ctr >= _VS_LIVE_FLUSH_EVERY:
+				_vs_live_flush_ctr = 0
+				_vs_live_flush_log(false)
 
 	# ── Divergence detector ──────────────────────────────────────────
 	if _dbg_enabled and player_ready:
@@ -611,6 +610,19 @@ func _simulate_gm_tick() -> void:
 				if _dbg_enabled and _replay_tick_count % 100 == 0:
 					print("[SNAP] tick=%d score=%d pos=(%.2f,%.2f) vel_y=%.2f rng=%d" % [_replay_tick_count, score, player.position.x, player.position.y, player.velocity.y, _rng.state])
 			else:
+				# Live-watching a match still in progress: running out of
+				# decoded input just means we've caught up to whatever the
+				# player has streamed so far — freeze on this exact frame
+				# (do NOT set _game_over/_replay_mode=OFF, which would be a
+				# one-way dead end — _physics_process bails out permanently
+				# once _game_over is true). live_append()/live_replace_log()
+				# flip _replay_paused back off the moment more bytes arrive,
+				# so playback just resumes seamlessly from here.
+				if _live_watch_mode:
+					_replay_paused = true
+					if is_instance_valid(player):
+						player.set("_replay_dir", 0)
+					return
 				_game_over     = true
 				_replay_mode   = ReplayMode.OFF
 				# "viewer" = leaderboard/stats/web replay — log ended, just stop, do not emit
@@ -710,7 +722,6 @@ func _simulate_gm_tick() -> void:
 
 
 		player.set("_replay_dir", rdir)
-		if _vs_active: _vs_last_rdir = rdir   # cache for VS send
 
 	# Track mirror debuff activation for quest system
 	if not _quest_used_mirror and is_instance_valid(player) and player._mirror_active:
@@ -804,83 +815,161 @@ func _simulate_gm_tick() -> void:
 
 
 # ───────────────────────────────────────────────────────────────────
-#  VS MODE
+#  VS LIVE STREAMING (spectator relay — see backend/handlers/vs_live.go)
 # ───────────────────────────────────────────────────────────────────
+# While the local player is actually playing their VS round (vs_room_id set,
+# _replay_mode == RECORDING), this opens a small WebSocket to
+# /backend/vsroom/{id}/live and streams compact per-tick frames so anyone
+# watching /backend/vsroom/{id}/watch sees the run as it happens. Purely a
+# broadcast — nothing here affects gameplay or the deterministic sim; if the
+# connection fails or drops, the match just isn't watchable live, the actual
+# recorded replay (submitted normally afterward) is unaffected.
 
-## Called by Main.gd when VS match starts (countdown = 0)
-## Force a specific seed for VS mode — call before activate()
-func vs_apply_seed(seed_int: int) -> void:
-	if seed_int == 0: return
-	game_seed  = seed_int & 0x7FFFFFFFFFFFFFFF
-	session_id = _make_local_session_id(seed_int)
-	_init_game_from_seed()
+## Called once from _init_game_from_seed() right as a VS round starts
+## recording, if vs_room_id is set. No-op outside the web export (native
+## builds never open VS rooms) and silently no-ops if auth/token is missing.
+func _vs_live_connect() -> void:
+	if vs_room_id == "": return
+	if not OS.has_feature("web"): return
+	var tok := ""
+	if is_instance_valid(main_node) and main_node.get("_auth_token") != null:
+		tok = str(main_node.get("_auth_token"))
+	if tok == "": return   # can't authenticate the stream — just skip it
 
+	_vs_live_disconnect()  # defensive — clear out any stale prior connection
+	var base := ApiConfig.base_url()
+	var ws_base := base.replace("https://", "wss://").replace("http://", "ws://")
+	# Signed like every other /backend request — the WS upgrade starts as a
+	# plain HTTP GET before hijacking, so it goes through the exact same
+	# app-signature check in main.go's corsMiddleware as anything else.
+	var url := ApiConfig.sign_url("%s/backend/vsroom/%s/live?token=%s" % [ws_base, vs_room_id.uri_encode(), tok.uri_encode()])
 
-func vs_start() -> void:
-	_vs_active    = true
-	_vs_tick      = 0
-	_vs_last_rdir = 0
-	_ghost_x      = VW * 0.5
-	_ghost_y      = VH * 0.5
-	_ghost_dir    = 0
-	_spawn_ghost_sprite()
-	# Connect VSManager signals
-	if not VSManager.opponent_input.is_connected(_on_vs_opponent_input):
-		VSManager.opponent_input.connect(_on_vs_opponent_input)
-	if not VSManager.opponent_left.is_connected(_on_vs_opponent_left):
-		VSManager.opponent_left.connect(_on_vs_opponent_left)
-
-
-func vs_stop() -> void:
-	_vs_active = false
-	if is_instance_valid(_ghost_sprite):
-		_ghost_sprite.queue_free()
-		_ghost_sprite = null
-	if VSManager.opponent_input.is_connected(_on_vs_opponent_input):
-		VSManager.opponent_input.disconnect(_on_vs_opponent_input)
-	if VSManager.opponent_left.is_connected(_on_vs_opponent_left):
-		VSManager.opponent_left.disconnect(_on_vs_opponent_left)
-
-
-func _spawn_ghost_sprite() -> void:
-	if is_instance_valid(_ghost_sprite):
-		_ghost_sprite.queue_free()
-	_ghost_sprite = Sprite2D.new()
-	# Reuse player texture as ghost — tinted blue
-	if is_instance_valid(player) and player.get_child_count() > 0:
-		var anim := player.get_node_or_null("AnimatedSprite2D")
-		if anim and anim.sprite_frames:
-			var frames : SpriteFrames = anim.sprite_frames
-			var tex : Texture2D = frames.get_frame_texture("stand", 0)
-			if tex:
-				_ghost_sprite.texture = tex
-	_ghost_sprite.modulate = _VS_GHOST_COLOR
-	_ghost_sprite.z_index  = -1   # behind player
-	_ghost_sprite.position = Vector2(_ghost_x, _ghost_y)
-	add_child(_ghost_sprite)
+	_vs_live_ws = WebSocketPeer.new()
+	var err := _vs_live_ws.connect_to_url(url)
+	if err != OK:
+		print("[VS_LIVE] connect_to_url failed err=%d" % err)
+		_vs_live_ws = null
+		return
+	_vs_live_sent_len  = 0
+	_vs_live_flush_ctr = 0
 
 
-func _vs_update_ghost() -> void:
-	if not is_instance_valid(_ghost_sprite): return
-	# Smoothly lerp ghost toward last known position
-	# (position is approximate — based on inputs only, no full physics sim)
-	var target := Vector2(_ghost_x, _ghost_y)
-	_ghost_sprite.position = _ghost_sprite.position.lerp(target, 0.25)
+func _vs_live_poll() -> void:
+	if not is_instance_valid(_vs_live_ws): return
+	_vs_live_ws.poll()
+	# Drain any incoming data — the play-side socket doesn't expect messages
+	# back, but reading keeps the connection's internal buffers healthy and
+	# lets us notice a server-side close promptly.
+	while _vs_live_ws.get_ready_state() == WebSocketPeer.STATE_OPEN and _vs_live_ws.get_available_packet_count() > 0:
+		_vs_live_ws.get_packet()
+	if _vs_live_ws.get_ready_state() == WebSocketPeer.STATE_CLOSED:
+		_vs_live_ws = null
 
 
-func _on_vs_opponent_input(tick: int, dir: int) -> void:
-	_ghost_dir = dir
-	# Simple approximation: move ghost horizontally based on dir
-	# Real position comes from deterministic sim — this is just visual smoothing
-	_ghost_x += dir * 4.0   # rough pixels per tick
-	# Camera-relative: ghost Y stays close to player Y (same seed = same height)
-	# _shake_rng kullanılıyor — ghost Y görsel amaçlı ama tutarlı olsun
-	if is_instance_valid(player):
-		_ghost_y = player.global_position.y + _shake_rng.randf_range(-20.0, 20.0)
+## Sends any newly-sealed _replay_log bytes since the last flush, as a single
+## binary WS message. `final`=true (called once, from _vs_live_disconnect at
+## game end) also sends the very last byte, which is only safe once no more
+## ticks are coming to potentially still extend its RLE run count.
+func _vs_live_flush_log(final: bool) -> void:
+	if not is_instance_valid(_vs_live_ws): return
+	var avail : int = _replay_log.size()
+	var send_upto : int = avail if final else maxi(_vs_live_sent_len, avail - 1)
+	if send_upto <= _vs_live_sent_len: return
+	var chunk := _replay_log.slice(_vs_live_sent_len, send_upto)
+	_vs_live_ws.send(chunk)  # binary by default
+	_vs_live_sent_len = send_upto
 
 
-func _on_vs_opponent_left() -> void:
-	vs_stop()
+## Called from _submit_session() once the round is over — flushes whatever's
+## left (now safe to send in full since the run is genuinely done) and stops
+## streaming, regardless of whether the round ended in a win/loss/disconnect.
+func _vs_live_disconnect() -> void:
+	if is_instance_valid(_vs_live_ws):
+		_vs_live_ws.poll()
+		_vs_live_flush_log(true)
+		_vs_live_ws.poll()
+		_vs_live_ws.close()
+	_vs_live_ws        = null
+	_vs_live_sent_len  = 0
+	_vs_live_flush_ctr = 0
+
+
+# ───────────────────────────────────────────────────────────────────
+#  VS LIVE WATCHING — RECEIVER side (spectating a match in progress)
+# ───────────────────────────────────────────────────────────────────
+# Main.gd/VSPanel.gd drive the actual WebSocket connection to
+# /backend/vsroom/{id}/watch (reconnect handling, viewer-count/status UI
+# all live there — see Main.gd's _watch_vs_live). This GameManager only
+# needs to know how to (a) keep decoding a replay log that keeps growing
+# instead of ending, and (b) accept new bytes / a replaced buffer as they
+# arrive over the wire.
+
+## Shared RLE tick-count decoder — same algorithm used inline in
+## start_replay()/_submit_session(), pulled out here since live-watch needs
+## to recompute it every time new bytes arrive instead of just once.
+func _decode_rle_tick_count(log: PackedByteArray) -> int:
+	var total := 0
+	var i := 0
+	while i < log.size():
+		var b : int = log[i]
+		if b == 0xFF:
+			if i + 2 < log.size():
+				i += 3
+			else:
+				break
+			continue
+		total += maxi(1, (b >> 2) & 0x3F)
+		i += 1
+	return total
+
+
+## Called by Main.gd right before starting the replay player on a live
+## (still-growing) log, so the log-exhausted path in _simulate_gm_tick knows
+## to freeze-and-wait instead of ending the match.
+func live_start_watch() -> void:
+	_live_watch_mode   = true
+	_live_watch_active = false
+
+
+## Called by Main.gd once its own 3-2-1 countdown has finished and it's
+## about to unpause for real — from this point on, live_append()/
+## live_replace_log() are allowed to auto-unpause on new data (see below).
+func live_mark_active() -> void:
+	_live_watch_active = true
+
+
+## Called by Main.gd when the spectator closes the live view / navigates
+## away, so a stray late WS message can't resurrect playback afterward.
+func live_stop_watch() -> void:
+	_live_watch_mode   = false
+	_live_watch_active = false
+
+
+## New bytes arrived over the /watch socket — append them to the log being
+## played back and recompute the tick count so the seek bar (and the
+## catch-up check below) reflect the new data. If playback had frozen
+## waiting for more input, this wakes it back up. Guarded by
+## _live_watch_active (not just _live_watch_mode) so a chunk arriving during
+## Main.gd's deliberate pre-countdown pause doesn't unpause it early.
+func live_append(bytes: PackedByteArray) -> void:
+	if bytes.is_empty(): return
+	_replay_log.append_array(bytes)
+	_replay_total_ticks = _decode_rle_tick_count(_replay_log)
+	if _live_watch_active and _replay_paused:
+		_replay_paused = false
+
+
+## Used after a spectator WS reconnect: the server always resends the FULL
+## backlog on a fresh /watch handshake, so instead of appending (which would
+## duplicate everything) this swaps the whole buffer in place — read
+## position (_rle_run_pos) and playback tick are left untouched, since the
+## fresh backlog is always a prefix-compatible superset of what was already
+## decoded (append-only server-side buffer, same room).
+func live_replace_log(bytes: PackedByteArray) -> void:
+	_replay_log = bytes
+	_replay_total_ticks = _decode_rle_tick_count(_replay_log)
+	if _live_watch_active and _replay_paused:
+		_replay_paused = false
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -1069,13 +1158,37 @@ func _spawn_platform(pos: Vector2, broken: bool, safe: bool = false, p_diff: flo
 		_add_spike_bottom(plat)
 
 	var enemy_prob := lerpf(ENEMY_BASE_PROB, ENEMY_MAX_PROB, use_diff)
+	var placed_etype : int = -1
 	if _rng.randf() < enemy_prob:
-		_add_enemy(plat, use_diff, plat_score)
-	elif _rng.randf() < ITEM_BASE_PROB:
-		if _rng.randf() < 0.15:
+		placed_etype = _add_enemy(plat, use_diff, plat_score)
+
+	# user request: "duran bloklar" (SPRINGMAN, SLIME_BLOCK gibi hareket etmeyen/
+	# sabit duran düşmanlar) varsa aynı platformda item ÇIKMASIN — şans kartı
+	# (spinning card) da dahil. Önceki hâlde "_blocks_item" sadece _add_item()
+	# roll'unu (nimiq/carrot/altın havuç) atlıyordu; "and" kısa-devre yaptığı
+	# için _blocks_item true olduğunda if-koşulu hemen false oluyor ve kod
+	# else'e düşüp şans kartını YİNE deniyordu — kullanıcının fark ettiği bug
+	# tam buydu (springman'in üstünde şans kutusu çıkıyordu).
+	var _blocking_static_types := [Enemy.EnemyType.SPRINGMAN, Enemy.EnemyType.SLIME_BLOCK]
+	var _blocks_item : bool = placed_etype in _blocking_static_types
+
+	# Item artık düşmandan tamamen BAĞIMSIZ kontrol ediliyor — yaratıklı
+	# bir platformda da nimiq/carrot/altın havuç çıkabilir, biri diğerini
+	# engellemez. Tek istisna: _blocking_static_types — o platformlarda ne
+	# item ne şans kartı çıkar.
+	var item_prob := _item_spawn_prob(use_diff)
+	if _blocks_item:
+		pass  # duran blok var — item ve şans kartı roll'u tamamen atlanır
+	elif _rng.randf() < item_prob:
+		_add_item(plat, use_diff)
+	else:
+		# Şans kartı bağımsız/sabit %CARD_PROB olsun diye, item rolünü
+		# kaçıran ihtimal üzerinden telafili roll (elif olduğu için
+		# ham CARD_PROB kullanırsak gerçek sonuç CARD_PROB'un altında
+		# kalırdı).
+		var card_roll_thresh := CARD_PROB / maxf(1.0 - item_prob, 0.0001)
+		if _rng.randf() < card_roll_thresh:
 			_spawn_spinning_card(plat.global_position + Vector2(0, -VH * 0.06))
-		else:
-			_add_item(plat, use_diff)
 
 
 func _cached_tex(path: String) -> Texture2D:
@@ -1110,8 +1223,7 @@ func _add_deco(plat: StaticBody2D, gname: String) -> void:
 				var grass := "grass1.png" if r1 < 0.5 else "grass2.png"
 				var side  := -_dw165 if r2 < 0.5 else _dw165
 				_place_deco(plat, env + grass, side, int(VH * 0.0275))
-			if r3 < 0.30:
-				_place_deco(plat, par + "particle_green.png", r4, int(VH * 0.01))
+			# user request: çimen dışındaki yeşil parçacık dekorasyonu kaldırıldı
 		"sand":
 			if r0 < 0.70:
 				var cx := -_dw175 if r1 < 0.5 else _dw175
@@ -1261,7 +1373,7 @@ func _add_spring(plat: StaticBody2D) -> void:
 			area.add_child(anim)
 
 	var cs := CircleShape2D.new()
-	cs.radius = int(VW * 0.023)
+	cs.radius = int(VW * 0.023 * 1.3)   # 1.3x bigger hitbox (user request)
 	var col := CollisionShape2D.new()
 	col.shape    = cs
 	col.position = Vector2.ZERO
@@ -1357,16 +1469,16 @@ func register_split_enemy(e: Node) -> void:
 		_enemies.append(e)
 
 
-func _add_enemy(plat: StaticBody2D, p_diff: float = -1.0, p_score: int = -1) -> void:
+func _add_enemy(plat: StaticBody2D, p_diff: float = -1.0, p_score: int = -1) -> int:
 	var use_diff := p_diff if p_diff >= 0.0 else _difficulty()
-	if _enemy_frames.is_empty(): return
+	if _enemy_frames.is_empty(): return -1
 
 	var available := _enemies_for_biome(p_score)
-	if available.is_empty(): return
+	if available.is_empty(): return -1
 
 	var etype := available[_rng.randi() % available.size()]
 	var frames : Dictionary = _enemy_frames.get(etype, {})
-	if frames.is_empty(): return
+	if frames.is_empty(): return -1
 
 	var enemy : EnemyBase = _enemy_script.new()
 	add_child(enemy)
@@ -1405,13 +1517,6 @@ func _add_enemy(plat: StaticBody2D, p_diff: float = -1.0, p_score: int = -1) -> 
 
 	enemy.setup(etype, frames, use_diff)
 	_enemies.append(enemy)
-	if _CRASH_DEBUG:
-		var ename : String = Enemy.EnemyType.keys()[etype] if etype >= 0 and etype < Enemy.EnemyType.size() else "?"
-		_crash_debug_line("[SPAWN] tick=%d type=%s(%d) id=%d pos=(%.1f,%.1f) plat_pos=(%.1f,%.1f) seed=%d" % [
-			_replay_tick_count, ename, etype, enemy.get_instance_id(),
-			enemy.global_position.x, enemy.global_position.y,
-			plat.global_position.x, plat.global_position.y, enemy_seed
-		])
 
 	# Springman veya slime block varsa aynı platformdaki spike'ları kaldır — çakışmasın
 	if etype == Enemy.EnemyType.SPRINGMAN or etype == Enemy.EnemyType.SLIME_BLOCK:
@@ -1426,13 +1531,32 @@ func _add_enemy(plat: StaticBody2D, p_diff: float = -1.0, p_score: int = -1) -> 
 					spike_area.queue_free()
 					_interactables.remove_at(i)
 
+	return int(etype)
+
+
+# Bir platformda GERÇEK item (kart hariç) çıkma ihtimali (enemy'den bağımsız).
+# Değerler artık DOĞRUDAN yüzde puanı (oyun başında):
+#   NIMIQ %8, CARROT %5, GOLDEN_CARROT %2, BUBBLE/JETPACK/WINGS %1.34 (değişmedi)
+# NIMIQ/CARROT/GOLDEN_CARROT zorlukla azalıyor, diğerleri sabit.
+# total zaten yüzde birimi olduğundan /100 basit oranlama yeterli (ekstra K
+# katsayısına gerek yok — önceki bug buradan kaynaklanmıştı).
+func _item_spawn_prob(d: float) -> float:
+	var w0 := lerpf(8.0, 4.27, d)    # NIMIQ
+	var w1 := lerpf(5.0, 2.5,  d)    # CARROT
+	var w4 := 1.34                    # BUBBLE (sabit, değişmedi)
+	var w5 := lerpf(2.0, 1.0,  d)    # GOLDEN_CARROT
+	var total := w0 + w1 + 1.34 + 1.34 + w4 + w5   # JETPACK=1.34, WINGS=1.34 sabit
+	return total / 100.0
+
 
 func _add_item(plat: StaticBody2D, p_diff: float = -1.0) -> void:
 	var d  := p_diff if p_diff >= 0.0 else _difficulty()
-	var w0 := int(lerpf(15, 8, d))
-	var w1 := int(lerpf(3, 6, d))
-	var w4 := int(lerpf(2, 4, d))
-	var total := w0 + w1 + 1 + 1 + w4 + 1
+	# Ağırlıklar x100 hassasiyetle tutuluyor, oran _item_spawn_prob ile aynı.
+	var w0 := int(round(lerpf(800.0, 427.0, d)))   # NIMIQ
+	var w1 := int(round(lerpf(500.0, 250.0, d)))   # CARROT
+	var w4 := 134                                   # BUBBLE (sabit)
+	var w5 := int(round(lerpf(200.0, 100.0, d)))   # GOLDEN_CARROT
+	var total := w0 + w1 + 134 + 134 + w4 + w5     # JETPACK=134, WINGS=134 sabit
 	var roll  := _rng.randi() % total
 	var chosen := 5
 	var c := 0
@@ -1440,11 +1564,12 @@ func _add_item(plat: StaticBody2D, p_diff: float = -1.0) -> void:
 	else:
 		c += w1; if roll < c: chosen = 1
 		else:
-			c += 1; if roll < c: chosen = 2
+			c += 134; if roll < c: chosen = 2
 			else:
-				c += 1; if roll < c: chosen = 3
+				c += 134; if roll < c: chosen = 3
 				else:
 					c += w4; if roll < c: chosen = 4
+					# else: chosen = 5 (GOLDEN_CARROT) — kalan pay
 	var itype : Item.ItemType = _ITEM_TYPES[chosen]
 	var item : Item = _item_script.new()
 	add_child(item)
@@ -1618,8 +1743,14 @@ func _check_interactables() -> void:
 			var rsize : Vector2 = entry["_rect_size"]
 			var ax : float = area.global_position.x
 			var ay : float = area.global_position.y + entry["_rect_child_pos"].y
-			if (px + p_half_w > ax - rsize.x * 0.5 and px - p_half_w < ax + rsize.x * 0.5 and
-				py + p_half_h > ay - rsize.y * 0.5 and py - p_half_h < ay + rsize.y * 0.5):
+			# HARDENING: same float-boundary tie-break class as the platform
+			# landing bug — a strict overlap test on continuously-accumulated
+			# floats can flip right at the edge between two runs of the same
+			# replay. Small epsilon (see Player.gd LAND_EPS) makes the trigger
+			# consistent instead of knife-edge.
+			const _OVERLAP_EPS := 0.05
+			if (px + p_half_w > ax - rsize.x * 0.5 - _OVERLAP_EPS and px - p_half_w < ax + rsize.x * 0.5 + _OVERLAP_EPS and
+				py + p_half_h > ay - rsize.y * 0.5 - _OVERLAP_EPS and py - p_half_h < ay + rsize.y * 0.5 + _OVERLAP_EPS):
 				var etype2 : String = entry["type"]
 				var is_spring2     : bool = (etype2 == "spring")
 				var is_spike2      : bool = (etype2 == "spike")
@@ -1638,7 +1769,9 @@ func _check_interactables() -> void:
 		var dx : float = px - ax
 		var dy : float = (py - p_half_h * 0.5) - ay   # mid-body
 		var dist_sq : float = dx * dx + dy * dy
-		var touch_r : float = radius + p_half_w * 0.7
+		# HARDENING: +0.05 before squaring — same tie-break fix as the rect
+		# overlap above and Player.gd's platform-landing check.
+		var touch_r : float = radius + p_half_w * 0.7 + 0.05
 		if dist_sq < touch_r * touch_r:
 			var etype : String = entry["type"]
 			var is_spring      : bool = (etype == "spring")
@@ -1646,6 +1779,21 @@ func _check_interactables() -> void:
 			# proj_damage with one_shot=false stays alive (persistent cloud/zone)
 			var is_persistent  : bool = (etype == "proj_damage" and
 				entry["data"] is Dictionary and not entry["data"].get("one_shot", true))
+			# SPRING: only triggers coming down onto it from above — jumping up
+			# into it from underneath the platform no longer works (user request).
+			# py > ay + eps means the player's center is BELOW the spring's
+			# center (Y grows downward), i.e. approaching from underneath.
+			# BUG FIX: position alone isn't enough — on a one-way platform the
+			# player's center crosses to being numerically "above" the spring
+			# (py <= ay) the instant they pass through from below, WHILE STILL
+			# MOVING UPWARD (haven't hit the jump apex yet). That crossing tick
+			# used to satisfy py <= ay and trigger the spring immediately, which
+			# looked/felt exactly like triggering it from underneath. Requiring
+			# velocity.y >= 0 (actually falling, not still rising) closes that
+			# gap — the spring now only fires while genuinely descending onto it.
+			var falling : bool = player.velocity.y >= 0.0
+			if is_spring and (py > ay + 0.05 or not falling):
+				continue
 			if not is_spring and not is_spike and not is_persistent:
 				entry["used"] = true
 				_ci_to_remove.append(i)
@@ -2163,6 +2311,8 @@ func _init_game_from_seed() -> void:
 	if game_seed == 0:
 		print("[GM] seed=0, aborting init")
 		return
+	_live_watch_mode   = false   # a real game is starting — never the live-watch freeze/resume path
+	_live_watch_active = false
 	# Clean up nodes from previous game
 	for child in get_children().duplicate():
 		if child == player or child == camera: continue
@@ -2253,11 +2403,20 @@ func _init_game_from_seed() -> void:
 		camera.position = Vector2(VW * 0.5, _sim_cam_y)
 	_spawn_initial_platforms()
 	print("[GM] platforms spawned, game ready")
+	if vs_room_id != "":
+		_vs_live_connect()
 	ready_to_play.emit()
 
 func start_replay() -> void:
 	# Clear nickname on direct call; start_replay_external overrides it afterward
 	_replay_nickname = ""
+	# Reset here, not just in _init_game_from_seed() — otherwise watching a
+	# NORMAL (finished, non-live) replay right after watching a live match
+	# would inherit the "freeze instead of end" behavior. Main.gd re-enables
+	# it via live_start_watch() right after start_replay_external() returns,
+	# specifically for the live-watch call path — see _watch_vs_live.
+	_live_watch_mode   = false
+	_live_watch_active = false
 	if _replay_log.is_empty():
 		print("[REPLAY] Log empty, no replay")
 		return
@@ -2837,6 +2996,7 @@ func _submit_quest_progress() -> void:
 
 	var http := HTTPRequest.new()
 	add_child(http)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result: int, code: int, _h, body_resp: PackedByteArray):
 		http.queue_free()
 		if code == 401:
@@ -2863,7 +3023,7 @@ func _submit_quest_progress() -> void:
 	if _qtok == "":
 		return  # no token — skip, will retry via flush_pending after sign-in
 	headers.append("Authorization: Bearer " + _qtok)
-	var _e := http.request(BACKEND_URL + "/backend/quests/progress", headers, HTTPClient.METHOD_POST, body)
+	var _e := http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/quests/progress"), headers, HTTPClient.METHOD_POST, body)
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -2935,6 +3095,9 @@ func _submit_session() -> void:
 		print("[SUBMIT] tagging as VS room=%s role=%s" % [vs_room_id, vs_role])
 	var body := JSON.stringify(payload)
 	_send_submit_with_retry(session_id, body)
+	# Stop streaming to spectators now that the round is actually over —
+	# must happen before clearing vs_room_id below.
+	_vs_live_disconnect()
 	# One-shot tag — a solo run right after a VS match must not inherit it.
 	vs_room_id = ""
 	vs_role    = ""
@@ -2972,6 +3135,7 @@ func _send_submit_with_retry(sid: String, body: String) -> void:
 	var http := HTTPRequest.new()
 	add_child(http)
 	http.timeout = 12.0
+	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(_r, code, _h, _b):
 		http.queue_free()
 		print("[GM] submit code=%d sid=%s" % [code, sid.left(8)])
@@ -3002,7 +3166,7 @@ func _send_submit_with_retry(sid: String, body: String) -> void:
 			Toast.network_error("submit code=%d" % code)
 			_ensure_retry_timer()
 	)
-	var _e := http.request(BACKEND_URL + "/backend/submit", headers, HTTPClient.METHOD_POST, body)
+	var _e := http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/submit"), headers, HTTPClient.METHOD_POST, body)
 
 
 ## Save {sid, body} dict to pending queue
@@ -3096,12 +3260,13 @@ func flush_pending() -> void:
 		add_child(http)
 		http.timeout = 12.0
 		var _sid := sid
+		http.request_completed.connect(ApiConfig.check_clock_skew)
 		http.request_completed.connect(func(_r, code, _h, _b):
 			http.queue_free()
 			print("[GM] flush submit code=%d sid=%s" % [code, _sid.left(8)])
 			if code == 200:
 				_pending_remove(_sid)
 		)
-		var _e := http.request(BACKEND_URL + "/backend/submit", f_headers, HTTPClient.METHOD_POST, body)
+		var _e := http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/submit"), f_headers, HTTPClient.METHOD_POST, body)
 		if _e != OK:
 			http.queue_free()

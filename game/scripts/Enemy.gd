@@ -87,9 +87,7 @@ var WINGMAN_RETURN_SPEED : float = 0.0
 var _wingman_chasing := false
 
 # ── SPIKEMAN ─────────────────────────────────────────────────────────
-# Patrols platform, tracks player on X axis when player is above — unkillable
-var SPIKEMAN_DETECT_X    : float = 0.0
-var SPIKEMAN_CHASE_SPEED : float = 0.0
+# Patrols platform back and forth — unkillable (no longer tracks the player)
 
 # ── SPIKEBALL ────────────────────────────────────────────────────────
 # Vertical up-down movement
@@ -150,7 +148,7 @@ var _fly_dive_cd      := 0.0
 # ── MOUSE ────────────────────────────────────────────────────────────
 # Fast patrol, walks toward the player, dies when stomped on the head
 var MOUSE_AGGRO_RANGE : float = 0.0
-var MOUSE_PATROL_SPEED := 1.5
+var MOUSE_PATROL_SPEED := 1.35
 var MOUSE_CHASE_SPEED  : float = 0.0
 var _mouse_chasing := false
 var _mouse_chase_cd := 0.0
@@ -408,14 +406,27 @@ func _make_circle_tex(color: Color, size: int) -> ImageTexture:
 	return ImageTexture.create_from_image(img)
 
 func _init_tex_cache() -> void:
-	_tex_rain      = _make_solid_tex(Color(0.4, 0.7, 1.0, 0.8),   int(_vw * 0.006) + 1, int(_vh * 0.02) + 1)
-	_tex_ice       = _make_circle_tex(Color(0.4, 0.75, 1.0, 0.85),  int(_vw * 0.117))
-	_tex_blob      = _make_circle_tex(Color(0.2, 0.85, 0.15, 0.95), int(_vw * 0.023))
-	_tex_cloud_atk = _make_circle_tex(Color(0.15, 0.75, 0.1, 0.7),  int(_vw * 0.133))
-	_tex_mini      = _make_circle_tex(Color(0.65, 0.2, 0.9, 0.95),  int(_vw * 0.033))
-	_tex_puff      = _make_circle_tex(Color(0.6, 0.4, 0.15, 0.85),  int(_vw * 0.023))
-	_tex_dirt      = _make_circle_tex(Color(0.55, 0.35, 0.12, 1.0), int(_vw * 0.040))
-	_init_projectile_pools()
+	# BUG FIX (determinism/anti-cheat parity): dokular (texture) sadece görsel
+	# olduğu için headless'ta atlanabilir, ama _init_projectile_pools() öyle
+	# değil — o, solucanın toprak atışı ve slime'ların fırlattığı parçacıklar
+	# gibi GERÇEK hasar veren interactable'ların (proj_damage) kaydedildiği
+	# Area2D havuzlarını oluşturuyor. Bu çağrı "if not _is_headless" bloğunun
+	# İÇİNE alınmıştı, yani headless modda (server/replay simülasyonu) bu
+	# havuzlar hiç oluşmuyordu → _pool_acquire() her zaman boş dönüyordu →
+	# _register_interactable() hiç çağrılmıyordu. Sonuç: client'ta oyuncuya
+	# gerçekten çarpıp hasar veren bu atışlar, headless/server tarafında HİÇ
+	# var olmuyordu (aynı bug sınıfı, _slime_green_death_cloud'daki yorumda
+	# bahsedilen sorunun bir üst seviyesi). Şimdi havuzlar her modda kuruluyor,
+	# sadece pahalı/gereksiz doku üretimi (_make_*_tex) headless'ta atlanıyor.
+	if not _is_headless:
+		_tex_rain      = _make_solid_tex(Color(0.4, 0.7, 1.0, 0.8),   int(_vw * 0.006) + 1, int(_vh * 0.02) + 1)
+		_tex_ice       = _make_circle_tex(Color(0.4, 0.75, 1.0, 0.85),  int(_vw * 0.117))
+		_tex_blob      = _make_circle_tex(Color(0.2, 0.85, 0.15, 0.95), int(_vw * 0.023))
+		_tex_cloud_atk = _make_circle_tex(Color(0.15, 0.75, 0.1, 0.7),  int(_vw * 0.133))
+		_tex_mini      = _make_circle_tex(Color(0.65, 0.2, 0.9, 0.95),  int(_vw * 0.033))
+		_tex_puff      = _make_circle_tex(Color(0.6, 0.4, 0.15, 0.85),  int(_vw * 0.023))
+		_tex_dirt      = _make_circle_tex(Color(0.55, 0.35, 0.12, 1.0), int(_vw * 0.040))
+	_init_projectile_pools()   # her zaman çalışır — headless'ta tex parametreleri null olur, sorun değil (hiç çizilmiyor zaten)
 
 # ── PROJECTILE POOL HELPERS (EN-11) ───────────────────────────────────────────
 
@@ -437,6 +448,20 @@ func _build_pool(count: int, shape_type: String, tex: Texture2D, layer: int) -> 
 		var node := Area2D.new()
 		node.collision_layer = layer
 		node.collision_mask  = 1
+		# DETERMINISM FIX: Area2D defaults to monitoring = true in Godot. This
+		# pool used to leave that default in place and rely entirely on the
+		# caller registering the node with GameManager._register_interactable()
+		# (which sets monitoring = false) right after acquiring it. In every
+		# current call site that happens synchronously, same frame — but that
+		# was an assumption living in the CALLER's code, not a guarantee this
+		# node itself enforces. Any future projectile type that acquires a pool
+		# slot and does something (even briefly) before registering would have
+		# a real, frame-based Area2D signal window — exactly the non-tick-based
+		# collision path we don't want anywhere in this game. Disabling it right
+		# here, at creation, means every pooled node is dead-signal from the
+		# moment it exists, full stop, regardless of what any caller does.
+		node.monitoring  = false
+		node.monitorable = false
 		var cs := CollisionShape2D.new()
 		if shape_type == "circle":
 			cs.shape = CircleShape2D.new()
@@ -529,48 +554,52 @@ func _special_setup() -> void:
 	# ramping smoothly up to the cap at max difficulty. Pure function of
 	# `difficulty`, which is itself deterministic (score/height based), so
 	# this stays bit-identical between client and server replay sims.
-	var _diff_speed_mult : float = lerpf(1.0, 1.15, difficulty)  # up to +15% speed
+	var _diff_speed_mult : float = lerpf(1.0, 1.15, difficulty) * GameConstants.SPEED_BUFF  # up to +15% speed, plus global buff
 	var _diff_range_mult : float = lerpf(1.0, 1.10, difficulty)  # up to +10% aggro/detect range
 
 	# Cache computed constants (EN-04: avoid per-access multiplication)
 	WINGMAN_CHASE_RANGE = _vw * 0.30 * _diff_range_mult
-	WINGMAN_CHASE_SPEED = _vw * 0.55 * _diff_speed_mult   # matched to BEE_CHASE_SPEED per request
+	WINGMAN_CHASE_SPEED = _vw * 0.55 * 0.5 * 1.2 * 1.3 * _diff_speed_mult   # -50%, +%20, sonra +%20 yerine +%30 (user request)
 	WINGMAN_RETURN_SPEED = WINGMAN_CHASE_SPEED   # BUG FIX: see _wingman_ai — used to snap home in a fixed 0.5s regardless of distance, now returns at its own normal speed
-	SPIKEMAN_DETECT_X   = _vw * 0.20 * _diff_range_mult
-	SPIKEMAN_CHASE_SPEED= _vw * 0.28 * _diff_speed_mult
+	# SPIKEMAN_DETECT_X / SPIKEMAN_CHASE_SPEED removed — spikeman no longer
+	# chases (see _spikeman_ai below), these were dead code left over from
+	# before that behavior was cut.
 	SPIKEBALL_AMPLITUDE = _vh * 0.07
 	SUN_AMPLITUDE       = _vh * 0.08
-	CLOUD_FOLLOW_SPEED  = _vw * 0.23 * _diff_speed_mult   # was 0.46 — halved, was following horizontally way too fast
+	CLOUD_FOLLOW_SPEED  = _vw * 0.55 * 0.5 * 1.2 * 1.3 * _diff_speed_mult   # user request: diğer uçan tiplerle (wingman/bee/fly/ghost) aynı hız
 	CLOUD_RAIN_RANGE_X  = _vw * 0.06
 	BEE_AGGRO_RANGE     = _vw * 0.32 * _diff_range_mult   # was 0.25 — too low, barely chased, bumped up per request
-	BEE_CHASE_SPEED     = _vw * 0.55 * 0.95 * _diff_speed_mult   # -5% per request
+	BEE_CHASE_SPEED     = _vw * 0.55 * 0.5 * 1.2 * 1.3 * _diff_speed_mult   # wingman/fly/ghost ile aynı hız (user request)
 	BEE_RETURN_SPEED    = BEE_CHASE_SPEED   # per request: same as WINGMAN/GHOST — returns at its own normal speed, not a separate fixed value
 	FLY_AGGRO_RANGE     = _vw * 0.28 * _diff_range_mult
-	FLY_CHASE_SPEED     = _vw * 0.48 * 0.95 * _diff_speed_mult   # -5% per request ("sivrisinek")
-	MOUSE_AGGRO_RANGE   = _vw * 0.22 * _diff_range_mult
-	MOUSE_CHASE_SPEED   = _vw * 0.42 * _diff_speed_mult
+	FLY_CHASE_SPEED     = _vw * 0.55 * 0.5 * 1.2 * 1.3 * _diff_speed_mult   # wingman/bee/ghost ile aynı hız (user request)
+	MOUSE_AGGRO_RANGE   = _vw * 2.0   # user request: aynı platformdaysa (same_level) mesafeye bakmaksızın hep tepki versin — küçük adımlarla oyalanmayı önler
+	MOUSE_CHASE_SPEED   = _vw * 0.42 * 0.9 * _diff_speed_mult   # user request: hafif yavaşlatıldı (-10%)
+	MOUSE_PATROL_SPEED  = 0.65 * GameConstants.SPEED_BUFF   # user request: uçan gruple (wingman/bee/fly/ghost) tamamen aynı hız
 	FROG_DETECT_X       = _vw * 0.20 * _diff_range_mult
 	FROG_DETECT_Y       = _vh * 0.25 * _diff_range_mult
 	FROG_JUMP_HEIGHT    = -_vh * 0.18
 	FROG_JUMP_DIST      = _vw * 0.12
 	SLIME_FIRE_DETECT   = _vw * 0.22 * _diff_range_mult
-	SPIDER_AGGRO_RANGE  = _vw * 0.20 * _diff_range_mult
+	SPIDER_AGGRO_RANGE  = _vw * 0.32 * _diff_range_mult   # was 0.20 — too short, spider let go of the chase almost immediately; bumped up to match BEE (user request, same complaint)
 	SPIDER_DETECT_X     = _vw * 0.34 * _diff_range_mult
 	SPIDER_DETECT_Y     = _vh * 0.32 * _diff_range_mult
 	GHOST_DETECT_RANGE  = _vw * 0.28 * _diff_range_mult
-	GHOST_CHASE_SPEED   = _vw * 0.30 * _diff_speed_mult
+	GHOST_CHASE_SPEED   = _vw * 0.55 * 0.5 * 1.2 * 1.3 * _diff_speed_mult  # user request: wingman/bee/fly ile tamamen aynı hız
 	GHOST_RETURN_SPEED  = GHOST_CHASE_SPEED   # BUG FIX: see _ghost_ai — used to snap home in a fixed 0.5s regardless of distance, now returns at its own normal speed
 	WORM_DIRT_RANGE     = _vw * 0.233 * _diff_range_mult
-	WORM_DIRT_SPEED_X   = _vw * 0.15   # already scaled by difficulty at use-site (line ~1869), don't double-scale here
+	WORM_DIRT_SPEED_X   = _vw * 0.15   # already scaled by difficulty at use-site (line ~1869), don't double-scale here — projectile speed, intentionally left out of SPEED_BUFF (see review notes)
 	WORM_DIRT_SPEED_Y   = -_vh * 0.40
 	WORM_DIRT_GRAVITY   = _vh * 0.75
+	SPIDER_BURST_SPEED  = _vw * 0.55 * _diff_speed_mult   # FIX: was declared but never assigned/used — burst chase now scales with height-based difficulty like every other chase speed
 
 	# Cache platform collision shape once (EN-01)
 	if is_instance_valid(_platform):
 		_platform_cs = _get_cs_of(_platform)
 
-	if not _is_headless:
-		_init_tex_cache()
+	# BUG FIX: bu artık her zaman çağrılıyor — _init_tex_cache() içinde
+	# headless/görsel ayrımı zaten kendi içinde yapılıyor (bkz. yukarıdaki not).
+	_init_tex_cache()
 	var headless := _is_headless
 	var sf : SpriteFrames = null
 	if not headless and is_instance_valid(_anim):
@@ -581,22 +610,22 @@ func _special_setup() -> void:
 			# Unkillable — damages on contact. Patrols left-right in the air.
 			if sf and sf.has_animation("fly"): _anim.play("fly")
 			elif sf: _anim.play(sf.get_animation_names()[0])
-			_start_patrol()
-			_start_vertical_bob()
+			_start_patrol(0.65 * GameConstants.SPEED_BUFF)              # user request: uçan herşeyle aynı hız
+			_start_vertical_bob(12.0, 2.2)  # user request: uçan herşeyle aynı bob hızı
 
 		EnemyType.WINGMAN:
 			# Chases in range, patrols outside
 			if sf and sf.has_animation("fly"): _anim.play("fly")
 			elif sf: _anim.play(sf.get_animation_names()[0])
 			_wingman_chasing = false
-			_start_patrol(1.0)   # matched to BEE's patrol speed per request
-			_start_vertical_bob(10.0, 1.8)
+			_start_patrol(0.65 * GameConstants.SPEED_BUFF)              # -50%, +%20 yerine +%30 (user request)
+			_start_vertical_bob(10.0, 2.2)  # user request: uçan herşeyle aynı bob hızı
 
 		EnemyType.SPIKEMAN:
-			# Patrol + X-tracks player when above — unkillable
+			# Patrols platform back and forth — unkillable (no longer tracks/chases the player)
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			elif sf: _anim.play(sf.get_animation_names()[0])
-			_start_patrol()
+			_start_patrol(GameConstants.SPEED_BUFF)
 
 		EnemyType.SPIKEBALL:
 			# Vertical up-down
@@ -651,8 +680,8 @@ func _special_setup() -> void:
 			_bee_chasing     = false
 			_bee_returning   = false
 			_bee_sting_timer = 0.0
-			_start_patrol(1.0)
-			_start_vertical_bob(8.0, 1.2)
+			_start_patrol(0.65 * GameConstants.SPEED_BUFF)   # user request: wingman/fly/ghost ile aynı hız
+			_start_vertical_bob(8.0, 2.2)  # user request: uçan herşeyle aynı bob hızı
 
 		EnemyType.FLY:
 			# Chases until dead once player enters range
@@ -660,8 +689,8 @@ func _special_setup() -> void:
 			elif sf: _anim.play(sf.get_animation_names()[0])
 			_fly_home_pos = global_position
 			_fly_aggro    = false
-			_start_patrol(1.0)
-			_start_vertical_bob(8.0, 1.4)
+			_start_patrol(0.65 * GameConstants.SPEED_BUFF)   # user request: wingman/bee/ghost ile aynı hız
+			_start_vertical_bob(8.0, 2.2)  # user request: uçan herşeyle aynı bob hızı
 
 		EnemyType.FROG:
 			# Moves by jumping, leaps toward the player
@@ -691,13 +720,13 @@ func _special_setup() -> void:
 		EnemyType.SLIME_BLUE, EnemyType.SLIME_GREEN, EnemyType.SLIME_PURPLE, EnemyType.SLIME_FIRE:
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			elif sf: _anim.play(sf.get_animation_names()[0])
-			_start_patrol_from(global_position.x, 0.6)
+			_start_patrol_from(global_position.x, 0.6 * GameConstants.SPEED_BUFF)
 			_slime_attack_cd = _rng_range(2.0, 4.0)
 
 		EnemyType.SNAIL:
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			elif sf: _anim.play(sf.get_animation_names()[0])
-			_start_patrol(0.35, true)
+			_start_patrol(0.35 * GameConstants.SPEED_BUFF, true)
 
 		EnemyType.WORM_GREEN, EnemyType.WORM_PINK:
 			_worm_dirt_timer = _rng_range(1.0, WORM_DIRT_COOLDOWN)
@@ -715,7 +744,7 @@ func _special_setup() -> void:
 					_anim.modulate = Color.WHITE
 					_anim.self_modulate = Color.WHITE
 				_col.scale = Vector2(WORM_BABY_SCALE, WORM_BABY_SCALE)
-			_start_patrol_from(global_position.x, spd)
+			_start_patrol_from(global_position.x, spd * GameConstants.SPEED_BUFF)
 
 		EnemyType.LADYBUG:
 			_ladybug_is_resting = false
@@ -723,8 +752,8 @@ func _special_setup() -> void:
 			can_fly = true
 			if sf and sf.has_animation("fly"): _anim.play("fly")
 			elif sf: _anim.play(sf.get_animation_names()[0])
-			_start_patrol(0.8)            # 1.2 / 1.5 → 1.5x slower
-			_start_vertical_bob(10.0, 1.95)  # 1.3 * 1.5 → 1.5x slower bob
+			_start_patrol(0.65 * GameConstants.SPEED_BUFF)            # user request: uçan herşeyle aynı hız
+			_start_vertical_bob(10.0, 2.2)  # user request: uçan herşeyle aynı bob hızı
 
 		EnemyType.SPIDER:
 			can_fly = false
@@ -738,7 +767,7 @@ func _special_setup() -> void:
 			_frog_gm             = get_parent()
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			elif sf: _anim.play(sf.get_animation_names()[0])
-			_start_patrol(1.4)
+			_start_patrol(0.65 * GameConstants.SPEED_BUFF)   # user request: uçan gruple (wingman/bee/fly/ghost) tamamen aynı hız
 
 		EnemyType.GHOST:
 			can_fly = true
@@ -748,11 +777,12 @@ func _special_setup() -> void:
 			_ghost_visible     = true
 			if sf and sf.has_animation("idle"): _anim.play("idle")
 			elif sf: _anim.play(sf.get_animation_names()[0])
-			_start_patrol(0.9)
+			# user request: uçan herşeyle (wingman/bee/fly) tamamen aynı patrol hızı
+			_start_patrol(0.65 * GameConstants.SPEED_BUFF)
 			_start_vertical_bob(12.0, 2.2)
 
 		EnemyType.UFO:
-			UFO_HOVER_SPEED = _vw * 0.0027
+			UFO_HOVER_SPEED = _vw * 0.0027 * GameConstants.SPEED_BUFF
 			UFO_HOVER_RANGE = _vw * 0.30
 			if sf and sf.has_animation("idle"): _anim.play("idle")
 			elif sf: _anim.play(sf.get_animation_names()[0])
@@ -764,7 +794,7 @@ func _special_setup() -> void:
 				_anim.scale *= 1.3
 
 		EnemyType.ALIEN_GREEN:
-			ALIEN_SPEED = _vw * lerpf(0.0008, 0.0015, difficulty)
+			ALIEN_SPEED = _vw * lerpf(0.0008, 0.0015, difficulty) * GameConstants.SPEED_BUFF
 			_frog_cur_platform = _platform
 			_frog_gm           = get_parent()
 			_alien_jump_timer  = _rng.randf_range(ALIEN_JUMP_INTERVAL, ALIEN_JUMP_INTERVAL * 1.5)
@@ -775,7 +805,7 @@ func _special_setup() -> void:
 				_anim.scale *= 2.25
 
 		EnemyType.ALIEN_BLUE:
-			ALIEN_SPEED = _vw * lerpf(0.0006, 0.0012, difficulty)
+			ALIEN_SPEED = _vw * lerpf(0.0006, 0.0012, difficulty) * GameConstants.SPEED_BUFF
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			_start_patrol(ALIEN_SPEED)
 			if is_instance_valid(_col): _col.position.y = _vw * 0.06
@@ -783,7 +813,7 @@ func _special_setup() -> void:
 				_anim.scale *= 2.25
 
 		EnemyType.ALIEN_PINK:
-			ALIEN_SPEED = _vw * 0.0006
+			ALIEN_SPEED = _vw * 0.0006 * GameConstants.SPEED_BUFF
 			_alien_shoot_timer = _rng.randf_range(2.0, ALIEN_SHOOT_INTERVAL)
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			_start_patrol(ALIEN_SPEED)
@@ -792,7 +822,7 @@ func _special_setup() -> void:
 				_anim.scale *= 2.25
 
 		EnemyType.ALIEN_YELLOW:
-			ALIEN_SPEED = _vw * lerpf(0.0012, 0.002, difficulty)
+			ALIEN_SPEED = _vw * lerpf(0.0012, 0.002, difficulty) * GameConstants.SPEED_BUFF
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			_start_patrol(ALIEN_SPEED)
 			if is_instance_valid(_col): _col.position.y = _vw * 0.06
@@ -921,8 +951,8 @@ func _special_hit(body: Node, stomped: bool, powered: bool) -> bool:
 									elif sf2.has_animation("idle"):
 										_anim_play("idle")
 							)
-			elif not powered:
-				body.hit_enemy()
+			# user request: alttan/yandan temasta hiçbir şey olmasın, sadece
+			# üstten basılınca (stomped) zıplatsın — hasar verme kısmı kaldırıldı
 			return true
 
 		EnemyType.BARNACLE:
@@ -1057,8 +1087,8 @@ func _wingman_ai(_delta: float) -> void:
 			var return_dist : float = absf(global_position.y - _start_y)
 			var return_secs : float = clampf(return_dist / maxf(WINGMAN_RETURN_SPEED, 1.0), 0.15, 2.0)
 			_move_to(Vector2(global_position.x, _start_y), return_secs, false, true, false, func():
-				_start_patrol_from(global_position.x, 1.0, true)   # matched to BEE
-				_start_vertical_bob(10.0, 1.8)
+				_start_patrol_from(global_position.x, 0.65, true)   # user request: setup ile eşit (0.65)
+				_start_vertical_bob(10.0, 2.2)  # user request: uçan herşeyle aynı bob hızı
 			)
 
 
@@ -1138,12 +1168,25 @@ func _ground_chase_step(aggro_range: float, chase_speed: float,
 				_anim_flip(dx)   # keep facing the player
 				_play_idle_or_walk(true)
 			return true
-		var new_x : float = global_position.x + dir * chase_speed * FIXED_DELTA
+		# BUG FIX: when the enemy is close enough that a single step would carry
+		# it PAST the player's x, it used to still take the full chase_speed
+		# step every tick — overshooting the player, flipping dx's sign next
+		# tick, overshooting back the other way, flipping again, forever. That's
+		# the "çok seri sağ sol" jitter once a fast chaser (spider especially,
+		# high SPIDER_BURST_SPEED) catches up to the player. Fix: clamp the step
+		# to the remaining distance so the enemy stops exactly at the player's x
+		# instead of oscillating around it.
+		var step : float = chase_speed * FIXED_DELTA
+		var new_x : float
+		if abs(dx) <= step:
+			new_x = global_position.x + dx
+		else:
+			new_x = global_position.x + dir * step
 		new_x = clampf(new_x, left_x, right_x)
 		global_position.x = new_x
 		if is_instance_valid(_anim):
 			_anim_flip(dx)
-			_play_idle_or_walk(false)
+			_play_idle_or_walk(abs(dx) <= step)
 		return true
 
 	# NOT in range — make sure we are patrolling. If we were chasing, resume
@@ -1160,7 +1203,12 @@ func _ground_chase_step(aggro_range: float, chase_speed: float,
 #  SPIKEMAN AI — patrol + chase player on the same platform (unkillable)
 # ══════════════════════════════════════════════════════════════════════
 func _spikeman_ai(_delta: float) -> void:
-	_ground_chase_step(SPIKEMAN_DETECT_X, SPIKEMAN_CHASE_SPEED, 1.0, false)
+	# User request: SPIKEMAN no longer tracks/chases the player — just patrols
+	# left/right forever. _tick_patrol() (EnemyBase.gd) already handles that
+	# movement every tick on its own, since setup() already called
+	# _start_patrol() for EnemyType.SPIKEMAN — nothing else needed here.
+	# Was: _ground_chase_step(SPIKEMAN_DETECT_X, SPIKEMAN_CHASE_SPEED, 1.0, false) — vars removed, see setup()
+	pass
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1178,14 +1226,16 @@ func _cloud_ai(_delta: float) -> void:
 	var follow_speed : float = CLOUD_FOLLOW_SPEED * _speed_variance
 
 	# X: follow player slowly
-	var target_x : float = global_position.x + signf(dx) * minf(abs(dx), follow_speed * FIXED_DELTA)
+	# user request: yatay hız %30 azaltıldı
+	var x_speed : float = follow_speed * 0.7
+	var target_x : float = global_position.x + signf(dx) * minf(abs(dx), x_speed * FIXED_DELTA)
 	global_position.x = target_x
 
 	# Y: try to stay above player — target is player.y - hover_offset
 	# Move upward slowly so player ends up below the cloud
 	var hover_offset : float = _vh * 0.12   # how far above player to hover
 	var target_y : float = p.global_position.y - hover_offset
-	var y_speed  : float = follow_speed * 0.825 * FIXED_DELTA
+	var y_speed  : float = follow_speed * 0.825 * 1.15 * FIXED_DELTA   # user request: dikey hız %15 artırıldı
 	if global_position.y > target_y:
 		# Cloud is below target — move up
 		global_position.y = maxf(global_position.y - y_speed, target_y)
@@ -1277,8 +1327,8 @@ func _bee_ai(_delta: float) -> void:
 			global_position = _bee_home_pos
 			_bee_returning   = false
 			_bee_sting_timer = BEE_STING_COOLDOWN
-			_start_patrol_from(global_position.x, 1.0, true)
-			_start_vertical_bob(8.0, 1.2)
+			_start_patrol_from(global_position.x, 0.65, true)   # user request: setup ile eşit (0.65)
+			_start_vertical_bob(8.0, 2.2)  # user request: uçan herşeyle aynı bob hızı
 		return
 
 	var p := _get_player()
@@ -1635,7 +1685,7 @@ func _slime_ai(_delta: float) -> void:
 	_slime_attack_cd = maxf(0.0, _slime_attack_cd - FIXED_DELTA)
 	# NOTE: do NOT early-return on headless here. The RNG calls that reset
 	# _slime_attack_cd must run in both modes so the RNG state stays in sync
-	# with the recording. Only the visual projectile spawning is skipped below.
+	# with the recording.
 	if not _is_headless:
 		for _si in range(_slime_nodes.size() - 1, -1, -1):
 			if not is_instance_valid(_slime_nodes[_si]): _slime_nodes.remove_at(_si)
@@ -1644,21 +1694,23 @@ func _slime_ai(_delta: float) -> void:
 	if _slime_attack_cd > 0.0: return
 	var dist_sq : float = global_position.distance_squared_to(p.global_position)
 	match enemy_type:
-		EnemyType.SLIME_BLUE:
-			var r := _vw * 0.133; if dist_sq < r * r:
-				if not _is_headless: _slime_blue_ice_burst(p)
-				_slime_attack_cd = _rng_range(3.0, 5.0) * (1.0 - difficulty * 0.2)
+		# user request: mavi slime artık efekt atmıyor, diğer slime'lar gibi
+		# sadece temasla (dokunuşla) saldırıyor — SLIME_BLUE case'i kaldırıldı.
 		EnemyType.SLIME_GREEN:
 			var r := _vw * 0.117; if dist_sq < r * r:
-				if not _is_headless: _slime_green_spit(p)
+				# BUG FIX: eskiden "if not _is_headless:" ile çağrılıyordu, yani
+				# headless'ta bu saldırının kaydettiği gerçek proj_damage hiç
+				# oluşmuyordu (bkz. _init_tex_cache'teki not). Artık her modda çağrılıyor.
+				_slime_green_spit(p)
 				_slime_attack_cd = _rng_range(4.0, 6.0) * (1.0 - difficulty * 0.2)
 		EnemyType.SLIME_PURPLE:
 			var r := _vw * 0.167; if dist_sq < r * r:
-				if not _is_headless: _slime_purple_spawn_mini(p)
+				_slime_purple_spawn_mini(p)   # BUG FIX: aynı şekilde artık her modda çalışıyor
 				_slime_attack_cd = _rng_range(4.5, 7.0) * (1.0 - difficulty * 0.3)
 
 
 func _slime_blue_ice_burst(target: Node) -> void:
+	# NOTE: artık hiçbir yerden çağrılmıyor (user request: mavi slime efekt atmasın)
 	if _is_headless: return
 	var parent := get_parent()
 	if not parent: return
@@ -1890,7 +1942,8 @@ func _worm_throw_dirt(target: Node) -> void:
 		if shake:
 			shake.tween_property(_anim, "position", Vector2(0, -_vh * 0.005), 0.07)
 			shake.tween_property(_anim, "position", Vector2.ZERO, 0.07)
-	var count := 2 if difficulty > 0.5 else 1
+	# user request: zorluk fark etmeksizin her zaman tek parçacık atsın (eski: zorluk 0.5 üstünde 2 taneydi)
+	var count := 1
 	for i in count:
 		var offset_x := dir * _rng_range(_vw * 0.008, _vw * 0.033) * float(i + 1)
 		_worm_spawn_dirt_block(parent, dir, offset_x)
@@ -2076,7 +2129,7 @@ func _ladybug_ai(_delta: float) -> void:
 			can_fly = true
 			if sf and sf.has_animation("fly"):
 				_anim_play("fly")
-			_start_patrol_from(global_position.x, 0.87, true)  # 1.3 / 1.5 → 1.5x slower
+			_start_patrol_from(global_position.x, 0.6525, true)  # 0.87 * 0.75 -> -25% (user request)
 			_start_vertical_bob(10.0, 1.8)  # 1.2 * 1.5 → 1.5x slower bob
 			if DEBUG_LADYBUG:
 				print("[LADYBUG id=%d] waking up, taking off from (%.1f, %.1f)" %
@@ -2187,6 +2240,11 @@ func _spider_get_vertical_neighbors() -> Array:
 	var best_down_d: float = INF
 	for pl in plat_list:
 		if not is_instance_valid(pl): continue
+		# BUG FIX: kırık (BROKEN) tip platformlar ya da şu an kırılmakta/
+		# çökmekte olan (_breaking) platformlar hedef alınmamalı — spider
+		# oraya ağ atıp tırmanırsa platform anında yok oluyor/oynayamıyor.
+		if pl.get("platform_type") == Platform.PlatformType.BROKEN: continue
+		if pl.get("_breaking") == true: continue
 		var pdx : float = abs(pl.global_position.x - anchor.x)
 		var pdy : float = pl.global_position.y - anchor.y
 		if pdx > max_dx: continue
@@ -2283,7 +2341,7 @@ func _spider_ai(_delta: float) -> void:
 	# fastest grounder: quicker patrol and a higher chase speed give it that
 	# "rushes at you" feel, but it's still hard-clamped on-platform.
 	_spider_burst_active = _ground_chase_step(SPIDER_AGGRO_RANGE,
-		_vw * 0.55, 1.6, _spider_burst_active)
+		SPIDER_BURST_SPEED, 1.6 * GameConstants.SPEED_BUFF, _spider_burst_active)
 
 
 # Shoots a single taut web thread to `target_plat` FIRST (spider stays put while

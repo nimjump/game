@@ -21,11 +21,14 @@ run/max_fps=60
 config/icon="uid://76vl82m410ia"
 application/run/low_processor_mode=false
 
+[audio]
+
+driver/driver.web="Dummy"
+
 [autoload]
 
 ApiConfig="*res://scripts/ApiConfig.gd"
 NimiqJS="*res://scripts/NimiqJS.gd"
-VSManager="*res://scripts/VSManager.gd"
 GlobalTheme="*res://scripts/GlobalTheme.gd"
 
 [display]

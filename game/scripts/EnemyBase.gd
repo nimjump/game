@@ -41,6 +41,8 @@ const PATROL_TIME  := 1.3
 # If the cyan/green lines don't line up with the yellow box, the bounds maths
 # is wrong. Flip this to false (or delete this block) to turn the overlay off.
 const DEBUG_DRAW_BOUNDS := false
+# user request: sadece hitbox'ı (çarpışma alanını) göster, bounds/metin gürültüsü olmadan
+const DEBUG_DRAW_HITBOX := true
 
 # ── State variables ──────────────────────────────────────────────────────────────────
 var _rng           : RandomNumberGenerator = RandomNumberGenerator.new()
@@ -293,8 +295,8 @@ func simulate_tick() -> void:
 	global_position.x = snappedf(global_position.x, 0.01)
 	global_position.y = snappedf(global_position.y, 0.01)
 	_tick_player_overlap()
-	if DEBUG_DRAW_BOUNDS:
-		queue_redraw()   # refresh the on-screen bounds overlay every tick
+	if DEBUG_DRAW_BOUNDS or DEBUG_DRAW_HITBOX:
+		queue_redraw()   # refresh the on-screen bounds/hitbox overlay every tick
 
 
 func _tick_patrol(delta: float) -> void:
@@ -356,7 +358,13 @@ func _tick_player_overlap() -> void:
 	var dx : float = (p.global_position.x) - global_position.x
 	var dy : float = (p.global_position.y + _overlap_v_offset.y) - global_position.y
 	var dist_sq   : float = dx * dx + dy * dy
-	var threshold : float = _vw * 0.043
+	# HARDENING: +0.05 — same float-boundary tie-break fix applied to the
+	# platform-landing check and item-pickup overlap tests (see Player.gd
+	# LAND_EPS / GameManager.gd _OVERLAP_EPS). This threshold gates
+	# stomp/hit/death, so a tie right at the boundary is worth the same
+	# treatment — makes the outcome consistent across replay viewings
+	# instead of knife-edge on accumulated float noise.
+	var threshold : float = _vw * 0.043 + 0.05
 	if dist_sq <= threshold * threshold:
 		if not _overlap_triggered:
 			_overlap_triggered = true
@@ -372,7 +380,12 @@ func _on_body_entered(body: Node) -> void:
 		(body.get("_powerup_is_jetpack") or body.get("_powerup_is_wings"))
 	if player_flying and not can_fly: return
 	var rel_y   : float = body.global_position.y - global_position.y
-	var from_above : bool = rel_y < _vh * 0.01
+	# user request: eski _vh*0.05 (≈40px) toleransı çok gevşekti — oyuncu
+	# neredeyse yandan/içten vurduğunda bile (sadece hafif düşüyor olsa yeterdi)
+	# stomp sayılıp yaratık ölüyordu. _vh*0.015'e (≈12px) çekildi: gerçekten
+	# üstten gelen vuruşlar hâlâ sayılır, ama yandan/aşağıdan temas artık
+	# stomp olarak yanlış algılanmıyor.
+	var from_above : bool = rel_y < _vh * 0.02   # ≈16px (user request)
 	var stomped : bool = from_above and body.is_stomping()
 	var powered : bool  = body.is_powered_up
 	if _special_hit(body, stomped, powered): return
@@ -580,9 +593,28 @@ func seek_reset() -> void:
 	_snap_dirty = true
 	# Re-snap immediately so the enemy is visually in the right place
 	_snap_to_platform()
-	# Resume patrol from current X so there's no positional jump
-	if _patrol_active:
-		_start_patrol(1.0, true)  # resume=true preserves current x phase
+	# DETERMINISM FIX: do NOT call _start_patrol(..., true) here.
+	#
+	# GameManager.seek_to_tick() reaches this point by re-running
+	# _run_one_tick() in a loop from tick 0 up to the target tick — which
+	# means simulate_tick() -> _tick_patrol() has ALREADY advanced
+	# _patrol_timer / _patrol_active / global_position.x tick-by-tick, bit
+	# for bit identically to a normal (non-seeked) playthrough. That state
+	# is already correct here; nothing needs to be "resumed."
+	#
+	# The old code called _start_patrol(1.0, true), whose resume=true path
+	# (see _start_patrol_from) reconstructs _patrol_timer from the enemy's
+	# CURRENT x using `acos(cos_val)`. acos() only ever returns a value in
+	# [0, π], so it cannot distinguish whether the enemy was on the rising
+	# or falling half of its patrol curve — roughly half the time it silently
+	# picked the WRONG half-cycle. That overwrote the correct, tick-simulated
+	# phase with a bad reconstruction, and only on a seek/rewind/scrub — never
+	# during a straight, non-seeked playthrough of the same replay. From that
+	# point on the enemy could patrol in the mirrored direction, its distance
+	# to the player in _tick_player_overlap() would differ from the original
+	# run, and a stomp/hit could register differently after a seek than it
+	# did live or on a straight replay. Simply not touching the already-correct
+	# state fixes this.
 	# Restore idle animation — _die() plays "hurt" which may persist after seek reset
 	if is_instance_valid(_anim) and _anim.sprite_frames:
 		var sf := _anim.sprite_frames
@@ -776,6 +808,18 @@ func _find_collision_shape(n: Node) -> CollisionShape2D:
 
 # ── DEBUG draw — shows the live bounds the AI is actually using ───────
 func _draw() -> void:
+	if _is_headless: return
+	if DEBUG_DRAW_HITBOX and not DEBUG_DRAW_BOUNDS:
+		# Sade hitbox gösterimi: sadece gerçek çarpışma dairesi (player-overlap testi
+		# _vw*0.043 yarıçapında) — bounds/metin gürültüsü yok.
+		draw_arc(Vector2.ZERO, _vw * 0.043, 0.0, TAU, 32, Color(1, 0, 1, 0.9), 3.0)
+		if is_instance_valid(_col) and _col.shape:
+			if _col.shape is RectangleShape2D:
+				var sz : Vector2 = (_col.shape as RectangleShape2D).size
+				draw_rect(Rect2(_col.position - sz * 0.5, sz), Color(0, 1, 1, 0.9), false, 2.0)
+			elif _col.shape is CircleShape2D:
+				draw_arc(_col.position, (_col.shape as CircleShape2D).radius, 0.0, TAU, 32, Color(0, 1, 1, 0.9), 2.0)
+		return
 	if not DEBUG_DRAW_BOUNDS: return
 	if _is_headless: return
 	var h : float = _vh * 0.05

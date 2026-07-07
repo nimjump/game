@@ -2,8 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
+	"time"
 
 	"github.com/valyala/fasthttp"
 
@@ -211,6 +211,18 @@ func (s *Server) handleAdminTestTelegram(ctx *fasthttp.RequestCtx) {
 
 // POST /bj/leaderboard/pay-winners
 // Body: {"period_type":"daily","period":"2026-06-17"}
+//
+// BUG FIX: when `period` was omitted, this used to default to game.CurrentPeriods()
+// — i.e. TODAY's still-open day / THIS week, not the period that just ENDED.
+// Paying winners only makes sense for a CLOSED period (the one that just
+// finished), so if this was ever triggered without an explicit period (e.g.
+// a midnight cron job with no arguments), it would snapshot winners for a
+// period that had just started seconds earlier — zero sessions in it yet —
+// and queue zero rewards. No error was raised, so it failed completely
+// silently. Default is now the most recently CLOSED period (yesterday for
+// daily, last ISO week for weekly) instead of the current one. Callers that
+// explicitly pass `period` (e.g. an admin re-paying a specific past date)
+// are unaffected.
 func (s *Server) handleLeaderboardPayWinners(ctx *fasthttp.RequestCtx) {
 	var req struct {
 		PeriodType string `json:"period_type"`
@@ -224,58 +236,30 @@ func (s *Server) handleLeaderboardPayWinners(ctx *fasthttp.RequestCtx) {
 		req.PeriodType = "daily"
 	}
 	if req.Period == "" {
-		daily, weekly := game.CurrentPeriods()
-		if req.PeriodType == "daily" {
-			req.Period = daily
-		} else {
-			req.Period = weekly
-		}
+		req.Period = game.PreviousClosedPeriod(req.PeriodType)
+		log.Printf("[LEADERBOARD_PAY] no period given — defaulting to last closed %s period=%s",
+			req.PeriodType, req.Period)
 	}
 
-	// Get winners (create snapshot if none exists)
-	pw, err := s.Store.GetWinners(req.Period)
-	if err != nil || pw == nil {
-		pw, err = s.Store.SnapshotWinners(req.PeriodType, req.Period)
-		if err != nil {
-			writeErr(ctx, 500, "snapshot_error")
-			return
-		}
+	// Shared with the automatic payout loop (game.StartLeaderboardPayoutLoop)
+	// — idempotent via the lb:paid: marker, so re-running this for a period
+	// the auto-loop already paid is a safe no-op, not a double payment.
+	// If the period was already paid, surface that explicitly instead of
+	// silently returning queued=0 with no explanation.
+	alreadyPaid := s.Store.IsPeriodPaid(req.Period)
+	queued, err := s.Store.PayWinnersForPeriod(req.PeriodType, req.Period)
+	if err != nil {
+		writeErr(ctx, 500, "payout_error: "+err.Error())
+		return
 	}
 
-	type queueResult struct {
-		PlayerID string  `json:"player_id"`
-		Nickname string  `json:"nickname"`
-		Rank     int     `json:"rank"`
-		PrizeNIM float64 `json:"prize_nim"`
-		RewardID string  `json:"reward_id,omitempty"`
-		Error    string  `json:"error,omitempty"`
-	}
-
-	results := make([]queueResult, 0, len(pw.Winners))
-	for _, w := range pw.Winners {
-		if w.PrizeNIM <= 0 {
-			continue
-		}
-		res := queueResult{
-			PlayerID: w.PlayerID,
-			Nickname: w.Nickname,
-			Rank:     w.Rank,
-			PrizeNIM: w.PrizeNIM,
-		}
-		reason := fmt.Sprintf("leaderboard:%s:%s:rank%d", req.PeriodType, req.Period, w.Rank)
-		reward, rerr := s.Store.QueueReward(w.PlayerID, w.PrizeNIM, reason)
-		if rerr != nil {
-			res.Error = rerr.Error()
-		} else {
-			res.RewardID = reward.ID
-		}
-		results = append(results, res)
-	}
+	log.Printf("[LEADERBOARD_PAY] period_type=%s period=%s queued=%d already_paid=%v",
+		req.PeriodType, req.Period, queued, alreadyPaid)
 
 	writeJSON(ctx, 200, map[string]any{
-		"period":      req.Period,
-		"period_type": req.PeriodType,
-		"queued":      len(results),
-		"results":     results,
+		"period":       req.Period,
+		"period_type":  req.PeriodType,
+		"queued":       queued,
+		"already_paid": alreadyPaid,
 	})
 }

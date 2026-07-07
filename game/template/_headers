@@ -12,3 +12,14 @@
 # wasm-loader.js). Whatever goes here gets copied into export/ as-is
 # by build.py on every run — this file (in game/template/) is the
 # source of truth, don't edit the copy inside export/ directly.
+
+# ── CSP FIX (broad/permissive on purpose) ───────────────────────────────────
+# Root cause of "loads to 100%, then the page reloads itself" on some
+# mobile browsers/webviews: script-src-elem and connect-src were being
+# blocked (no explicit CSP was set anywhere before this, so the browser/
+# host's own default kicked in and blocked things like unpkg.com and the
+# wasm/pck asset fetches). This policy is intentionally wide open so
+# NOTHING gets blocked while we stabilize — tighten it later once confirmed
+# fixed (swap the https:/wss: wildcards for the actual backend + CDN domains).
+/*
+  Content-Security-Policy: default-src 'self' https: wss: blob: data:; script-src 'self' https: blob: data: 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; script-src-elem 'self' https: blob: data: 'unsafe-inline'; worker-src 'self' https: blob: data:; connect-src 'self' https: wss: blob: data:; style-src 'self' https: 'unsafe-inline'; img-src 'self' https: blob: data:; font-src 'self' https: data:; media-src 'self' https: blob: data:; manifest-src 'self' https:; frame-src 'self' https:; child-src 'self' https: blob:; object-src 'none'

@@ -178,84 +178,16 @@ func (s *Store) List(onlyFlagged bool, limit int) []models.Session {
 	return out
 }
 
-// ── Pending session cleanup & crash recovery ──────────────────────────────────
-
-const pendingExpiry = 7 * 24 * time.Hour // 1 hafta bekleyen session silinir
-
-// StartCleanupLoop — runs in background, deletes pending sessions older than 1 week.
-// Cleans up sessions left incomplete due to server crashes.
-// StateCompleted sessions are left to Badger's TTL (90 days).
-func (s *Store) StartCleanupLoop() {
-	go func() {
-		// On first run, log recoverable sessions
-		s.logOrphanedSessions()
-		ticker := time.NewTicker(6 * time.Hour)
-		defer ticker.Stop()
-		for range ticker.C {
-			s.cleanupStalePending()
-		}
-	}()
-}
-
-// logOrphanedSessions — logs sessions left incomplete at startup (pending with GameStartedAt set).
-// Used to surface sessions not submitted due to server crash.
-func (s *Store) logOrphanedSessions() {
-	count := 0
-	cutoff := time.Now().Add(-5 * time.Minute).Unix() * 1000 // 5 dakikadan eski
-	_ = s.db.View(func(txn *badger.Txn) error {
-		it := txn.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
-		pfx := []byte("s:")
-		for it.Seek(pfx); it.ValidForPrefix(pfx); it.Next() {
-			_ = it.Item().Value(func(v []byte) error {
-				var sess models.Session
-				if err := json.Unmarshal(v, &sess); err != nil { return nil }
-				if sess.State == models.StatePending && sess.GameStartedAt > 0 && sess.GameStartedAt < cutoff {
-					count++
-				}
-				return nil
-			})
-		}
-		return nil
-	})
-	if count > 0 {
-		log.Printf("[CLEANUP] %d orphaned sessions found (started but never submitted — possible crash)", count)
-	} else {
-		log.Printf("[CLEANUP] no orphaned sessions — clean start")
-	}
-}
-
-// cleanupStalePending — deletes pending sessions older than 1 week.
-// These sessions will never complete (user quit, connection lost, etc.)
-func (s *Store) cleanupStalePending() {
-	cutoff := time.Now().Add(-pendingExpiry).Unix()
-	var toDelete []string
-	_ = s.db.View(func(txn *badger.Txn) error {
-		it := txn.NewIterator(badger.DefaultIteratorOptions)
-		defer it.Close()
-		pfx := []byte("s:")
-		for it.Seek(pfx); it.ValidForPrefix(pfx); it.Next() {
-			_ = it.Item().Value(func(v []byte) error {
-				var sess models.Session
-				if err := json.Unmarshal(v, &sess); err != nil { return nil }
-				if sess.State == models.StatePending && sess.CreatedAt < cutoff {
-					toDelete = append(toDelete, sess.SessionID)
-				}
-				return nil
-			})
-		}
-		return nil
-	})
-	if len(toDelete) == 0 { return }
-	deleted := 0
-	for _, id := range toDelete {
-		_ = s.db.Update(func(txn *badger.Txn) error {
-			return txn.Delete(key(id))
-		})
-		deleted++
-	}
-	log.Printf("[CLEANUP] deleted %d stale pending sessions (>1 week old)", deleted)
-}
+// ── Pending session cleanup — REMOVED ─────────────────────────────────────────
+//
+// This used to hold StartCleanupLoop / logOrphanedSessions / cleanupStalePending,
+// which deleted "pending" sessions older than 1 week (StatePending, meant to mark
+// a game started-but-not-yet-submitted). Removed because that state was never
+// actually reachable: the only place a Session is ever created is the /submit
+// handler (see handlers/server.go), and it always saves State as StateCompleted
+// or StateFlagged immediately — there was never a separate "start game" call
+// that wrote StatePending first. So these functions always found zero orphaned/
+// stale-pending sessions; pure dead code kept alive by nothing.
 
 // Delete — removes a session from DB (for cleanup)
 func (s *Store) Delete(sessionID string) error {
