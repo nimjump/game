@@ -209,11 +209,27 @@ func (s *Server) handleStats(ctx *fasthttp.RequestCtx) {
 //	&player_id=NQ...            (self entry için; token'dan da alınır)
 func (s *Server) handleLeaderboard(ctx *fasthttp.RequestCtx) {
 	periodType := string(ctx.QueryArgs().Peek("period_type"))
+	period := string(ctx.QueryArgs().Peek("period"))
+
+	// Compat: the game client sends the TYPE (daily/weekly/alltime) as
+	// `period`, and never sends `period_type` at all. Without this,
+	// period_type always fell through to the "daily" default below
+	// regardless of what the client asked for — so requesting
+	// period=weekly silently returned the daily leaderboard. If
+	// period_type is absent/empty but period looks like a type value,
+	// treat it as the type and clear period so the block below resolves
+	// it to the real current day/week key.
+	if periodType == "" {
+		switch period {
+		case "daily", "weekly", "alltime":
+			periodType = period
+			period = ""
+		}
+	}
 	if periodType == "" {
 		periodType = "daily"
 	}
 
-	period := string(ctx.QueryArgs().Peek("period"))
 	if period == "" && periodType != "alltime" {
 		daily, weekly := game.CurrentPeriods()
 		if periodType == "weekly" {

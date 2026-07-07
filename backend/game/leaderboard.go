@@ -177,7 +177,16 @@ func (s *Store) periodBoundsForType(periodType, period string) (int64, int64) {
 	if periodType == "alltime" {
 		return 0, 0
 	}
-	if period == "" {
+	// Some callers (observed: the game client) pass period=daily/weekly/alltime
+	// instead of a real period key like "2026-07-07" or "2026-W27" — that's a
+	// period_type value, not a period. Treat it the same as period=="" so we
+	// resolve it to the actual current day/week below. Without this, periodBounds
+	// failed to parse the bogus value and fell back to start=0 (all-time — every
+	// score ever, ignoring the period entirely), AND the reset marker match below
+	// (m.Period == period) could never succeed since the marker stores a real
+	// period key, so an admin reset silently had no effect for these callers.
+	switch period {
+	case "", "daily", "weekly", "alltime":
 		daily, weekly := CurrentPeriods()
 		if periodType == "weekly" {
 			period = weekly
