@@ -225,7 +225,6 @@ func main() {
 	game.GetWorkerPool()
 	srv := &handlers.Server{Store: store}
 	srv.StartBackgroundServices()
-	store.StartCleanupLoop()
 
 	// Root context for everything that should die when the backend does —
 	// right now just the admin app supervisor (adminproc.go). Cancelled in

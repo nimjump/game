@@ -3,7 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"log"
-	"time"
 
 	"github.com/valyala/fasthttp"
 

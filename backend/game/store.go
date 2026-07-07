@@ -3,7 +3,6 @@ package game
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
