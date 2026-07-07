@@ -36,78 +36,79 @@ func (s *Server) Register(r *router.Router) {
 	}
 
 	// Admin login — no auth required to reach these (this IS the auth).
-	r.POST("/backend/admin/login",  s.handleAdminLogin)
+	r.POST("/backend/admin/login", s.handleAdminLogin)
 	r.POST("/backend/admin/logout", s.handleAdminLogout)
-	r.GET("/backend/admin/me",      s.handleAdminMe)
+	r.GET("/backend/admin/me", s.handleAdminMe)
 
 	// Admin endpoints — exposed to the public internet, so every one of
 	// these is protected by a session cookie (see admin_session.go; set
 	// via POST /backend/admin/login, checked against ADMIN_USERNAME /
 	// ADMIN_PASSWORD). They bypass rate limiting (only admins use these).
-	r.GET("/backend/developer-mode",            s.handleDeveloperModeGet) // public, read-only — no auth needed
-	r.POST("/backend/admin/developer-mode",     s.requireAdminSession(s.handleDeveloperModeSet))
-	r.POST("/backend/admin/prizes",            s.requireAdminSession(s.handleAdminSetPrizes))
-	r.POST("/backend/admin/snapshot",          s.requireAdminSession(s.handleAdminSnapshot))
-	r.POST("/backend/admin/nimiq-config",      s.requireAdminSession(s.handleAdminNimiqConfig))
-	r.GET("/backend/admin/nimiq-config",       s.requireAdminSession(s.handleAdminNimiqConfigGet))
-	r.GET("/backend/admin/nimiq-balance",      s.requireAdminSession(s.handleAdminNimiqBalance))
-	r.GET("/backend/admin/rewards",            s.requireAdminSession(s.handleAdminRewards))
-	r.POST("/backend/admin/rewards/retry",     s.requireAdminSession(s.handleAdminRetryRewards))
-	r.POST("/backend/admin/test-telegram",     s.requireAdminSession(s.handleAdminTestTelegram))
-	r.GET("/backend/admin/devices",             s.requireAdminSession(s.handleAdminDevices))
+	r.GET("/backend/developer-mode", s.handleDeveloperModeGet) // public, read-only — no auth needed
+	r.POST("/backend/admin/developer-mode", s.requireAdminSession(s.handleDeveloperModeSet))
+	r.POST("/backend/admin/prizes", s.requireAdminSession(s.handleAdminSetPrizes))
+	r.POST("/backend/admin/snapshot", s.requireAdminSession(s.handleAdminSnapshot))
+	r.POST("/backend/admin/nimiq-config", s.requireAdminSession(s.handleAdminNimiqConfig))
+	r.GET("/backend/admin/nimiq-config", s.requireAdminSession(s.handleAdminNimiqConfigGet))
+	r.GET("/backend/admin/nimiq-balance", s.requireAdminSession(s.handleAdminNimiqBalance))
+	r.GET("/backend/admin/rewards", s.requireAdminSession(s.handleAdminRewards))
+	r.POST("/backend/admin/rewards/retry", s.requireAdminSession(s.handleAdminRetryRewards))
+	r.POST("/backend/admin/test-telegram", s.requireAdminSession(s.handleAdminTestTelegram))
+	r.GET("/backend/admin/devices", s.requireAdminSession(s.handleAdminDevices))
 	r.GET("/backend/admin/devices/{device_id}", s.requireAdminSession(s.handleAdminDevice))
-	r.POST("/backend/admin/test-replay",        s.requireAdminSession(s.handleAdminTestReplay))
-	r.GET("/backend/admin/overview",            s.requireAdminSession(s.handleAdminOverview))
-	r.GET("/backend/admin/sessions",            s.requireAdminSession(s.handleAdminSessions))
-	r.GET("/backend/admin/worker-status",       s.requireAdminSession(s.handleAdminWorkerStatus))
+	r.POST("/backend/admin/test-replay", s.requireAdminSession(s.handleAdminTestReplay))
+	r.GET("/backend/admin/overview", s.requireAdminSession(s.handleAdminOverview))
+	r.GET("/backend/admin/sessions", s.requireAdminSession(s.handleAdminSessions))
+	r.GET("/backend/admin/worker-status", s.requireAdminSession(s.handleAdminWorkerStatus))
 	r.POST("/backend/admin/replay-retry/{session_id}", s.requireAdminSession(s.handleAdminReplayRetry))
-	r.GET("/backend/admin/client-logs",              s.requireAdminSession(s.handleAdminClientLogs))
-	r.DELETE("/backend/admin/client-logs",           s.requireAdminSession(s.handleAdminDeleteClientLogs))
-	r.GET("/backend/admin/replay-failed",            s.requireAdminSession(s.handleAdminReplayFailed))
-	r.GET("/backend/admin/player",                   s.requireAdminSession(s.handleAdminPlayer))
-	r.GET("/backend/admin/players",                  s.requireAdminSession(s.handleAdminPlayersList))
-	r.POST("/backend/admin/session/{session_id}",    s.requireAdminSession(s.handleAdminSessionPatch))
-	r.GET("/backend/admin/analytics",               s.requireAdminSession(s.handleAdminAnalytics))
+	r.GET("/backend/admin/client-logs", s.requireAdminSession(s.handleAdminClientLogs))
+	r.DELETE("/backend/admin/client-logs", s.requireAdminSession(s.handleAdminDeleteClientLogs))
+	r.GET("/backend/admin/replay-failed", s.requireAdminSession(s.handleAdminReplayFailed))
+	r.GET("/backend/admin/player", s.requireAdminSession(s.handleAdminPlayer))
+	r.GET("/backend/admin/players", s.requireAdminSession(s.handleAdminPlayersList))
+	r.POST("/backend/admin/session/{session_id}", s.requireAdminSession(s.handleAdminSessionPatch))
+	r.GET("/backend/admin/analytics", s.requireAdminSession(s.handleAdminAnalytics))
 
 	// App config — leaderboard on/off, update mode, replay version, replay binary upload
-	r.GET("/backend/admin/config",                  s.requireAdminSession(s.handleAdminGetConfig))
-	r.POST("/backend/admin/config",                 s.requireAdminSession(s.handleAdminSetConfig))
-	r.POST("/backend/admin/update-mode",            s.requireAdminSession(s.handleAdminSetUpdateMode))
-	r.POST("/backend/admin/update-complete",        s.requireAdminSession(s.handleAdminCompleteUpdate))
-	r.GET("/backend/admin/device-breakdown",        s.requireAdminSession(s.handleAdminDeviceBreakdown))
-	r.GET("/backend/admin/quest-pool",              s.requireAdminSession(s.handleAdminQuestPool))
-	r.POST("/backend/admin/quest-reward",           s.requireAdminSession(s.handleAdminSetQuestReward))
-	r.POST("/backend/admin/quest-target",           s.requireAdminSession(s.handleAdminSetQuestTarget))
-	r.POST("/backend/admin/replays/clear-all",      s.requireAdminSession(s.handleAdminClearAllReplays))
-	r.GET("/backend/admin/replay-binary",           s.requireAdminSession(s.handleAdminReplayBinaryStatus))
-	r.POST("/backend/admin/replay-binary",          s.requireAdminSession(s.handleAdminReplayBinaryUpload))
-	r.POST("/backend/admin/replay-binary/delete",   s.requireAdminSession(s.handleAdminReplayBinaryDelete))
+	r.GET("/backend/admin/config", s.requireAdminSession(s.handleAdminGetConfig))
+	r.POST("/backend/admin/config", s.requireAdminSession(s.handleAdminSetConfig))
+	r.POST("/backend/admin/update-mode", s.requireAdminSession(s.handleAdminSetUpdateMode))
+	r.POST("/backend/admin/update-complete", s.requireAdminSession(s.handleAdminCompleteUpdate))
+	r.GET("/backend/admin/device-breakdown", s.requireAdminSession(s.handleAdminDeviceBreakdown))
+	r.GET("/backend/admin/quest-pool", s.requireAdminSession(s.handleAdminQuestPool))
+	r.POST("/backend/admin/quest-reward", s.requireAdminSession(s.handleAdminSetQuestReward))
+	r.POST("/backend/admin/quest-target", s.requireAdminSession(s.handleAdminSetQuestTarget))
+	r.POST("/backend/admin/replays/clear-all", s.requireAdminSession(s.handleAdminClearAllReplays))
+	r.POST("/backend/admin/leaderboard/reset", s.requireAdminSession(s.handleAdminLeaderboardReset))
+	r.GET("/backend/admin/replay-binary", s.requireAdminSession(s.handleAdminReplayBinaryStatus))
+	r.POST("/backend/admin/replay-binary", s.requireAdminSession(s.handleAdminReplayBinaryUpload))
+	r.POST("/backend/admin/replay-binary/delete", s.requireAdminSession(s.handleAdminReplayBinaryDelete))
 
 	// Database tab — key-prefix category overview/clear + failed-replay archive
-	r.GET("/backend/admin/database",                s.requireAdminSession(s.handleAdminDatabaseOverview))
-	r.POST("/backend/admin/database/clear",         s.requireAdminSession(s.handleAdminDatabaseClear))
-	r.GET("/backend/admin/failed-replay-archive",   s.requireAdminSession(s.handleAdminFailedReplayArchiveList))
+	r.GET("/backend/admin/database", s.requireAdminSession(s.handleAdminDatabaseOverview))
+	r.POST("/backend/admin/database/clear", s.requireAdminSession(s.handleAdminDatabaseClear))
+	r.GET("/backend/admin/failed-replay-archive", s.requireAdminSession(s.handleAdminFailedReplayArchiveList))
 	r.GET("/backend/admin/failed-replay-archive/{id}/download", s.requireAdminSession(s.handleAdminFailedReplayArchiveDownload))
 
 	// Scheduled deploy jobs — Cloudflare Pages push + replay binary
 	// activation + version bump, triggered now/at-time/daily-lb-end/weekly-lb-end.
-	r.GET("/backend/admin/deploy/status",           s.requireAdminSession(s.handleAdminDeployStatus))
-	r.POST("/backend/admin/deploy/schedule",        s.requireAdminSession(s.handleAdminScheduleDeploy))
-	r.GET("/backend/admin/deploy/jobs",             s.requireAdminSession(s.handleAdminListDeployJobs))
+	r.GET("/backend/admin/deploy/status", s.requireAdminSession(s.handleAdminDeployStatus))
+	r.POST("/backend/admin/deploy/schedule", s.requireAdminSession(s.handleAdminScheduleDeploy))
+	r.GET("/backend/admin/deploy/jobs", s.requireAdminSession(s.handleAdminListDeployJobs))
 	r.POST("/backend/admin/deploy/jobs/{id}/cancel", s.requireAdminSession(s.handleAdminCancelDeployJob))
 
 	// Golden replays — pinned reference replays used to catch determinism
 	// regressions (a code/binary change silently altering simulation
 	// results) before they show up as real player flags.
-	r.GET("/backend/admin/golden-replays",             s.requireAdminSession(s.handleAdminGoldenList))
-	r.POST("/backend/admin/golden-replays",             s.requireAdminSession(s.handleAdminGoldenSave))
-	r.POST("/backend/admin/golden-replays/delete",      s.requireAdminSession(s.handleAdminGoldenDelete))
-	r.POST("/backend/admin/golden-replays/self-test",   s.requireAdminSession(s.handleAdminGoldenSelfTest))
+	r.GET("/backend/admin/golden-replays", s.requireAdminSession(s.handleAdminGoldenList))
+	r.POST("/backend/admin/golden-replays", s.requireAdminSession(s.handleAdminGoldenSave))
+	r.POST("/backend/admin/golden-replays/delete", s.requireAdminSession(s.handleAdminGoldenDelete))
+	r.POST("/backend/admin/golden-replays/self-test", s.requireAdminSession(s.handleAdminGoldenSelfTest))
 
 	// Static determinism lint — scans game/scripts/*.gd for known
 	// determinism-breaking patterns (bare RNG, wall-clock time, hard free(),
 	// array mutation during iteration). See backend/game/determinism_lint.go.
-	r.GET("/backend/admin/determinism-lint",            s.requireAdminSession(s.handleAdminDeterminismLint))
+	r.GET("/backend/admin/determinism-lint", s.requireAdminSession(s.handleAdminDeterminismLint))
 
 	// Admin panel UI — reverse-proxied to the Next.js admin app (runs
 	// separately, see admin/.env for ADMIN_PORT). Same session-cookie gate,
@@ -118,53 +119,53 @@ func (s *Server) Register(r *router.Router) {
 	r.ANY(base+"/{filepath:*}", s.requireAdminSessionPage(s.handleAdminProxy))
 
 	// Public endpoint'ler — rate limitli
-	r.GET("/backend/auth/challenge",            rl(s.handleAuthChallenge))
-	r.POST("/backend/auth/verify",              rl(s.handleAuthVerify))
-	r.GET("/backend/auth/me",                   rl(s.handleAuthMe))
-	r.GET("/backend/ping",                      rl(s.handlePing))
+	r.GET("/backend/auth/challenge", rl(s.handleAuthChallenge))
+	r.POST("/backend/auth/verify", rl(s.handleAuthVerify))
+	r.GET("/backend/auth/me", rl(s.handleAuthMe))
+	r.GET("/backend/ping", rl(s.handlePing))
 	// /prefetch and /game_start removed — offline seed system
-	r.POST("/backend/submit",                   rl(s.handleSubmit))
-	r.GET("/backend/sessions",                  rl(s.handleSessions))
-	r.GET("/backend/leaderboard",               rl(s.handleLeaderboard))
-	r.GET("/backend/leaderboard/prizes",        rl(s.handleLeaderboardPrizes))
-	r.GET("/backend/leaderboard/winners",       rl(s.handleLeaderboardWinners))
-	r.POST("/backend/leaderboard/pay-winners",  rl(s.handleLeaderboardPayWinners))
-	r.POST("/backend/wallet/register",          rl(s.handleWalletRegister))
-	r.GET("/backend/wallet",                    rl(s.handleWalletGet))
-	r.GET("/backend/replay/{session_id}",       rl(s.handleReplay))
-	r.GET("/backend/nickname",                  rl(s.handleNicknameGet))
-	r.POST("/backend/nickname",                 rl(s.handleNicknameSet))
-	r.GET("/backend/nickname/check",            rl(s.handleNicknameCheck))
-	r.GET("/backend/stats",                     rl(s.handleStats))
-	r.GET("/backend/quests",                    rl(s.handleQuests))
-	r.POST("/backend/quests/progress",          rl(s.handleQuestProgress))
-	r.POST("/backend/quests/claim",             rl(s.handleQuestClaim))
-	r.POST("/backend/quests/claim_all",         rl(s.handleQuestClaimAll))
-	r.GET("/backend/replay-status",             rl(s.handleReplayStatus))
-	r.GET("/backend/rewards/history",           rl(s.handleRewardHistory))
-	r.POST("/backend/client-log",               rl(s.handleClientLog))
+	r.POST("/backend/submit", rl(s.handleSubmit))
+	r.GET("/backend/sessions", rl(s.handleSessions))
+	r.GET("/backend/leaderboard", rl(s.handleLeaderboard))
+	r.GET("/backend/leaderboard/prizes", rl(s.handleLeaderboardPrizes))
+	r.GET("/backend/leaderboard/winners", rl(s.handleLeaderboardWinners))
+	r.POST("/backend/leaderboard/pay-winners", rl(s.handleLeaderboardPayWinners))
+	r.POST("/backend/wallet/register", rl(s.handleWalletRegister))
+	r.GET("/backend/wallet", rl(s.handleWalletGet))
+	r.GET("/backend/replay/{session_id}", rl(s.handleReplay))
+	r.GET("/backend/nickname", rl(s.handleNicknameGet))
+	r.POST("/backend/nickname", rl(s.handleNicknameSet))
+	r.GET("/backend/nickname/check", rl(s.handleNicknameCheck))
+	r.GET("/backend/stats", rl(s.handleStats))
+	r.GET("/backend/quests", rl(s.handleQuests))
+	r.POST("/backend/quests/progress", rl(s.handleQuestProgress))
+	r.POST("/backend/quests/claim", rl(s.handleQuestClaim))
+	r.POST("/backend/quests/claim_all", rl(s.handleQuestClaimAll))
+	r.GET("/backend/replay-status", rl(s.handleReplayStatus))
+	r.GET("/backend/rewards/history", rl(s.handleRewardHistory))
+	r.POST("/backend/client-log", rl(s.handleClientLog))
 
 	// VS Rooms — async 1v1 challenge with optional NIM entry fee, plus a
 	// live spectator relay (see vs_live.go) for whichever side is currently
 	// playing their round.
-	r.POST("/backend/vsroom/create",            rl(s.handleVSRoomCreate))
-	r.GET("/backend/vsroom/mine",               rl(s.handleVSRoomMine))
-	r.GET("/backend/vsroom/open",               rl(s.handleVSRoomOpen))
-	r.GET("/backend/vsroom/{id}",               rl(s.handleVSRoomGet))
-	r.POST("/backend/vsroom/{id}/join",         rl(s.handleVSRoomJoin))
-	r.POST("/backend/vsroom/{id}/pay",          rl(s.handleVSRoomConfirmPayment))
-	r.POST("/backend/vsroom/{id}/cancel",       rl(s.handleVSRoomCancel))
-	r.POST("/backend/vsroom/{id}/forfeit",      rl(s.handleVSRoomForfeit))
+	r.POST("/backend/vsroom/create", rl(s.handleVSRoomCreate))
+	r.GET("/backend/vsroom/mine", rl(s.handleVSRoomMine))
+	r.GET("/backend/vsroom/open", rl(s.handleVSRoomOpen))
+	r.GET("/backend/vsroom/{id}", rl(s.handleVSRoomGet))
+	r.POST("/backend/vsroom/{id}/join", rl(s.handleVSRoomJoin))
+	r.POST("/backend/vsroom/{id}/pay", rl(s.handleVSRoomConfirmPayment))
+	r.POST("/backend/vsroom/{id}/cancel", rl(s.handleVSRoomCancel))
+	r.POST("/backend/vsroom/{id}/forfeit", rl(s.handleVSRoomForfeit))
 	// Rate-limited like every other route (guards the handshake itself
 	// against reconnect-storm/scan abuse — the already-open WS connection's
 	// own frame traffic afterward is unaffected). Origin is separately
 	// checked at upgrade time in vs_live.go's CheckOrigin.
-	r.GET("/backend/vsroom/{id}/live",          rl(s.handleVSRoomLivePlay))  // player streams their run
-	r.GET("/backend/vsroom/{id}/watch",         rl(s.handleVSRoomLiveWatch)) // spectator
-	r.GET("/backend/admin/vs-rooms",                     s.requireAdminSession(s.handleAdminVSRooms))
-	r.POST("/backend/admin/vs-rooms/sweep",              s.requireAdminSession(s.handleAdminVSRoomsSweep))
+	r.GET("/backend/vsroom/{id}/live", rl(s.handleVSRoomLivePlay))   // player streams their run
+	r.GET("/backend/vsroom/{id}/watch", rl(s.handleVSRoomLiveWatch)) // spectator
+	r.GET("/backend/admin/vs-rooms", s.requireAdminSession(s.handleAdminVSRooms))
+	r.POST("/backend/admin/vs-rooms/sweep", s.requireAdminSession(s.handleAdminVSRoomsSweep))
 	r.POST("/backend/admin/vs-rooms/reconcile-payments", s.requireAdminSession(s.handleAdminVSRoomsReconcile))
-	r.POST("/backend/admin/vs-rooms/{id}/cancel",        s.requireAdminSession(s.handleAdminVSRoomCancel))
+	r.POST("/backend/admin/vs-rooms/{id}/cancel", s.requireAdminSession(s.handleAdminVSRoomCancel))
 }
 
 // StartBackgroundServices — starts retry loop, balance monitor, and the
@@ -199,13 +200,13 @@ func (s *Server) handleDeveloperModeGet(ctx *fasthttp.RequestCtx) {
 	on := s.Store.GetDeveloperMode()
 	cfg := s.Store.GetAppConfig()
 	writeJSON(ctx, 200, map[string]any{
-		"developer_mode":              on,
-		"message":                     "We're currently updating the game. Come back soon!",
-		"update_active":               cfg.UpdateActive,
-		"update_message":              "Game updating. Please check back shortly — thanks for your patience!",
-		"daily_leaderboard_enabled":   cfg.DailyLeaderboardEnabled,
-		"weekly_leaderboard_enabled":  cfg.WeeklyLeaderboardEnabled,
-		"replay_version":              cfg.ReplayVersion,
+		"developer_mode":             on,
+		"message":                    "We're currently updating the game. Come back soon!",
+		"update_active":              cfg.UpdateActive,
+		"update_message":             "Game updating. Please check back shortly — thanks for your patience!",
+		"daily_leaderboard_enabled":  cfg.DailyLeaderboardEnabled,
+		"weekly_leaderboard_enabled": cfg.WeeklyLeaderboardEnabled,
+		"replay_version":             cfg.ReplayVersion,
 	})
 }
 
@@ -268,9 +269,11 @@ func rleUnpack(raw []byte) (ticks []byte, deltas []float64) {
 			}
 			continue
 		}
-		val   := b & 0x03
+		val := b & 0x03
 		count := (b >> 2) & 0x3F
-		if count == 0 { count = 1 }
+		if count == 0 {
+			count = 1
+		}
 		for k := byte(0); k < count; k++ {
 			ticks = append(ticks, val)
 		}
@@ -295,7 +298,9 @@ func rleTickCount(raw []byte) int {
 			continue
 		}
 		count := int((b >> 2) & 0x3F)
-		if count == 0 { count = 1 }
+		if count == 0 {
+			count = 1
+		}
 		total += count
 		i++
 	}
@@ -307,8 +312,8 @@ func rleTickCount(raw []byte) int {
 // Logic: normal timing passed → not called. Failed → inspect → if ok accept, if not reject.
 func analyzeDeltaMarkers(raw []byte) (isPending bool, flagged bool, reason string) {
 	const EXPECTED_MS = 1000.0 // 60 tick @ 60fps
-	const MIN_RATIO   = 0.4    // 400ms
-	const MAX_RATIO   = 6.0    // 6000ms (time_scale=0.1 → ~10000ms)
+	const MIN_RATIO = 0.4      // 400ms
+	const MAX_RATIO = 6.0      // 6000ms (time_scale=0.1 → ~10000ms)
 
 	_, deltas := rleUnpack(raw)
 
@@ -320,8 +325,12 @@ func analyzeDeltaMarkers(raw []byte) (isPending bool, flagged bool, reason strin
 	var slowCount, fastCount int
 	for _, ms := range deltas {
 		ratio := ms / EXPECTED_MS
-		if ratio > MAX_RATIO { slowCount++ }
-		if ratio < MIN_RATIO { fastCount++ }
+		if ratio > MAX_RATIO {
+			slowCount++
+		}
+		if ratio < MIN_RATIO {
+			fastCount++
+		}
 	}
 	if float64(slowCount)/float64(len(deltas)) > 0.30 {
 		return true, true, fmt.Sprintf("timescale_slow:slow=%d/%d", slowCount, len(deltas))
@@ -332,7 +341,6 @@ func analyzeDeltaMarkers(raw []byte) (isPending bool, flagged bool, reason strin
 	return true, false, ""
 }
 
-
 func acCheck(score, ticks int) (flagged bool, reason string) {
 	// Fast AC disabled — server-side replay simulation is sufficient
 	return false, ""
@@ -340,19 +348,19 @@ func acCheck(score, ticks int) (flagged bool, reason string) {
 
 // submitReq — flat JSON sent by client (no encryption; seed included for server-side claim)
 type submitReq struct {
-	Session    string  `json:"session"`     // 32-char hex local UUID
-	Seed       string  `json:"seed"`        // game_seed as string (int64 precision)
-	Score      int     `json:"score"`
-	Ticks      int     `json:"ticks"`
-	Char       int     `json:"char"`
-	PlayerID   string  `json:"player_id"`
-	Nickname   string  `json:"nickname"`
-	Nonce      float64 `json:"nonce"`
-	ReplayLog  string  `json:"replay_log"`
-	PlayerSeed string  `json:"player_seed"`
-	ClientVersion int  `json:"client_version"` // must match AppConfig.ReplayVersion or submit is rejected
-	VSRoomID   string  `json:"vs_room_id,omitempty"` // set when this play is one side of a VS room match
-	VSRole     string  `json:"vs_role,omitempty"`    // "creator" or "opponent"
+	Session       string  `json:"session"` // 32-char hex local UUID
+	Seed          string  `json:"seed"`    // game_seed as string (int64 precision)
+	Score         int     `json:"score"`
+	Ticks         int     `json:"ticks"`
+	Char          int     `json:"char"`
+	PlayerID      string  `json:"player_id"`
+	Nickname      string  `json:"nickname"`
+	Nonce         float64 `json:"nonce"`
+	ReplayLog     string  `json:"replay_log"`
+	PlayerSeed    string  `json:"player_seed"`
+	ClientVersion int     `json:"client_version"`       // must match AppConfig.ReplayVersion or submit is rejected
+	VSRoomID      string  `json:"vs_room_id,omitempty"` // set when this play is one side of a VS room match
+	VSRole        string  `json:"vs_role,omitempty"`    // "creator" or "opponent"
 }
 
 func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
@@ -378,7 +386,9 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 	}
 
 	sid8 := req.Session
-	if len(sid8) > 16 { sid8 = sid8[:16] }
+	if len(sid8) > 16 {
+		sid8 = sid8[:16]
+	}
 
 	// Parse seed from client
 	gameSeed, seedErr := strconv.ParseInt(req.Seed, 10, 64)
@@ -456,7 +466,6 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		nick = pn.Nickname
 	}
 
-
 	// Basic anticheat
 	flagged, reason := acCheck(req.Score, req.Ticks)
 
@@ -482,7 +491,7 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		if deltaFlagged && !flagged {
 			log.Printf("[AC_DELTA] session=%s reason=%s", sid8, deltaReason)
 			flagged = true
-			reason  = deltaReason
+			reason = deltaReason
 		}
 
 		// RLE-decoded tick count is authoritative — it's exactly what the replay
@@ -520,20 +529,20 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		initialState = models.StateFlagged
 	}
 	sess := &models.Session{
-		SessionID:    req.Session,
-		Seed:         gameSeed,
-		ClientScore:  req.Score,
-		ServerScore:  0,
-		Ticks:        req.Ticks,
-		Char:         req.Char,
-		PlayerID:     authedPlayer,
-		Nickname:     nick,
-		Flagged:      flagged,
-		Reason:       reason,
-		SubmittedAt:  time.Now().Unix(),
-		State:        initialState,
-		Log:          replayLog,
-		PlayerSeed:   parsedPlayerSeed,
+		SessionID:   req.Session,
+		Seed:        gameSeed,
+		ClientScore: req.Score,
+		ServerScore: 0,
+		Ticks:       req.Ticks,
+		Char:        req.Char,
+		PlayerID:    authedPlayer,
+		Nickname:    nick,
+		Flagged:     flagged,
+		Reason:      reason,
+		SubmittedAt: time.Now().Unix(),
+		State:       initialState,
+		Log:         replayLog,
+		PlayerSeed:  parsedPlayerSeed,
 	}
 	if saveErr := s.Store.Save(sess); saveErr != nil {
 		log.Printf("[SUBMIT] DB save error session=%s err=%v", sid8, saveErr)
@@ -549,12 +558,14 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 			result := game.SimulateReplayWithRetry(sessionID, log64, seed, charIdx, playerSeed, ticks)
 
 			stored, gerr := s.Store.Get(sessionID)
-			if gerr != nil { return }
+			if gerr != nil {
+				return
+			}
 
 			// Tüm retry'lar başarısız — StateReplayFailed yaz, admin manuel retry yapabilir
 			if result == nil {
 				log.Printf("[REPLAY_SIM] FAILED all retries session=%s — marking replay_failed", sessionID[:8])
-				stored.State       = models.StateReplayFailed
+				stored.State = models.StateReplayFailed
 				stored.ReplayError = "all retries exhausted"
 				_ = s.Store.Save(stored)
 				return
@@ -563,14 +574,14 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 			log.Printf("[REPLAY_SIM] session=%s %s", sessionID[:8], game.SummaryLine(result, clientScore))
 
 			simFlagged, simReason := game.ParseFlagReason(clientScore, result.ServerScore, 0.05)
-			stored.ServerScore    = result.ServerScore
-			stored.TotalKills     = result.QuestKills
+			stored.ServerScore = result.ServerScore
+			stored.TotalKills = result.QuestKills
 			stored.TotalPlatforms = result.QuestPlatforms
-			stored.ReplayError    = ""
+			stored.ReplayError = ""
 			if simFlagged {
 				stored.Flagged = true
-				stored.Reason  = simReason
-				stored.State   = models.StateFlagged
+				stored.Reason = simReason
+				stored.State = models.StateFlagged
 				log.Printf("[REPLAY_FLAG] session=%s reason=%s", sessionID[:8], simReason)
 				// İsteğe bağlı arşiv: score mismatch'leri de worker timeout'larıyla
 				// aynı failed_replays klasörüne kaydet — sebebi anlamak için elindeki
@@ -650,7 +661,6 @@ func (s *Server) handleSessions(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, map[string]any{"sessions": list})
 }
 
-
 func (s *Server) handleLeaderboardPrizes(ctx *fasthttp.RequestCtx) {
 	cfg, err := s.Store.GetLeaderboardConfig()
 	if err != nil {
@@ -659,7 +669,6 @@ func (s *Server) handleLeaderboardPrizes(ctx *fasthttp.RequestCtx) {
 	}
 	writeJSON(ctx, 200, cfg)
 }
-
 
 func (s *Server) handleAdminSetPrizes(ctx *fasthttp.RequestCtx) {
 	var cfg models.LeaderboardConfig

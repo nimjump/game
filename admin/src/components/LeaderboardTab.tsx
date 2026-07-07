@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import {
   fetchLeaderboard, type LBEntry,
   fetchLeaderboardPrizes, saveLeaderboardPrizes, type LeaderboardConfig,
+  resetLeaderboard,
 } from "@/lib/api";
 import NimiqAvatar from "@/components/NimiqAvatar";
 
@@ -82,6 +83,8 @@ export default function LeaderboardTab() {
   const [enabled, setEnabled] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error,   setError]   = useState("");
+  const [resetting, setResetting] = useState(false);
+  const [resetMsg,  setResetMsg]  = useState("");
 
   const load = async (p: Period) => {
     setLoading(true); setError("");
@@ -98,6 +101,22 @@ export default function LeaderboardTab() {
   };
 
   useEffect(() => { load(period); }, [period]);
+
+  const doReset = async () => {
+    if (!confirm(`Reset the ${period} leaderboard? Scores stay saved (alltime/replays/payouts untouched) — this just clears the ${period} board from this point on.`)) {
+      return;
+    }
+    setResetting(true); setError(""); setResetMsg("");
+    try {
+      await resetLeaderboard(period);
+      setResetMsg(`${period.charAt(0).toUpperCase() + period.slice(1)} leaderboard reset.`);
+      await load(period);
+    } catch (e: unknown) {
+      setError(String(e instanceof Error ? e.message : e));
+    } finally {
+      setResetting(false);
+    }
+  };
 
   return (
     <div>
@@ -116,6 +135,14 @@ export default function LeaderboardTab() {
         <button className="btn" onClick={() => load(period)} disabled={loading}>
           Refresh
         </button>
+        <button
+          className="btn"
+          style={{ color: "var(--red)" }}
+          onClick={doReset}
+          disabled={resetting || loading}
+        >
+          {resetting ? "Resetting…" : `Reset ${period} leaderboard`}
+        </button>
         {label && (
           <span style={{ alignSelf: "center", fontSize: 12, color: "var(--text-muted)" }}>
             Period: {label}
@@ -126,6 +153,7 @@ export default function LeaderboardTab() {
         )}
       </div>
 
+      {resetMsg && <div style={{ color: "var(--green)", marginBottom: 12, fontSize: 13 }}>{resetMsg}</div>}
       {error   && <div style={{ color: "var(--red)", marginBottom: 12 }}>{error}</div>}
       {loading && <div style={{ padding: 32, textAlign: "center", color: "var(--text-muted)" }}>Loading…</div>}
 

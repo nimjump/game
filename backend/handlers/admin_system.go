@@ -65,6 +65,39 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, cfg)
 }
 
+// POST /backend/admin/leaderboard/reset — body: {"period_type":"daily"} or
+// {"period_type":"weekly"}. One-button leaderboard reset from the admin
+// panel: does NOT delete any sessions, scores, replays, or payout history
+// — it just marks "now" as the cutoff for the currently-open day/week, so
+// the daily/weekly board (and its rank lookups) only counts scores
+// submitted after the click onward. Alltime leaderboard is untouched.
+// The marker only applies to the period it was set for, so it naturally
+// stops mattering once that day/week rolls over — nothing to clean up.
+func (s *Server) handleAdminLeaderboardReset(ctx *fasthttp.RequestCtx) {
+	var req struct {
+		PeriodType string `json:"period_type"`
+	}
+	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+		writeErr(ctx, 400, "bad_json")
+		return
+	}
+	if req.PeriodType != "daily" && req.PeriodType != "weekly" {
+		writeErr(ctx, 400, "period_type must be daily or weekly")
+		return
+	}
+	period, err := s.Store.SetLeaderboardReset(req.PeriodType)
+	if err != nil {
+		writeErr(ctx, 500, "save_error")
+		return
+	}
+	log.Printf("[ADMIN] leaderboard reset: period_type=%s period=%s", req.PeriodType, period)
+	writeJSON(ctx, 200, map[string]any{
+		"ok":          true,
+		"period_type": req.PeriodType,
+		"period":      period,
+	})
+}
+
 // GET /backend/admin/device-breakdown — how many distinct players are on
 // each platform (captured at wallet-auth verify time, see game/device.go).
 func (s *Server) handleAdminDeviceBreakdown(ctx *fasthttp.RequestCtx) {
@@ -302,10 +335,10 @@ func (s *Server) handleAdminReplayBinaryUpload(ctx *fasthttp.RequestCtx) {
 	go game.RestartAllWorkers()
 
 	writeJSON(ctx, 200, map[string]any{
-		"ok":   true,
-		"file": target,
-		"size": fh.Size,
-		"dir":  dir,
+		"ok":     true,
+		"file":   target,
+		"size":   fh.Size,
+		"dir":    dir,
 		"staged": false,
 	})
 }

@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	keyLBConfig  = "lb:config"
-	keyLBWinners = "lb:winners:" // prefix + period key (e.g. "2026-06-17" or "2026-W25")
+	keyLBConfig   = "lb:config"
+	keyLBWinners  = "lb:winners:" // prefix + period key (e.g. "2026-06-17" or "2026-W25")
+	keyLBResetPfx = "lb:reset:"   // prefix + periodType ("daily" / "weekly")
 )
 
 // UTC3 — fixed UTC+3 timezone used for all period calculations
@@ -51,6 +52,65 @@ func (s *Store) SaveLeaderboardConfig(cfg models.LeaderboardConfig) error {
 	})
 }
 
+// ── Admin reset ───────────────────────────────────────────────────────────────
+//
+// "Reset the daily/weekly leaderboard" doesn't delete any session data —
+// scores, replays, alltime standings, and payout history are all left
+// alone. Instead it just records the moment the admin clicked reset,
+// scoped to whatever day/week is currently open. periodBoundsForType then
+// pulls the query window's start forward to that moment, so anything
+// submitted before the click drops off the daily/weekly board while
+// staying fully intact everywhere else. When the period rolls over
+// naturally (next day / next ISO week), the marker's period no longer
+// matches the new current period and it's simply ignored — no cron job or
+// cleanup needed to "undo" it.
+
+type lbResetMarker struct {
+	Period string `json:"period"` // the day/week key this reset applies to
+	Ts     int64  `json:"ts"`     // reset moment (Unix seconds)
+}
+
+func lbResetKey(periodType string) []byte {
+	return []byte(keyLBResetPfx + periodType)
+}
+
+// SetLeaderboardReset marks "now" as the cutoff for the CURRENT day (or
+// week)'s leaderboard. periodType must be "daily" or "weekly".
+func (s *Store) SetLeaderboardReset(periodType string) (string, error) {
+	daily, weekly := CurrentPeriods()
+	period := daily
+	if periodType == "weekly" {
+		period = weekly
+	}
+	marker := lbResetMarker{Period: period, Ts: time.Now().Unix()}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		return period, err
+	}
+	err = s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set(lbResetKey(periodType), data)
+	})
+	return period, err
+}
+
+// getLeaderboardReset — the active reset marker for periodType, if any.
+func (s *Store) getLeaderboardReset(periodType string) *lbResetMarker {
+	var m lbResetMarker
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(lbResetKey(periodType))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(v []byte) error {
+			return json.Unmarshal(v, &m)
+		})
+	})
+	if err != nil {
+		return nil
+	}
+	return &m
+}
+
 // ── Period helpers ────────────────────────────────────────────────────────────
 
 // dailyPeriodKey — "2026-06-17"
@@ -80,7 +140,13 @@ func weeklyPeriodKey(t time.Time) string {
 // unfiltered data. Now the empty case is resolved to a real window up
 // front, so every caller gets correctly bounded results regardless of
 // whether it remembered to pass `period`.
-func periodBoundsForType(periodType, period string) (int64, int64) {
+//
+// It also applies an admin-triggered reset marker (see SetLeaderboardReset
+// below): if the resolved period matches the period the marker was set
+// for, the window's start is pulled forward to the reset moment, so
+// scores submitted before the reset stop counting. Once the period rolls
+// over naturally, the marker's period no longer matches and it's ignored.
+func (s *Store) periodBoundsForType(periodType, period string) (int64, int64) {
 	if periodType == "alltime" {
 		return 0, 0
 	}
@@ -92,7 +158,11 @@ func periodBoundsForType(periodType, period string) (int64, int64) {
 			period = daily
 		}
 	}
-	return periodBounds(period)
+	start, end := periodBounds(period)
+	if m := s.getLeaderboardReset(periodType); m != nil && m.Period == period && m.Ts > start {
+		start = m.Ts
+	}
+	return start, end
 }
 
 // periodBounds — returns start and end Unix timestamps for a period
@@ -160,7 +230,7 @@ func (s *Store) GetLeaderboard(periodType, period string, limit int) ([]LBEntry,
 func (s *Store) RankMapForPeriod(periodType, period string) map[string]int {
 	all := s.List(false, 0)
 
-	startTs, endTs := periodBoundsForType(periodType, period)
+	startTs, endTs := s.periodBoundsForType(periodType, period)
 
 	best := map[string]models.Session{}
 	for _, sess := range all {
@@ -205,7 +275,7 @@ func (s *Store) RankMapForPeriod(periodType, period string) map[string]int {
 func (s *Store) GetLeaderboardPaged(periodType, period string, limit, offset int, selfPlayerID string) ([]LBEntry, error) {
 	all := s.List(false, 0)
 
-	startTs, endTs := periodBoundsForType(periodType, period)
+	startTs, endTs := s.periodBoundsForType(periodType, period)
 
 	// Find best score per player
 	best := map[string]models.Session{}
@@ -245,14 +315,24 @@ func (s *Store) GetLeaderboardPaged(periodType, period string, limit, offset int
 	if selfPlayerID != "" {
 		for i, e := range entries {
 			pid := e.PlayerID
-			if pid == "" { pid = e.SessionID }
+			if pid == "" {
+				pid = e.SessionID
+			}
 			if pid == selfPlayerID {
 				nick := ""
 				if pn, pnerr := s.GetNickname(pid); pnerr == nil && pn != nil && pn.Nickname != "" {
 					nick = pn.Nickname
 				}
-				if nick == "" { nick = e.Nickname }
-				if nick == "" { p := pid; if len(p) > 8 { p = p[:8] }; nick = p }
+				if nick == "" {
+					nick = e.Nickname
+				}
+				if nick == "" {
+					p := pid
+					if len(p) > 8 {
+						p = p[:8]
+					}
+					nick = p
+				}
 				selfEntry = LBEntry{
 					Rank: i + 1, PlayerID: e.PlayerID, Nickname: nick,
 					ServerScore: e.ServerScore, Char: e.Char,
@@ -278,7 +358,9 @@ func (s *Store) GetLeaderboardPaged(periodType, period string, limit, offset int
 	out := make([]LBEntry, len(entries))
 	for i, e := range entries {
 		pid := e.PlayerID
-		if pid == "" { pid = e.SessionID }
+		if pid == "" {
+			pid = e.SessionID
+		}
 		// Prefer PlayerNickname DB over session nickname
 		nick := ""
 		if pn, pnerr := s.GetNickname(pid); pnerr == nil && pn != nil && pn.Nickname != "" {
@@ -288,7 +370,11 @@ func (s *Store) GetLeaderboardPaged(periodType, period string, limit, offset int
 			nick = e.Nickname
 		}
 		if nick == "" {
-			p := pid; if len(p) > 8 { p = p[:8] }; nick = p
+			p := pid
+			if len(p) > 8 {
+				p = p[:8]
+			}
+			nick = p
 		}
 		out[i] = LBEntry{
 			Rank:        offset + i + 1,
@@ -307,7 +393,8 @@ func (s *Store) GetLeaderboardPaged(periodType, period string, limit, offset int
 		inPage := false
 		for _, o := range out {
 			if o.PlayerID == selfEntry.PlayerID {
-				inPage = true; break
+				inPage = true
+				break
 			}
 		}
 		if !inPage {

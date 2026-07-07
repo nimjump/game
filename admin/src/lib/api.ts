@@ -336,6 +336,20 @@ export async function fetchLeaderboard(periodType: string, limit = 100): Promise
   return r.json();
 }
 
+// Resets the daily or weekly leaderboard with one click. Doesn't delete any
+// sessions/scores/replays — just marks "now" as the cutoff for the
+// currently-open day/week, so older scores drop off that board (alltime is
+// untouched). See handleAdminLeaderboardReset in backend/handlers/admin_system.go.
+export async function resetLeaderboard(periodType: "daily" | "weekly"): Promise<{ ok: boolean; period_type: string; period: string }> {
+  const r = await fetch(`${BASE}/backend/admin/leaderboard/reset`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ period_type: periodType }),
+  });
+  if (!r.ok) throw new Error("leaderboard reset failed");
+  return r.json();
+}
+
 export interface AnalyticsReward {
   id: string;
   player_id: string;
