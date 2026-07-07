@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -124,7 +125,7 @@ func (s *Store) QuestPoolWithOverrides() []QuestPoolEntry {
 			QuestType:        string(t.qtype),
 			Target:           target,
 			DefaultTarget:    t.target,
-			Description:      t.desc,
+			Description:      questDescription(t, target),
 			DefaultRewardNIM: t.reward,
 			RewardNIM:        reward,
 			Overridden:       rewardOverridden,
@@ -178,65 +179,93 @@ func (s *Store) SetQuestTargetOverride(poolIdx int, target *int) error {
 }
 
 // questPool is the full pool of quest templates used by generateQuest.
-// Each entry: (type, target, description, rewardNIM)
+// Each entry: (type, target, descFmt, rewardNIM)
+//
+// descFmt is a fmt.Sprintf format string, not a frozen literal. Where the
+// number shown to the player IS the quest's target (the overwhelming
+// majority — "Kill %d enemies" for QuestKills target=10), it contains one
+// %d and questDescription() renders it against the EFFECTIVE target (the
+// admin override if one is set, otherwise the default below). That's the
+// fix for the bug where admin changed a quest's target but the text kept
+// showing the old hardcoded number: previously desc was a plain string
+// baked in at pool-definition time, completely disconnected from target.
+//
+// A few templates show a fixed threshold in their text that ISN'T the
+// target (target is just a 0/1 "did it happen" completion flag for these,
+// e.g. QuestSpeedrun target=1 but the text's "1000 points" is a fixed
+// rule, not something admin's target field controls) — those have no %d
+// and render as-is; see questDescription().
 type questTemplate struct {
 	qtype   models.QuestType
 	target  int
-	desc    string
+	descFmt string
 	reward  float64
 }
 
 var questPool = []questTemplate{
 	// ── Score / progress ───────────────────────────────────────────
-	{models.QuestScore,        1500,  "Score 1500 points in a single match",             10.0},
-	{models.QuestScore,        2500,  "Score 2500 points in a single match",             15.0},
-	{models.QuestScore,        4000,  "Score 4000 points in a single match",             20.0},
-	{models.QuestTotalScore,   5000,  "Earn 5000 total points today",                    12.0},
-	{models.QuestTotalScore,   10000, "Earn 10 000 total points today",                  18.0},
+	{models.QuestScore,        1500,  "Score %d points in a single match",               10.0},
+	{models.QuestScore,        2500,  "Score %d points in a single match",               15.0},
+	{models.QuestScore,        4000,  "Score %d points in a single match",               20.0},
+	{models.QuestTotalScore,   5000,  "Earn %d total points today",                      12.0},
+	{models.QuestTotalScore,   10000, "Earn %d total points today",                      18.0},
 
 	// ── Match count ────────────────────────────────────────────────
-	{models.QuestGames,        3,     "Play 3 matches today (300+ points each)",          8.0},
-	{models.QuestGames5,       5,     "Play 5 matches today (300+ points each)",         12.0},
-	{models.QuestGames10,      10,    "Play 10 matches today (300+ points each) — keep the streak alive!", 20.0},
+	{models.QuestGames,        3,     "Play %d matches today (300+ points each)",         8.0},
+	{models.QuestGames5,       5,     "Play %d matches today (300+ points each)",        12.0},
+	{models.QuestGames10,      10,    "Play %d matches today (300+ points each) — keep the streak alive!", 20.0},
 
 	// ── Enemy kills ────────────────────────────────────────────────
-	{models.QuestKills,        10,    "Kill 10 enemies in a single match",                8.0},
-	{models.QuestKills,        20,    "Kill 20 enemies in a single match",               12.0},
-	{models.QuestKills,        30,    "Kill 30 enemies in a single match",               18.0},
-	{models.QuestKillsTotal,   40,    "Kill 40 enemies across all matches today",        12.0},
-	{models.QuestKillsTotal,   80,    "Kill 80 enemies across all matches today",        18.0},
-	{models.QuestMosquito,     5,     "Stomp 5 mosquitoes",                               8.0},
-	{models.QuestMosquito,     10,    "Stomp 10 mosquitoes",                             12.0},
-	{models.QuestFlying,       8,     "Kill 8 flying enemies",                           10.0},
-	{models.QuestFlying,       15,    "Kill 15 flying enemies",                          15.0},
-	{models.QuestNoDmgKill,    3,     "Kill 3 enemies without taking any damage",        10.0},
-	{models.QuestNoDmgKill,    6,     "Kill 6 enemies without taking any damage",        15.0},
-	{models.QuestMultiKill,    3,     "Kill 3 different enemy types in one match",       12.0},
+	{models.QuestKills,        10,    "Kill %d enemies in a single match",                8.0},
+	{models.QuestKills,        20,    "Kill %d enemies in a single match",               12.0},
+	{models.QuestKills,        30,    "Kill %d enemies in a single match",               18.0},
+	{models.QuestKillsTotal,   40,    "Kill %d enemies across all matches today",        12.0},
+	{models.QuestKillsTotal,   80,    "Kill %d enemies across all matches today",        18.0},
+	{models.QuestMosquito,     5,     "Stomp %d mosquitoes",                              8.0},
+	{models.QuestMosquito,     10,    "Stomp %d mosquitoes",                             12.0},
+	{models.QuestFlying,       8,     "Kill %d flying enemies",                          10.0},
+	{models.QuestFlying,       15,    "Kill %d flying enemies",                          15.0},
+	{models.QuestNoDmgKill,    3,     "Kill %d enemies without taking any damage",       10.0},
+	{models.QuestNoDmgKill,    6,     "Kill %d enemies without taking any damage",       15.0},
+	{models.QuestMultiKill,    3,     "Kill %d different enemy types in one match",      12.0},
 
 	// ── Platform / movement ────────────────────────────────────────
-	{models.QuestAltitude,     2000,  "Reach score 2000 in a single match",              12.0},
-	{models.QuestAltitude,     3500,  "Reach score 3500 in a single match",              16.0},
-	{models.QuestNoHit,        1000,  "Reach 1000 points without taking any damage",     15.0},
+	{models.QuestAltitude,     2000,  "Reach score %d in a single match",                12.0},
+	{models.QuestAltitude,     3500,  "Reach score %d in a single match",                16.0},
+	{models.QuestNoHit,        1000,  "Reach %d points without taking any damage",       15.0},
 	{models.QuestSpeedrun,     1,     "Reach 1000 points in under 90 seconds",           15.0},
 
 	// ── Coins / items ─────────────────────────────────────────────
-	{models.QuestCoinTotal,    10,    "Collect 10 coins today",                           8.0},
-	{models.QuestCoinTotal,    25,    "Collect 25 coins today",                          12.0},
-	{models.QuestCoinMatch,    5,     "Collect 5 coins in one match",                     8.0},
-	{models.QuestCoinMatch,    8,     "Collect 8 coins in one match",                    12.0},
-	{models.QuestGoldenCarot,  2,     "Collect 2 golden carrots in one match",           12.0},
-	{models.QuestGoldenCarot,  4,     "Collect 4 golden carrots in one match",           18.0},
-	{models.QuestItemHunter,   5,     "Pick up 5 different item types today",            12.0},
-	{models.QuestPowerup,      3,     "Use 3 powerups in one match",                     10.0},
-	{models.QuestPowerup,      6,     "Use 6 powerups in one match",                     15.0},
+	{models.QuestCoinTotal,    10,    "Collect %d coins today",                           8.0},
+	{models.QuestCoinTotal,    25,    "Collect %d coins today",                          12.0},
+	{models.QuestCoinMatch,    5,     "Collect %d coins in one match",                    8.0},
+	{models.QuestCoinMatch,    8,     "Collect %d coins in one match",                   12.0},
+	{models.QuestGoldenCarot,  2,     "Collect %d golden carrots in one match",          12.0},
+	{models.QuestGoldenCarot,  4,     "Collect %d golden carrots in one match",          18.0},
+	{models.QuestItemHunter,   5,     "Pick up %d different item types today",           12.0},
+	{models.QuestPowerup,      3,     "Use %d powerups in one match",                    10.0},
+	{models.QuestPowerup,      6,     "Use %d powerups in one match",                    15.0},
 	{models.QuestNoCoins,      1,     "Reach 500+ points without collecting any coins",  12.0},
 
 	// ── Style / challenge ─────────────────────────────────────────
-	{models.QuestStreak,       3,     "Pass 500 points in 3 separate matches today",     15.0},
-	{models.QuestPacifist,     500,   "Reach 500 points without killing a single enemy", 15.0},
+	{models.QuestStreak,       3,     "Pass 500 points in %d separate matches today",    15.0},
+	{models.QuestPacifist,     500,   "Reach %d points without killing a single enemy",  15.0},
 	{models.QuestNoDmgMatch,   1,     "Complete a match with min 500 points and no damage taken", 20.0},
-	{models.QuestHighJumpOnly, 200,   "Reach height 200 using only jumps (no powerups)", 15.0},
+	{models.QuestHighJumpOnly, 200,   "Reach height %d using only jumps (no powerups)",  15.0},
 	{models.QuestMirrorRun,    1,     "Score 500+ points during a mirror-debuff run",    15.0},
+}
+
+// questDescription renders a template's description against the EFFECTIVE
+// target (default, or admin override if one is set — callers pass the
+// already-resolved value, same one they attach as Quest.Target, so text
+// and number can never drift apart again). Templates whose descFmt has no
+// %d display a fixed rule unrelated to target and are rendered as-is (see
+// questTemplate doc comment for which ones and why).
+func questDescription(t questTemplate, effectiveTarget int) string {
+	if strings.Contains(t.descFmt, "%d") {
+		return fmt.Sprintf(t.descFmt, effectiveTarget)
+	}
+	return t.descFmt
 }
 
 // generateQuest deterministically picks a quest for a specific player+day+slot.
@@ -280,7 +309,7 @@ func generateQuest(playerID, day string, idx int, rewardOverrides map[string]flo
 	return models.Quest{
 		ID:          id,
 		Type:        t.qtype,
-		Description: t.desc,
+		Description: questDescription(t, target),
 		Target:      target,
 		RewardNIM:   reward,
 		Day:         day,

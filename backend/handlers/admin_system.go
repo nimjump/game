@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/valyala/fasthttp"
@@ -63,6 +64,80 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	log.Printf("[ADMIN] config updated: daily=%v weekly=%v replay_version=%d daily_earn_cap_nim=%.4f coin_nim_rate=%.6f",
 		cfg.DailyLeaderboardEnabled, cfg.WeeklyLeaderboardEnabled, cfg.ReplayVersion, cfg.DailyEarnCapNIM, cfg.CoinNIMRate)
 	writeJSON(ctx, 200, cfg)
+}
+
+// GET /backend/admin/leaderboard — same data/params as the public
+// /backend/leaderboard (see handlers/stats.go's handleLeaderboard), just
+// reachable from the admin panel without an app_sig. The public route
+// sits behind corsMiddleware's app_ts/app_sig HMAC check (appsig.go) —
+// that's for the game client, and the admin frontend has no business
+// holding that signing key. This one is gated by the admin session
+// cookie instead (requireAdminSession, see server.go), same as every
+// other /backend/admin/* route.
+//
+//	?period_type=daily|weekly|alltime
+//	&period=2026-06-28          (yoksa aktif dönem)
+//	&limit=10                   (max 100)
+//	&offset=0
+//	&player_id=NQ...            (self entry için)
+func (s *Server) handleAdminLeaderboard(ctx *fasthttp.RequestCtx) {
+	periodType := string(ctx.QueryArgs().Peek("period_type"))
+	if periodType == "" {
+		periodType = "daily"
+	}
+
+	period := string(ctx.QueryArgs().Peek("period"))
+	if period == "" && periodType != "alltime" {
+		daily, weekly := game.CurrentPeriods()
+		if periodType == "weekly" {
+			period = weekly
+		} else {
+			period = daily
+		}
+	}
+
+	limit := 10
+	if raw := ctx.QueryArgs().Peek("limit"); len(raw) > 0 {
+		if v, err := strconv.Atoi(string(raw)); err == nil && v > 0 && v <= 100 {
+			limit = v
+		}
+	}
+	offset := 0
+	if raw := ctx.QueryArgs().Peek("offset"); len(raw) > 0 {
+		if v, err := strconv.Atoi(string(raw)); err == nil && v >= 0 {
+			offset = v
+		}
+	}
+
+	selfPlayerID := string(ctx.QueryArgs().Peek("player_id"))
+
+	entries, err := s.Store.GetLeaderboardPaged(periodType, period, limit, offset, selfPlayerID)
+	if err != nil {
+		writeErr(ctx, 500, "leaderboard_error")
+		return
+	}
+	if entries == nil {
+		entries = []game.LBEntry{}
+	}
+
+	appCfg := s.Store.GetAppConfig()
+	enabled := true
+	switch periodType {
+	case "daily":
+		enabled = appCfg.DailyLeaderboardEnabled
+	case "weekly":
+		enabled = appCfg.WeeklyLeaderboardEnabled
+	}
+
+	writeJSON(ctx, 200, map[string]any{
+		"entries":     entries,
+		"period":      period,
+		"period_type": periodType,
+		"limit":       limit,
+		"offset":      offset,
+		"count":       len(entries),
+		"enabled":     enabled,
+	})
 }
 
 // POST /backend/admin/leaderboard/reset — body: {"period_type":"daily"} or
