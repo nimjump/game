@@ -331,7 +331,7 @@ export interface LeaderboardResponse {
 // silently always fell back to the daily leaderboard, regardless of
 // which tab was selected.
 export async function fetchLeaderboard(periodType: string, limit = 100): Promise<LeaderboardResponse> {
-  const r = await fetch(`${BASE}/backend/leaderboard?period_type=${periodType}&limit=${limit}`, { cache: "no-store" });
+  const r = await fetch(`${BASE}/backend/admin/leaderboard?period_type=${periodType}&limit=${limit}`, { cache: "no-store" });
   if (!r.ok) throw new Error("leaderboard fetch failed");
   return r.json();
 }

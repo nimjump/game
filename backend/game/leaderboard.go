@@ -76,6 +76,20 @@ func lbResetKey(periodType string) []byte {
 
 // SetLeaderboardReset marks "now" as the cutoff for the CURRENT day (or
 // week)'s leaderboard. periodType must be "daily" or "weekly".
+//
+// It ALSO marks the current period as already-paid (see MarkPeriodPaid /
+// keyLBPaidPfx). This is required, not optional: the reset marker only
+// affects what the admin/API READS (periodBoundsForType hides pre-reset
+// scores), but the background payout loop (StartLeaderboardPayoutLoop /
+// PayWinnersForPeriod) computes winners from the RAW, unfiltered scores —
+// it never looked at the reset marker at all. Without this, an admin
+// reset wiped the leaderboard *view* while the wiped-out scores could
+// still be paid out from under it once the period closed. Marking the
+// period paid up front makes PayWinnersForPeriod's `IsPeriodPaid` guard
+// short-circuit to a no-op (0 winners, no rewards queued) for the period
+// being reset, so a reset truly means "these plays don't count" — for
+// display AND for payout — with no way to reopen it once the button is
+// pressed.
 func (s *Store) SetLeaderboardReset(periodType string) (string, error) {
 	daily, weekly := CurrentPeriods()
 	period := daily
@@ -88,7 +102,20 @@ func (s *Store) SetLeaderboardReset(periodType string) (string, error) {
 		return period, err
 	}
 	err = s.db.Update(func(txn *badger.Txn) error {
-		return txn.Set(lbResetKey(periodType), data)
+		if setErr := txn.Set(lbResetKey(periodType), data); setErr != nil {
+			return setErr
+		}
+		if setErr := txn.Set(lbPaidKey(period), []byte("1")); setErr != nil {
+			return setErr
+		}
+		// Drop any winners snapshot already taken for this period (e.g. from
+		// an earlier manual "pay winners" click before the reset) so nothing
+		// stale is left for PayWinnersForPeriod to reuse via GetWinners.
+		delErr := txn.Delete(winnerKey(period))
+		if delErr != nil && delErr != badger.ErrKeyNotFound {
+			return delErr
+		}
+		return nil
 	})
 	return period, err
 }
