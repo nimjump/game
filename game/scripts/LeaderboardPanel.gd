@@ -588,7 +588,15 @@ func _build_list(data: Variant) -> void:
 
 		var time_str := ""
 		if ts > 0:
-			var dt := Time.get_datetime_dict_from_unix_time(ts)
+			# BUG FIX: Time.get_datetime_dict_from_unix_time() breaks the
+			# timestamp down in UTC, but the backend's daily leaderboard
+			# periods are UTC+3 (see backend/game/leaderboard.go's utc3).
+			# A score submitted at, say, 01:00 UTC+3 is 22:00 the PREVIOUS
+			# day in UTC — so entries the backend correctly grouped into
+			# the same UTC+3 day were displaying two different dates here,
+			# making one leaderboard look like it spanned two days. Shift
+			# by +3h before formatting to match the backend's own boundary.
+			var dt := Time.get_datetime_dict_from_unix_time(ts + 3 * 3600)
 			time_str = "%02d.%02d" % [dt.day, dt.month]
 		var time_lbl := _make_col_label(time_str, ref, 0.10, _C_MID, false)
 		time_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT

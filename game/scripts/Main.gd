@@ -102,6 +102,7 @@ var _streak_badge_lbl  : Label   = null
 # /backend/streak/status (_fetch_streak_status).
 var _streak_claimable_nim   := 0.0
 var _streak_already_claimed := false
+var _streak_preview_day     := 1   # day a claim right now would land on — see _update_streak_badge's doc comment
 var _streak_claim_hint_lbl  : Label = null   # small "+N.NN" hint shown on the badge when something's claimable
 var _sound_toggle      : CheckButton
 var _volume_slider     : HSlider
@@ -1078,22 +1079,32 @@ func _build_streak_badge() -> void:
 	_fetch_streak_status()
 
 
-## Fills in and reveals the lobby streak badge. Shown from day 1 (streak
-## count of 1) onward — previously hidden until day 2 to avoid clutter for
-## brand-new players, but that meant the badge never appeared during same-
-## day testing (streak only increments once per calendar day), so it looked
-## broken/missing. Only hidden for a genuine 0 (no streak data yet / not
-## logged in).
+## Fills in and reveals the lobby streak badge. Shown as soon as we're
+## authenticated, regardless of count — previously hidden whenever the
+## confirmed streak count was 0.
+##
+## BUG FIX: "streak badge doesn't show up top-left at all" — since streak
+## count now only advances on an actual CLAIM (see backend/game/streak.go's
+## doc comment), a brand-new or never-yet-claimed player's confirmed count
+## is a genuine, permanent 0 until they claim once. But this badge is the
+## ONLY way to open the streak panel (_on_streak_badge_input is wired to
+## this exact Control — see _open_streak_panel), and a hidden Control never
+## receives input in Godot. So a player who'd never claimed had literally
+## no way to ever discover or open the panel to claim their first reward —
+## a dead end, not just a cosmetic miss. Now shown whenever authenticated;
+## at a genuine 0 it shows the day a claim right now would land on
+## (_streak_preview_day, from _fetch_streak_status's streak_day field, always
+## >= 1) so there's still a visible, tappable, honestly-labeled entry point.
 func _update_streak_badge() -> void:
 	if not is_instance_valid(_streak_badge) or not is_instance_valid(_streak_badge_lbl):
 		return
 	if not is_instance_valid(_nimiq_bridge):
 		return
-	var days : int = int(_nimiq_bridge.get("streak"))
-	if days < 1:
+	if not bool(_nimiq_bridge.get("auth_verified")):
 		_streak_badge.visible = false
 		return
-	_streak_badge_lbl.text = "%d" % days
+	var days : int = int(_nimiq_bridge.get("streak"))
+	_streak_badge_lbl.text = "%d" % days if days >= 1 else "%d" % maxi(_streak_preview_day, 1)
 	_streak_badge.visible = true
 
 
@@ -1181,7 +1192,9 @@ func _fetch_streak_status() -> void:
 				var d : Dictionary = j.get_data()
 				_streak_claimable_nim   = float(d.get("claimable_nim", 0.0))
 				_streak_already_claimed = bool(d.get("already_claimed", false))
+				_streak_preview_day     = int(d.get("streak_day", 1))
 				_update_streak_claim_visual()
+				_update_streak_badge()  # refresh the "Day N" fallback label now that the real preview has arrived
 	)
 	var headers : PackedStringArray = ["Authorization: Bearer " + token]
 	http.request(ApiConfig.sign_url(ApiConfig.base_url() + "/backend/streak/status"), headers)
@@ -4239,7 +4252,9 @@ func _build_settings_popup() -> void:
 		nick_edit_btn.custom_minimum_size = Vector2(_p(0.22), _p(0.068))
 		_warm_btn_st(nick_edit_btn)
 		if _nickname_cooldown_end > 0 and Time.get_unix_time_from_system() < _nickname_cooldown_end:  # determinism-ok: UI-only cooldown check
-			var cd_dt := Time.get_datetime_dict_from_unix_time(_nickname_cooldown_end)
+			# +3h: same UTC vs UTC+3 fix as LeaderboardPanel.gd/StatsPanel.gd —
+			# keep displayed dates consistent with the backend's UTC+3 day.
+			var cd_dt := Time.get_datetime_dict_from_unix_time(_nickname_cooldown_end + 3 * 3600)
 			nick_edit_btn.disabled = true
 			nick_edit_btn.tooltip_text = "Can change after %02d.%02d.%04d" % [cd_dt.day, cd_dt.month, cd_dt.year]
 		nick_edit_btn.pressed.connect(func():

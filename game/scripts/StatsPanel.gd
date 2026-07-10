@@ -803,7 +803,11 @@ func _build_rewards(rewards: Array) -> void:
 
 		# Date
 		var date_lbl := Label.new()
-		var dt := Time.get_datetime_dict_from_unix_time(ts)
+		# BUG FIX: was UTC-based, but the backend's daily period boundary is
+		# UTC+3 (see LeaderboardPanel.gd's matching fix) — shift by +3h so
+		# match dates/hours shown here agree with which day the backend
+		# actually counted the score under.
+		var dt := Time.get_datetime_dict_from_unix_time(ts + 3 * 3600)
 		date_lbl.text = "%02d.%02d %02d.%02d" % [dt.month, dt.day, dt.hour, dt.minute]
 		UITheme.apply_label(date_lbl, _C_MID, int(ref * 0.024))
 		date_lbl.custom_minimum_size.x = ref * 0.28
@@ -890,7 +894,8 @@ func _build_recent(games: Array) -> void:
 
 		var date_str := "--"
 		if ts > 0:
-			var dt := Time.get_datetime_dict_from_unix_time(ts)
+			# BUG FIX: same UTC vs UTC+3 mismatch as the row above / LeaderboardPanel.gd.
+			var dt := Time.get_datetime_dict_from_unix_time(ts + 3 * 3600)
 			date_str = "%02d.%02d %02d.%02d" % [dt.day, dt.month, dt.hour, dt.minute]
 		row.add_child(_col_lbl(date_str, ref, 0.28, _C_MID, false))
 
