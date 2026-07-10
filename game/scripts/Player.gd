@@ -171,7 +171,40 @@ var _drunk_ghost_timer := 0.0
 const DRUNK_GHOST_INTERVAL := 0.08   
 const DRUNK_GHOST_TICKS := 7   # ticks between ghost echoes
 
-var _replay_dir    : int = 0  
+var _replay_dir    : int = 0
+
+# ── Movement ramp (smooth accel/decel instead of snapping to full speed) ──
+# Deterministic, replay-safe by construction: driven ONLY by _replay_dir,
+# which is already recorded/replayed tick-for-tick identically (see
+# GameManager.gd's RLE record/playback) — no raw sensor data, no new
+# per-tick state needed in the replay log itself, and the server's headless
+# replay runs this exact same GDScript, so it reproduces the ramp exactly.
+#
+# GYRO-ONLY: set once per match (never mid-tick) via set_gyro_control_active()
+# below, from a NEW per-session metadata field ("gyro_active") that now
+# travels alongside seed/char/replay_log through the whole submit → stored
+# Session → server replay-verification worker pipeline (mirrors exactly how
+# `char` already does — see GameManager.gd's _submit_session and the
+# backend's workerJob/Session structs). Tap stays instantly snappy, gyro
+# ramps up smoothly — and because this flag is fixed for the whole match
+# (not read live from a settings toggle that could change between record
+# time and replay time), a recording and its later replay/server-verify
+# always agree on which behavior to use, even if the player's live control
+# setting has since changed.
+var _move_ramp_ticks         := 0
+var _move_ramp_last_dir      := 0
+var _gyro_control_active_run := false   # set once via set_gyro_control_active(), not written per-tick
+const MOVE_RAMP_TICKS      := 10     # ~0.167s at 60 ticks/sec to reach full speed
+const MOVE_RAMP_START_FRAC := 0.45   # fraction of MOVE_SPEED at the very first tick of a new direction
+
+
+## Called once per match — by GameManager at match start when recording live
+## (from the current control-mode setting) and again when seeking/replaying
+## a finished log (from that log's own recorded "gyro_active" metadata, NOT
+## whatever the live settings toggle currently says) — see this var's own
+## declaration comment for why that distinction matters for determinism.
+func set_gyro_control_active(active: bool) -> void:
+	_gyro_control_active_run = active
 
 var _rng              : RandomNumberGenerator = RandomNumberGenerator.new()
 var _visual_rng       : RandomNumberGenerator = RandomNumberGenerator.new()  # visual-only, never affects game state
@@ -195,9 +228,17 @@ var _tick_entry_velocity_y := 0.0
 var _trail_timer      := 0.0
 const TRAIL_INTERVAL  := 0.04
 const TRAIL_TICKS      := 5   # ticks between trail spawns (≈ TRAIL_INTERVAL at 60fps)
-var _base_scale       := Vector2(0.28, 0.28)  
+var _base_scale       := Vector2(0.28, 0.28)
 var _glow_spr         : Sprite2D
-var _cam_ref          : Camera2D = null   
+var _cam_ref          : Camera2D = null
+
+# ── Cosmetics (character customization: hat/glasses/outfit/shoes) ──────────
+# Slot -> Sprite2D. Textures are looked up at "res://assets/cosmetics/<slot>/<item_id>.png".
+# Until real art exists for a slot, ResourceLoader.exists() is false and the
+# sprite just stays invisible with no texture — nothing to do here once the
+# assets are dropped in, set_cosmetics() picks them up automatically.
+var _cosmetic_sprites  : Dictionary = {}   # slot(String) -> Sprite2D
+var _equipped_cosmetics : Dictionary = {}  # slot(String) -> item_id(String), last applied
 
 static var _dust_tex  : ImageTexture = null
 static var _trail_tex : ImageTexture = null
@@ -332,6 +373,38 @@ func _ready() -> void:
 		Vector2( 13.0, 35.0),
 		Vector2(0.30, 0.30), -1)
 
+	# Cosmetic overlay slots — created empty (no texture) up front; equipping
+	# just swaps texture/visibility later via set_cosmetics(), same pattern
+	# as _make_overlay() above. Anchor offsets are relative to the sprite's
+	# own vertical layout (_st=top, _sy=center, _sb=bottom) so they scale
+	# with screen size automatically like everything else here.
+	#
+	# BUG FIX: these fractions were measured against the character sprite's
+	# NOMINAL texture height (271px) as if content filled the whole canvas,
+	# but the actual bunnyN/*.png art has ~70px of transparent headroom
+	# above the ears (content bbox starts at y=70/271 ≈ 0.26, not y=0) —
+	# nobody caught this because no real cosmetic art existed yet to render
+	# through these slots. Measured against the actual pixels (numpy bbox +
+	# darkest-pixel scan for the eyes) on bunny1/stand.png:
+	#   - eyes sit at y=169-189/271 ≈ 0.62-0.70 (center ≈0.66), but the old
+	#     glasses fraction (0.24) landed entirely in the empty headroom
+	#     above the character — glasses would float in mid-air.
+	#   - the belly/torso sits below the face (which itself runs to ≈0.70),
+	#     so an outfit sprite tall enough to cover the torso needs its
+	#     center lower still (≈0.80) to clear the face instead of
+	#     overlapping it — the old outfit offset (_sy, the CENTER of the
+	#     nominal 271px canvas, i.e. fraction 0.5) sat well above the torso,
+	#     across the face, for the same headroom reason.
+	#   - hat (0.06) and shoes (_sb - _sh*0.04 ≈ fraction 0.96) were already
+	#     fine as anchor POINTS — a hat is expected to span from that high
+	#     anchor down into the headroom to meet the head (tall hat art, not
+	#     a short one), and shoes/feet really do sit right at the bottom
+	#     (content bbox bottom = 271/271 = 1.0). Left unchanged.
+	_cosmetic_sprites["shoes"]   = _make_overlay("", Vector2(0, _sb - _sh * 0.04), Vector2(_sc, _sc), -1)
+	_cosmetic_sprites["outfit"]  = _make_overlay("", Vector2(0, _st + _sh * 0.80), Vector2(_sc, _sc), 1)
+	_cosmetic_sprites["glasses"] = _make_overlay("", Vector2(0, _st + _sh * 0.66), Vector2(_sc, _sc), 2)
+	_cosmetic_sprites["hat"]     = _make_overlay("", Vector2(0, _st + _sh * 0.06), Vector2(_sc, _sc), 3)
+
 	_glow_spr = Sprite2D.new()
 	_glow_spr.z_index = -1
 	_glow_spr.visible = false
@@ -456,6 +529,36 @@ func _make_overlay(path: String, offset: Vector2, sc: Vector2, z: int = 1) -> Sp
 	return spr
 
 
+## Apply the player's equipped cosmetics (called by whoever owns the
+## purchase/equip UI — CustomizePanel.gd — right after a successful equip
+## call, and once on menu/game start once the backend catalog response
+## arrives). `equipped` is {slot: item_id}, same shape the backend returns.
+## Missing slot keys / unknown textures just render nothing — safe to call
+## with a partial or even empty dictionary at any time.
+func set_cosmetics(equipped: Dictionary) -> void:
+	if _is_headless: return
+	for slot in _cosmetic_sprites.keys():
+		var item_id : String = str(equipped.get(slot, ""))
+		if _equipped_cosmetics.get(slot, "") == item_id: continue
+		_equipped_cosmetics[slot] = item_id
+		var spr : Sprite2D = _cosmetic_sprites[slot]
+		if not is_instance_valid(spr): continue
+		if item_id == "":
+			spr.visible = false
+			spr.texture = null
+			continue
+		var path := "res://assets/cosmetics/%s/%s.png" % [slot, item_id]
+		if ResourceLoader.exists(path):
+			spr.texture = load(path)
+			spr.visible = true
+		else:
+			# Item is equipped but no art dropped in yet for it — stay
+			# invisible instead of erroring; will appear automatically
+			# once the PNG exists at this path.
+			spr.texture = null
+			spr.visible = false
+
+
 ## DEBUG: set overlay offsets at runtime
 func debug_set_jetpack_offset(x: float, y: float) -> void:
 	if is_instance_valid(_overlay_jetpack):
@@ -566,6 +669,13 @@ func activate() -> void:
 	# alongside the other two so every new game/replay starts every
 	# landing-adjacent gate from a clean, identical state.
 	_was_on_floor = false
+
+	# Same stale-across-replay-views risk class as the three resets above —
+	# the movement ramp counter (see its declaration comment) must start
+	# fresh for every new game/replay, not carry over whatever ramp
+	# progress the Player node happened to have from a previous run.
+	_move_ramp_ticks    = 0
+	_move_ramp_last_dir = 0
 
 	if !_is_headless:
 		_anim_sprite.scale = Vector2(0.28, 0.28)
@@ -717,7 +827,30 @@ func simulate_tick() -> void:
 	if _mirror_active:
 		dir_int = -dir_int
 	var dir := float(dir_int)
-	var current_move := MOVE_SPEED * (1.35 if _speed_boost else 1.0)
+
+	# Movement ramp — GYRO-ONLY (tap stays instant/snappy). Reset to the
+	# start of the ramp whenever direction goes neutral or flips sign (a
+	# fresh push), otherwise count up ticks held in the same direction.
+	# min(...) caps it at MOVE_RAMP_TICKS so this is a cheap O(1) counter,
+	# never grows unbounded over a long run. When gyro isn't active this
+	# match, ramp_frac is pinned to 1.0 (unchanged, full-speed-instantly
+	# behavior) but the tick counter itself still updates for free — cheap,
+	# and means flipping _gyro_control_active_run mid-tick-loop (which never
+	# actually happens — see its own doc comment) couldn't produce a stale
+	# ramp value either way.
+	if dir_int == 0 or dir_int != _move_ramp_last_dir:
+		_move_ramp_ticks = 0
+	else:
+		_move_ramp_ticks = mini(_move_ramp_ticks + 1, MOVE_RAMP_TICKS)
+	_move_ramp_last_dir = dir_int
+	var ramp_frac := 1.0
+	if _gyro_control_active_run:
+		var ramp_t : float = float(_move_ramp_ticks) / float(MOVE_RAMP_TICKS)
+		# ∈ [MOVE_RAMP_START_FRAC, 1.0] — never exceeds 1.0, so ramped speed
+		# can never exceed the normal full MOVE_SPEED, only approach it.
+		ramp_frac = MOVE_RAMP_START_FRAC + (1.0 - MOVE_RAMP_START_FRAC) * ramp_t
+
+	var current_move := MOVE_SPEED * (1.35 if _speed_boost else 1.0) * ramp_frac
 	velocity.x = dir * current_move
 
 	# Platform collision active only when falling (checked with manual AABB)
@@ -823,6 +956,9 @@ func simulate_tick() -> void:
 		var want_flip := velocity.x < 0
 		if velocity.x != 0 and _anim_sprite.flip_h != want_flip:
 			_anim_sprite.flip_h = want_flip
+			# Cosmetics face the same way the character does
+			for cslot in _cosmetic_sprites.values():
+				if is_instance_valid(cslot): cslot.flip_h = want_flip
 
 	# Squash & Stretch — is_on_floor() doesn't work with move_and_collide,
 	# use landed flag and velocity change instead
@@ -1030,6 +1166,15 @@ func is_stomping() -> bool:
 	return _tick_entry_velocity_y > _vh * 0.04
 
 
+func _seek_silent() -> bool:
+	# True while GameManager.seek_to_tick() is running its hidden re-sim
+	# burst. Gameplay STATE changes (lives, score, is_dead, quest signals)
+	# must still run unconditionally below — only the purely-visual side
+	# effects (tweens, particles, flashes) are safe to skip, since the world
+	# isn't drawn until the seek finishes and nobody sees these anyway.
+	return _game_manager != null and _game_manager._is_seeking
+
+
 func hit_enemy() -> void:
 	if god_mode: return
 	if is_powered_up: return
@@ -1059,7 +1204,7 @@ func hit_enemy() -> void:
 	_invincible = 1.2
 	_hurt_flash = 0.8
 	if is_instance_valid(_anim_sprite): _anim_sprite.play("hurt")
-	if !_is_headless:
+	if !_is_headless and not _seek_silent():
 		var tw := create_tween()
 		if tw:
 			tw.set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)
@@ -1074,7 +1219,7 @@ func die() -> void:
 	is_dead = true
 	print("[PLAYER_DIE] lives=%d pos=(%.1f,%.1f) vel=(%.1f,%.1f)" % [lives, global_position.x, global_position.y, velocity.x, velocity.y])
 	if is_instance_valid(_anim_sprite): _anim_sprite.play("hurt")
-	if !_is_headless and is_instance_valid(_anim_sprite):
+	if !_is_headless and not _seek_silent() and is_instance_valid(_anim_sprite):
 		var tw := create_tween()
 		if tw:
 			tw.set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)
@@ -1084,7 +1229,7 @@ func die() -> void:
 
 
 func _do_squash() -> void:
-	if _is_headless: return
+	if _is_headless or _seek_silent(): return
 	if _squash_tween and _squash_tween.is_valid(): _squash_tween.kill()
 	_squash_tween = create_tween()
 	if not _squash_tween: return
@@ -1093,7 +1238,7 @@ func _do_squash() -> void:
 	_squash_tween.tween_property(_anim_sprite, "scale", _base_scale, 0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
 func _do_stretch() -> void:
-	if _is_headless: return
+	if _is_headless or _seek_silent(): return
 	if _squash_tween and _squash_tween.is_valid(): _squash_tween.kill()
 	_squash_tween = create_tween()
 	if not _squash_tween: return
@@ -1104,7 +1249,7 @@ func _do_stretch() -> void:
 
 func _spawn_dust() -> void:
 	# PL-03: Use pre-allocated spark pool — no Sprite2D.new() or add_child per landing
-	if _is_headless: return
+	if _is_headless or _seek_silent(): return
 	if _spark_pool.is_empty(): return
 	for i in 6:
 		var _sidx : int = _spark_idx
@@ -1134,7 +1279,7 @@ func _spawn_dust() -> void:
 
 func _spawn_trail() -> void:
 	# PL-04: Use pre-allocated trail pool — no Sprite2D.new() or add_child per frame
-	if _is_headless: return
+	if _is_headless or _seek_silent(): return
 	if not is_instance_valid(_anim_sprite): return
 	if _trail_pool.is_empty(): return
 	var sf := _anim_sprite.sprite_frames
@@ -1166,7 +1311,7 @@ func _spawn_trail() -> void:
 
 func _spawn_drunk_ghost() -> void:
 	# PL-05: Use pre-allocated drunk ghost pool — no Sprite2D.new() or add_child per trigger
-	if _is_headless: return
+	if _is_headless or _seek_silent(): return
 	if not is_instance_valid(_anim_sprite): return
 	if _drunk_ghost_pool.is_empty(): return
 	var sf := _anim_sprite.sprite_frames
@@ -1246,7 +1391,7 @@ func _update_glow() -> void:
 
 
 func activate_powerup_flash() -> void:
-	if _is_headless: return
+	if _is_headless or _seek_silent(): return
 	var tw := create_tween()
 	if not tw: return
 	tw.set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)

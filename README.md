@@ -44,8 +44,8 @@ NimJump/
   standard library)
 - A Cloudflare Pages project already connected (initial Pages setup is
   not covered here)
-- Know which OS you're exporting from — it determines which native
-  export preset you use for the backend (see section 3.2)
+- Know which OS the backend/replay-verifier host runs — it determines
+  which native export preset you use (see section 3.2)
 
 ---
 
@@ -79,16 +79,16 @@ Export Path (top of dialog): export/index.html
 ### 3.2 Native preset (for the backend)
 
 The backend's replay-verifier needs a native build of the game to
-validate replays server-side. Which preset you use depends on the OS
-you're exporting from:
+validate replays server-side. Pick the export preset to match the OS the
+backend/replay-verifier host actually runs — not the OS your own machine
+happens to be on:
 
-- Exporting on Linux → use the Linux/X11 export preset
-- Exporting on Windows → use the Windows Desktop export preset
+- Backend host runs Linux → use the Linux/X11 export preset
+- Backend host runs Windows → use the Windows Desktop export preset
 
-Whichever OS you build on is the build the backend will actually use —
-if the backend server runs Linux but you export from Windows, the
-backend won't be able to use that binary. Make sure the export platform
-matches what the backend/replay-verifier host actually runs.
+Godot can export either target from either OS (as long as the matching
+export templates are installed) — the only thing that matters is the
+export preset you pick, not which machine you're clicking Export on.
 
 Export Path for this preset: backend/replay-verifier/replay.exe
 (or replay.zip if that's the packaged format replay-verifier expects —
@@ -284,7 +284,7 @@ backend/replay-verifier/ to already be in place if you want replay
 verification to actually work while it's running.
 
 For running this unattended on a real server — auto-start on boot,
-auto-restart on crash, survives reboots — see section 19.
+auto-restart on crash, survives reboots — see section 17.
 
 ---
 
@@ -325,32 +325,37 @@ mid-session) — "Log out" in the top-right of the panel clears it early.
 
 - **Overview** — currently-playing sessions, recent sessions, replay
   worker queue health, and a server resources card (RAM / disk usage —
-  see section 14).
+  see section 16).
 - **Analytics** — daily/weekly player & session counts, playtime, NIM
   distributed, Nimiq wallet balance.
-- **Active / Completed / Flagged / Failed / All Sessions** — session
-  browser, click into any session for the full replay analysis view.
+- **Completed / Flagged / Failed / All Sessions** — session browser,
+  click into any session for the full replay analysis view (including
+  whether that match was played with tap or gyro control). A session
+  only shows up here once it's actually finished.
 - **Leaderboard** — read-only view of daily/weekly rankings.
-- **Players / Player Search** — look up a specific player's stats, quest
-  progress, reward history.
-- **Logs** — aggregated client-side error/warning logs (includes
-  `version_mismatch` entries — see section 13).
-- **System** — leaderboard on/off switches, replay version, game update
-  mode, replay verifier binary upload, "Remove All Replays" (sections
-  11–13).
+- **Players** — look up a specific player's stats, quest progress, reward
+  history, connection-IP history.
+- **Streaks** — every player's daily login-streak status (current day,
+  longest run), aggregate NIM distributed via streak claims, and the
+  reward formula's three knobs (base/extra-per-day/max NIM) plus the
+  per-IP multi-account claim cap — all admin-editable here.
+- **Logs** — aggregated client-side error/warning logs.
+- **System** — leaderboard on/off switches, game update lock (Activate/
+  Deactivate — section 11), replay verifier binary upload, "Remove All
+  Replays" (section 12).
 - **Database** — live key-count per data category in BadgerDB, with a
-  clear button per category, plus the failed-replay archive (section 15).
+  clear button per category, plus the failed-replay archive (section 14).
 
 ---
 
 ## 11. Pushing a Game Update — Step by Step
 
 This is the actual playbook for "I changed something in Godot and/or the
-backend, now I need it live." Read this whole section before doing it
-for the first time — the pieces (client version, replay version, update
-mode) only make sense together.
+backend, now I need it live." Updating is just: build, deploy, and
+optionally use the update lock to keep players off the site for a moment
+while you do it.
 
-### 11.1 The two builds that must move together
+### 11.1 The two builds that still move together
 
 Every deploy touches up to two separate binaries, built from the same
 Godot project, for two different purposes:
@@ -366,179 +371,96 @@ Godot project, for two different purposes:
 
 **Both come from the same Godot project** — if you change gameplay logic
 (movement, scoring, enemy behavior, anything that affects simulation),
-you almost always need to rebuild and redeploy *both*, or the web client
-and the server's replay verifier will disagree on what the "correct"
-score should have been for a given input log, and legitimate scores
-start getting flagged/rejected.
+rebuild and redeploy *both* together, or the web client and the server's
+replay verifier will disagree on what the "correct" score should have
+been for a given input log, and legitimate scores can end up flagged.
 
-### 11.2 Bumping the version number
+The backend doesn't check version-matching between client and server —
+keeping these two builds in sync is a matter of discipline, not something
+enforced for you.
 
-`game/scripts/GameVersion.gd` has one constant:
+### 11.2 Game Update Lock: Activate / Deactivate
 
-    const CLIENT_VERSION := 1
+Admin panel → System tab → **Game Update Lock**. One switch, two states:
 
-The backend has a matching `REPLAY_VERSION` (env var default, changeable
-live from admin → System tab). Every replay submit includes
-`client_version`; the backend rejects (doesn't save, doesn't simulate)
-any submit where it doesn't match `REPLAY_VERSION` exactly — see section
-13 for exactly why this exists and what it does and doesn't protect
-against.
+- **Deactivate** (default) — no restriction, this is normal operation.
+  Status shows "new games open."
+- **Activate** — new games are blocked *immediately*, for everyone.
+  Players mid-game can finish their current run; starting a *new* one
+  shows a "Game updating" toast instead. Status shows "new games
+  locked." Use this while you swap in a new build so nobody starts a
+  session against a half-updated deploy.
 
-**Whenever you change anything that affects gameplay simulation, bump
-`CLIENT_VERSION` by 1** before exporting the web build, and set the admin
-panel's replay version to the same new number once (and only once) both
-the new web build and the new replay verifier binary are live. Until you
-flip the admin panel's number, the *old* version stays authoritative — so
-sequence matters (11.4).
+While active, `Main.gd` polls `/backend/developer-mode` every 25 seconds
+and blocks `_do_start_game()` with an English toast ("Game updating.
+Please check back shortly — thanks for your patience!") instead of
+starting a session. Click **Deactivate** once your new build is fully
+live to resume play for everyone immediately.
 
-If you're only changing something that doesn't affect simulation (UI
-text, a sound, an admin-only feature) you don't need to touch the
-version number at all — old and new clients keep working side by side.
-
-### 11.3 Update modes: Force vs Normal
-
-Admin panel → System tab → Game Update Mode. This exists to prevent the
-awkward window where some players are on the old client (talking to the
-old replay verifier) and some are on the new one, submitting scores that
-don't reconcile.
-
-- **Off** (default) — no restriction, this is normal operation.
-- **Force** — new games are blocked *immediately*, for everyone, the
-  moment you click it. Players mid-game can finish their current run;
-  starting a *new* one shows a "Game updating" toast instead. Use this
-  when you need the site down for an update right now (emergency fix,
-  short maintenance window).
-- **Normal** — nothing changes immediately. The backend keeps track of
-  which weekly leaderboard period was current when you clicked it, and
-  every minute checks whether that period has since ended (Monday
-  00:00 UTC+3). The instant it rolls over, `update_active` flips on
-  automatically, same effect as Force from that point on. Use this for
-  a clean, non-disruptive update that lands exactly at the weekly
-  leaderboard boundary — nobody's mid-week runs get cut off, and the
-  next week starts entirely on the new version.
-
-Either way, while `update_active` is true, `Main.gd` polls
-`/backend/developer-mode` every 25 seconds and blocks `_do_start_game()`
-with an English toast ("Game updating. Please check back shortly —
-thanks for your patience!") instead of starting a session.
-
-Click **Complete Update** once the new web export is live on Cloudflare
-Pages *and* the new replay binary is uploaded — this resumes play for
-everyone immediately.
-
-### 11.4 Recommended order of operations
-
-Doing these out of order is the most common way to end up with a pile of
-falsely-rejected `version_mismatch` submits or, worse, wrongly-flagged
-scores. Follow this order:
+### 11.3 Recommended order of operations
 
 1. Finish your Godot changes.
-2. Bump `game/scripts/GameVersion.gd`'s `CLIENT_VERSION`.
-3. (Optional but recommended for gameplay-affecting changes) Admin panel
-   → System → set update mode to **Force** or **Normal**. This stops new
-   games on the *old* version from starting while you're mid-deploy.
-4. Export the **native/headless** build, upload it via admin panel →
+2. (Optional, recommended for gameplay-affecting changes) Admin panel →
+   System → **Activate** the update lock so new games stop starting on
+   the old build while you deploy.
+3. Export the **native/headless** build, upload it via admin panel →
    System → Replay Verifier Binary (section 12). The worker pool restarts
    automatically and picks it up within a few seconds.
-5. Export the **web** build, run `setup/build.py`, upload `export/` to
-   Cloudflare Pages (section 16).
-6. Admin panel → System → set **Replay version** to the same number you
-   put in `CLIENT_VERSION`. From this instant, only submits from the new
-   client are accepted.
-7. Admin panel → System → click **Complete Update**. Players can start
-   new games again, now on the new version.
-8. (Optional) Admin panel → System → **Remove All Replays** if you want
-   to clear out replay logs recorded against the old build (see 13.3) —
-   doesn't touch scores/stats, only the raw recordings.
+4. Export the **web** build, run `setup/build.py`, upload `export/` to
+   Cloudflare Pages (section 15 — manual upload only).
+5. Admin panel → System → **Deactivate** the update lock. Players can
+   start new games again, now on the new version.
+6. (Optional) Admin panel → System → **Remove All Replays** if you want
+   to clear out replay logs recorded against the old build — doesn't
+   touch scores/stats, only the raw recordings.
 
-For small, simulation-safe changes (won't affect scoring), you can skip
-steps 3, 6, 7 entirely and just redeploy — the version check only
-matters when client and server would actually disagree on how to replay
-something.
-
-### 11.5 Doing all of this in one click — the Deploy tab
-
-Steps 3–7 above can also be bundled into a single scheduled job from
-admin panel → **Deploy tab**, instead of clicking through System tab
-buttons one at a time. See section 18 for the full walkthrough — short
-version: stage the new replay binary, tick "Deploy to Cloudflare Pages"
-and "Set replay version to N", pick when it should run (right now, a
-specific time, or automatically at the next daily/weekly leaderboard
-boundary), and the backend does steps 3–7 itself, in order, the moment
-the trigger fires — including automatically resuming play afterward.
+For small changes that don't affect scoring, you can skip steps 2 and 5
+entirely and just redeploy — the lock is a courtesy to avoid confusing
+mid-deploy behavior, not something enforced by the backend.
 
 ---
 
 ## 12. Updating the Replay Verifier Binary
 
-Admin panel → System tab → **Replay Verifier Binary** card.
+This is how you get a newly exported native/headless build (section 3.2)
+onto a live server without touching FTP/SSH — the admin panel uploads it
+straight into place and hot-swaps it in.
 
-- Accepts a `.zip` (Linux headless build — the backend extracts the
-  binary + `.pck` from it automatically) or a `.exe` (Windows/Godot
-  export, run as-is — useful if the backend host itself is Windows).
-- On upload, the backend saves it into `SERVERGAMES_DIR`
-  (`backend/replay-verifier` by default), clears its cached binary path,
-  and restarts every persistent Godot worker process so they relaunch
-  against the new binary — no backend restart needed.
-- The card also shows whether the currently-active binary is healthy
-  (a background monitor pings it periodically) and lists every file
-  sitting in that folder with size/modified time.
+**Step by step:**
 
-This is the same folder documented in section 3.2 (native export) — the
-admin upload just replaces doing it by hand over FTP/SSH.
+1. Export the **native/headless** preset in Godot first (section 3.2/4) —
+   you're uploading the output of that export, not the web build.
+2. Log into the admin panel → **System** tab.
+3. Find the **Replay Verifier Binary** card.
+4. Click the file picker and choose the exported file:
+   - `.zip` if the backend host runs Linux — the backend unpacks the
+     binary + its `.pck` out of the zip automatically, you don't extract
+     anything yourself first.
+   - `.exe` if the backend host runs Windows — uploaded and run as-is,
+     no unpacking needed.
+5. Click **Upload & Replace**. A confirm dialog appears (it tells you the
+   worker pool is about to restart) — confirm it.
+6. That's it. The backend saves the file into `SERVERGAMES_DIR`
+   (`backend/replay-verifier` by default), then restarts every persistent
+   Godot worker process so they all relaunch against the new binary —
+   this takes a few seconds, no backend restart and no downtime beyond
+   that brief worker-pool restart. It goes live the instant the upload
+   finishes; there's no separate "activate" step and nothing to schedule.
 
----
+**Confirming it worked:** the same card shows a health indicator for the
+currently-active binary (a background check pings it periodically) plus a
+list of every file in that folder with its size and modified time — after
+uploading, check that the modified time on your new file is recent and
+the health indicator is still green.
 
-## 13. Version Matching — What It Actually Protects Against
-
-**This is not anti-cheat.** It exists purely to catch *you* forgetting to
-update one half of a deploy — e.g. you push a new replay verifier binary
-but forget to bump `CLIENT_VERSION` and redeploy the web build (or the
-other way around). Without it, an old/new mismatch would silently
-produce wrong `server_score` values or spurious flags, and you'd have no
-idea why scores suddenly look broken.
-
-### 13.1 How it works
-
-- `game/scripts/GameVersion.gd`'s `CLIENT_VERSION` is sent as
-  `client_version` on every `/backend/submit`.
-- The backend compares it against `AppConfig.ReplayVersion` (env var
-  `REPLAY_VERSION`, or admin panel → System → "Replay version").
-- **Mismatch → the submit is silently rejected.** Nothing gets written to
-  the database — no session, no score, no replay log, no simulation
-  attempt. The backend responds `409 {"error":"version_mismatch"}`.
-- The mismatch is logged as a client-log entry (`level: warn`,
-  `message: version_mismatch`) with the player ID / IP attached — visible
-  on the admin panel's Logs tab, so you can see if this is actually
-  happening to real players (which would mean you deployed out of order)
-  versus just being theoretical.
-
-### 13.2 What happens on the client
-
-`GameManager.gd`'s submit retry logic treats a `409 version_mismatch`
-response as a **permanent rejection** — it's removed from the local
-pending-submit queue immediately and **never retried**. It also shows a
-one-time English toast: *"Your game version is out of date. Please
-refresh the page to update."* This matters because without it, a stale
-client would otherwise keep silently retrying a submit the server will
-never accept, forever, doing nothing but wasting requests.
-
-### 13.3 "Remove All Replays"
-
-Admin panel → System tab → Danger Zone → **Remove All Replays**. Deletes
-every stored replay log (and the whole failed-replay archive — section
-15) but leaves every session's score, quest progress, and any rewards
-already paid out completely untouched. Use this after a version bump if
-you don't want old replay recordings (made against the previous build)
-sitting around no longer meaning anything — they're just raw input logs,
-not proof of anything on their own once the simulator that would replay
-them has changed.
+This is the same folder documented in section 3.2 — the admin upload is
+just a faster way to put a file there than doing it by hand on the server.
 
 ---
 
-## 14. Leaderboards On/Off
+## 13. Leaderboards On/Off
 
-Admin panel → System tab → Leaderboards & Versioning.
+Admin panel → System tab → Leaderboards.
 
 - Two independent switches: **Daily leaderboard enabled** and **Weekly
   leaderboard enabled**.
@@ -555,11 +477,11 @@ Admin panel → System tab → Leaderboards & Versioning.
 
 ---
 
-## 15. Database Tab & Failed Replay Archive
+## 14. Database Tab & Failed Replay Archive
 
 Admin panel → Database tab.
 
-### 15.1 Category overview
+### 14.1 Category overview
 
 Every meaningful key-prefix in BadgerDB is listed with a live count:
 sessions, seed dedup index, auth tokens, nicknames, wallet registrations,
@@ -575,7 +497,7 @@ log everyone out, or reset settings back to `.env` defaults. The rest
 (seed index, daily caps, quests, client logs, failed-replay archive) are
 safe to clear any time; they regenerate/reset on their own.
 
-### 15.2 Failed replay archive
+### 14.2 Failed replay archive
 
 Whenever server-side replay simulation fails outright (worker crash,
 timeout, cancelled job) or a submitted score doesn't match what the
@@ -587,30 +509,22 @@ feed back into the replay binary by hand for manual debugging).
 
 ---
 
-## 16. Deploying — the Full Picture
+## 15. Deploying — the Full Picture
 
 Putting sections 5–6 and 11–12 together, here's literally everything
 that can change on a deploy and where each piece goes:
 
 | What changed | Where it goes | How |
 |---|---|---|
-| Gameplay/UI (Godot project) | `export/` → Cloudflare Pages | Web export → `setup/build.py` → **admin panel Deploy tab** (or manual dashboard upload, see below) |
-| Server-side replay verification (same Godot project, headless export) | `backend/replay-verifier/` | Admin panel → System (immediate) or Deploy tab (staged + scheduled) |
+| Gameplay/UI (Godot project) | `export/` → Cloudflare Pages | Web export → `setup/build.py` → manual dashboard upload (Deployments → Direct upload), or push to whatever branch the Pages project is Git-connected to |
+| Server-side replay verification (same Godot project, headless export) | `backend/replay-verifier/` | Admin panel → System → Replay Verifier Binary upload (section 12) |
 | Backend Go code | wherever the backend process runs | `go build .` (or `go run .` in dev), restart the process |
 | Admin panel (Next.js) | wherever the admin process runs | `npm run build && npm start` (or restart if already running), restarted separately from the backend |
 
-**There is still no `wrangler.toml` in this project** — but the backend
-*can* push to Cloudflare Pages for you now (section 18), by shelling out
-to `npx wrangler pages deploy` with credentials from env vars. No config
-file, no `wrangler login` — just `CLOUDFLARE_API_TOKEN` /
-`CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_PAGES_PROJECT` in `backend/.env`.
-This needs Node/npm on the backend host (already required for the admin
-app, so nothing extra to install in practice).
-
-If you'd rather not configure that, the manual path still works exactly
-as before: drag-and-drop the whole `export/` folder into the Pages
-project's dashboard (Deployments → Direct upload), or push to whatever
-branch the Pages project is Git-connected to.
+Deploying to Cloudflare Pages is always a manual step: drag-and-drop the
+whole `export/` folder into the Pages project's dashboard (Deployments →
+Direct upload), or push to whatever branch the Pages project is
+Git-connected to.
 
 The backend and admin app are two separate long-running processes (see
 section 7) — updating one doesn't require restarting the other, except
@@ -621,7 +535,7 @@ code change).
 
 ---
 
-## 17. System Resources
+## 16. System Resources
 
 Admin panel → Overview tab (bottom card) shows: goroutine count, Go heap
 size, uptime, CPU core count, and — on a Linux server — total/used RAM
@@ -632,128 +546,7 @@ the card simply doesn't render the bars).
 
 ---
 
-## 18. The Deploy Tab — Scheduled Updates
-
-This is the one-click version of section 11.4's manual checklist. Admin
-panel → **Deploy tab**.
-
-### 18.1 One-time setup
-
-Set these in `backend/.env` (see `.env.example` for the same keys, blank):
-
-    CLOUDFLARE_API_TOKEN=...       # Cloudflare dashboard → My Profile → API Tokens
-    CLOUDFLARE_ACCOUNT_ID=...      # Cloudflare dashboard → any domain overview → sidebar
-    CLOUDFLARE_PAGES_PROJECT=...   # Workers & Pages → your project → the slug in the URL
-    CLOUDFLARE_EXPORT_DIR=../export   # default already matches this repo's layout
-    CLOUDFLARE_PAGES_BRANCH=main      # whatever branch your Pages project treats as production
-
-The Deploy tab shows a green "configured" badge once all three of
-TOKEN/ACCOUNT_ID/PROJECT are set; until then the "Deploy to Cloudflare
-Pages" checkbox stays disabled so you can't accidentally schedule
-something that can't run.
-
-Requires Node/npm on the backend host — the deploy runs
-`npx --yes wrangler@3 pages deploy` under the hood, no global install, no
-`wrangler.toml`, no interactive login (auth comes entirely from the two
-env vars above, which Wrangler reads automatically in CI mode).
-
-### 18.2 Staging a replay binary
-
-Same file upload as System tab's Replay Verifier Binary card, but with
-"Stage for later" — the file lands in a `staged/` folder and does
-**nothing** until a scheduled job explicitly activates it. Check the
-Deploy tab's config card to confirm it's staged before scheduling. You
-can only have one staged file waiting at a time — uploading a new one
-replaces it, and cancelling a pending job that would've activated it
-discards it too.
-
-### 18.3 Scheduling
-
-Tick whichever of these three actions you want bundled together:
-
-- **Activate staged replay binary** — swaps in whatever you staged in
-  18.2, resets the cached binary path, restarts the worker pool.
-- **Deploy to Cloudflare Pages** — runs Wrangler against
-  `CLOUDFLARE_EXPORT_DIR`, deploying *whatever's sitting in that folder
-  at the moment the job actually runs*. There's no separate "build" step
-  here — export the web build and run `setup/build.py` yourself first
-  (section 5), same as always; the Deploy tab only handles the upload.
-- **Set replay version to N** — same as typing a number into System
-  tab's "Replay version" field, just bundled into the same atomic job.
-
-Then pick **when**:
-
-- **Right now** — runs within ~15 seconds (the scheduler's poll interval).
-- **At a specific time** — pick a date/time, runs the moment the clock
-  hits it (checked every 15 seconds, so expect up to ~15s of slop).
-- **When the daily leaderboard ends** — next UTC+3 midnight.
-- **When the weekly leaderboard ends** — next Monday 00:00 UTC+3 (matches
-  the same week boundary the weekly leaderboard itself resets on).
-
-Only one job can be pending/running at a time — schedule a second one
-and the backend tells you to cancel the first. A pending job can be
-cancelled any time before it runs; a running one can't (it's already
-doing the thing).
-
-### 18.4 What actually happens when a job fires
-
-In order:
-
-1. New games get blocked immediately (same "Game updating" toast as
-   Force update mode — section 11.3).
-2. Staged replay binary activates, if you checked that box.
-3. Cloudflare Pages deploy runs, if you checked that box — this is
-   usually the slowest step (uploading however much the export folder
-   weighs).
-4. Replay version updates, if you set one.
-5. If every checked step succeeded: new games are unblocked again,
-   automatically — no separate "Complete Update" click needed.
-6. If any step failed: the block **stays on** and the job is marked
-   failed with the error in its log. Nothing after the failed step runs
-   (e.g. if the binary activation fails, Cloudflare never gets touched).
-   You'll need to look at the job's log (click the row to expand it),
-   fix whatever's wrong, and schedule a fresh job — failed jobs aren't
-   auto-retried.
-
-### 18.5 "Close-safe" — what that actually means here
-
-Every job is written to the database the moment you schedule it (not
-held in memory) and its status is saved to the database at every step —
-so restarting the backend never loses a scheduled job, and you can always
-see exactly what happened by checking Deploy tab → job history.
-
-What it deliberately does **not** do: silently resume or re-run a job
-that was caught mid-execution by a backend restart. If that happens, the
-job is marked `failed` with an explicit "backend restarted while this job
-was running" message the next time the backend boots — a Cloudflare
-deploy or binary swap isn't something that's always safe to blindly
-repeat automatically, so this surfaces it for you to look at and
-re-schedule manually instead of guessing.
-
-### 18.6 The full update flow, end to end
-
-Putting all of section 11 + 18 together, this is what a full update
-looks like in practice:
-
-1. You finish your Godot changes, bump `CLIENT_VERSION`, export the
-   headless build.
-2. Admin panel → Deploy tab → upload the new replay binary with
-   "Stage for later".
-3. Export the web build, run `setup/build.py`.
-4. Deploy tab → tick all three checkboxes (activate binary / deploy
-   Cloudflare / set replay version to the new number) → pick **"When the
-   weekly leaderboard ends"** → Schedule.
-5. Walk away. Players keep playing on the current version all week,
-   scores keep counting toward the weekly leaderboard normally.
-6. The moment the week rolls over: new games block for as long as the
-   job actually takes (typically under a minute unless the Cloudflare
-   upload is slow), the new binary + new web build + new replay version
-   all go live together, and play resumes automatically — everyone's
-   now on the new version, cleanly split at the week boundary.
-
----
-
-## 19. Running Unattended — systemd (boot-start + auto-restart)
+## 17. Running Unattended — systemd (boot-start + auto-restart)
 
 Everything so far assumes you're at a terminal running `go run .` by
 hand. For a real server you want the backend (and with it, the admin
@@ -763,11 +556,11 @@ crashes — without you having to SSH in and notice.
 
 `systemd` (standard on basically every Linux server distro) does both
 with one unit file. This is the "close-safe" / "kapanmama garantisi"
-piece the deploy jobs (section 18) and the admin auto-start (section 7)
-were already built to survive — this is what makes the survival
-actually automatic instead of "works if you remember to restart it."
+piece the admin auto-start (section 7) was already built to survive —
+this is what makes the survival actually automatic instead of "works if
+you remember to restart it."
 
-### 19.1 Build a real binary first
+### 17.1 Build a real binary first
 
 Don't run `go run .` in production — it recompiles on every start and
 leaves a build cache around. Compile once:
@@ -830,8 +623,7 @@ What each close-safety piece is doing:
   process (OOM kill, panic, `go build` produced a bad binary, anything)
   systemd brings it back within `RestartSec`. This is on top of, not
   instead of, the app-level auto-restart of the admin app (section 7)
-  and the deploy job scheduler's own crash detection (section 18.5) —
-  three independent layers, each catching a different kind of failure.
+  — two independent layers, each catching a different kind of failure.
 - **`WantedBy=multi-user.target`** — starts on boot, no manual step
   after a server reboot.
 - **`TimeoutStopSec=10`** — gives the backend's shutdown handler (which
@@ -859,7 +651,7 @@ If you already have this unit installed with the old settings, editing
 `/etc/systemd/system/nimjump-backend.service` on the server and running
 `sudo systemctl daemon-reload` picks up the change (no reinstall needed).
 
-### 19.2b Make sure logs actually survive a crash/reboot (do this once)
+### 17.2b Make sure logs actually survive a crash/reboot (do this once)
 
 The reboot escalation above is only useful if the *logs explaining why*
 survive the reboot too — otherwise you're back to "it happened, no way to
@@ -884,7 +676,7 @@ After this, `journalctl -u nimjump.service` (or `--list-boots` to see
 every past boot) keeps working across reboots instead of only covering
 whatever's happened since the box last came up.
 
-### 19.3 Enable it
+### 17.3 Enable it
 
     sudo systemctl daemon-reload
     sudo systemctl enable --now nimjump-backend
@@ -894,19 +686,18 @@ immediately. From here on:
 
     sudo systemctl status nimjump-backend     # is it up, how long, last exit code
     sudo journalctl -u nimjump-backend -f     # live logs — backend + [ADMIN]-prefixed admin app logs, same stream
-    sudo systemctl restart nimjump-backend    # after deploying a new binary (19.1) or config change
+    sudo systemctl restart nimjump-backend    # after deploying a new binary (17.1) or config change
 
-### 19.4 What actually survives what
+### 17.4 What actually survives what
 
 | Event | What happens |
 |---|---|
 | Admin app (Next.js) crashes | `adminproc.go` restarts it in-process within seconds (backoff, section 7) — backend itself is untouched |
 | Backend process crashes/panics | systemd restarts the whole thing (`Restart=always`) within `RestartSec`; admin app comes back up with it |
 | Server reboots | systemd starts the service on boot (`enable`); BadgerDB reopens from `DB_PATH` with everything intact |
-| A deploy job is mid-run when any of the above happens | Marked `failed` on the next boot rather than silently resumed — see section 18.5. Nothing is lost (it's in BadgerDB), but it won't guess whether it's safe to redo automatically |
 | You push new backend code | `go build -o nimjump-backend .` then `sudo systemctl restart nimjump-backend` — one restart, both backend and admin app come back |
 
-### 19.5 If you're not on Linux
+### 17.5 If you're not on Linux
 
 No `systemd` on Windows — use Task Scheduler (run at startup, "restart
 on failure" under the task's Settings tab) or a small wrapper like

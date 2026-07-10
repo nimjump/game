@@ -48,7 +48,7 @@ var dbCategories = []dbCategoryDef{
 	{"leaderboard_winners", "lb:winners:", "Leaderboard Winner Snapshots",
 		"Recorded past-period winners (used for payout history).", true},
 	{"app_config", "cfg:", "App Config",
-		"Developer mode, update mode, leaderboard on/off, replay version. Clearing resets everything to the .env defaults.", true},
+		"Developer mode, update lock (active/inactive), leaderboard on/off. Clearing resets everything to the .env defaults.", true},
 }
 
 type DBCategory struct {

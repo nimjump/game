@@ -3,7 +3,7 @@ extends CanvasLayer
 ## Same UITheme style as settings popup.
 
 signal closed
-signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int)
+signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int, address: String, gyro_active: bool)
 
 var BACKEND_URL : String = ApiConfig.base_url()   # resolved at runtime (same origin on web)
 const UITheme     := preload("res://scripts/UITheme.gd")
@@ -14,6 +14,7 @@ var _list_root   : VBoxContainer = null
 var _tab_daily   : Button        = null
 var _tab_weekly  : Button        = null
 var _anim_tween  : Tween         = null
+
 var _cur_period  : String        = "daily"   # "daily" | "weekly"
 var _player_id   : String        = ""
 var _auth_attempted : bool = false
@@ -76,15 +77,16 @@ func hide_panel() -> void:
 		_h.cancel_request()
 		_h.queue_free()
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
-	if is_instance_valid(_panel_ctrl):
-		_anim_tween = create_tween()
-		if _anim_tween:
-			_anim_tween.set_parallel(true)
-			_anim_tween.tween_property(_panel_ctrl, "modulate:a", 0.0,                 0.15).set_trans(Tween.TRANS_QUAD)
-			_anim_tween.tween_property(_panel_ctrl, "scale",      Vector2(0.90, 0.90), 0.15).set_trans(Tween.TRANS_QUAD)
-			_anim_tween.chain().tween_callback(func(): hide())
-			return
+	# BUG FIX: hide() used to only run inside a tween.chain().tween_callback()
+	# fired after the fade-out finished. If hide_panel() got called again
+	# before that fired, .kill() above stops the tween WITHOUT running its
+	# chained callback, so hide() never ran — this CanvasLayer (with its
+	# full-rect, input-blocking dim layer) stayed stuck on top of the lobby.
+	# Fix: hide immediately/synchronously, treat the fade as pure decoration.
 	hide()
+	if is_instance_valid(_panel_ctrl):
+		_panel_ctrl.modulate.a = 1.0
+		_panel_ctrl.scale      = Vector2.ONE
 
 
 const _C_BG     := Color(0.957, 0.898, 0.800)
@@ -257,7 +259,18 @@ func _switch_period(period: String) -> void:
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
-func _fetch_prizes_then_lb() -> void:
+## BUG FIX: transient network failures — result != SUCCESS, code 0 (CORS/
+## fetch-level failure), or a 502 — used to be treated as final and shown to
+## the player immediately. In devtools/tunnel testing this fires constantly
+## on the very FIRST request or two right after a Cloudflare Quick Tunnel
+## comes up: the tunnel can answer a readiness poll and still 502 the next
+## real request a moment later while its edge routing finishes settling —
+## a known Quick Tunnel quirk, not a config/CORS bug. One quiet retry after
+## a short delay absorbs that without bothering the player; only a SECOND
+## consecutive failure is treated as a real problem.
+const _RETRYABLE_CODES := [0, 502, 503, 504]
+
+func _fetch_prizes_then_lb(_retry: bool = false) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 5.0
 	add_child(http)
@@ -272,12 +285,18 @@ func _fetch_prizes_then_lb() -> void:
 				var wp = d.get("weekly", {})
 				_daily_prizes  = [dp.get("first", 100.0), dp.get("second", 50.0), dp.get("third", 30.0)]
 				_weekly_prizes = [wp.get("first", 500.0), wp.get("second", 300.0), wp.get("third", 100.0)]
+			_fetch_lb()
+			return
+		if not _retry and code in _RETRYABLE_CODES:
+			await get_tree().create_timer(0.8).timeout
+			_fetch_prizes_then_lb(true)
+			return
 		_fetch_lb()
 	)
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/leaderboard/prizes"))
 
 
-func _fetch_lb() -> void:
+func _fetch_lb(_retry: bool = false) -> void:
 	_set_loading()
 	var http := HTTPRequest.new()
 	http.timeout = 6.0
@@ -290,6 +309,10 @@ func _fetch_lb() -> void:
 			if j.parse(body.get_string_from_utf8()) == OK:
 				_build_list(j.get_data())
 				return
+		if not _retry and code in _RETRYABLE_CODES:
+			await get_tree().create_timer(0.8).timeout
+			_fetch_lb(true)
+			return
 		_show_error("Could not connect to server. Code: %d" % code)
 		Toast.network_error("leaderboard code=%d" % code)
 	)
@@ -300,19 +323,24 @@ func _fetch_lb() -> void:
 
 static func _warm_btn(btn: Button, r: float = 8.0) -> void:
 	var ri := int(r)
-	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new()
-	for s in [sn, sh, sp]:
+	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new(); var sd := StyleBoxFlat.new()
+	for s in [sn, sh, sp, sd]:
 		s.corner_radius_top_left = ri; s.corner_radius_top_right = ri
 		s.corner_radius_bottom_left = ri; s.corner_radius_bottom_right = ri
 	sn.bg_color = Color(0.780, 0.380, 0.120)
 	sh.bg_color = Color(0.820, 0.450, 0.160)
 	sp.bg_color = Color(0.640, 0.300, 0.080)
-	btn.add_theme_stylebox_override("normal",  sn)
-	btn.add_theme_stylebox_override("hover",   sh)
-	btn.add_theme_stylebox_override("pressed", sp)
+	# BUG FIX: no "disabled" stylebox was set — a disabled button fell back
+	# to Godot's raw default grey panel, clashing with the warm theme.
+	sd.bg_color = Color(0.720, 0.660, 0.580)
+	btn.add_theme_stylebox_override("normal",   sn)
+	btn.add_theme_stylebox_override("hover",    sh)
+	btn.add_theme_stylebox_override("pressed",  sp)
+	btn.add_theme_stylebox_override("disabled", sd)
 	btn.add_theme_color_override("font_color",         Color(0.957, 0.898, 0.800))
 	btn.add_theme_color_override("font_hover_color",   Color(1.0, 1.0, 1.0))
 	btn.add_theme_color_override("font_pressed_color", Color(0.957, 0.898, 0.800))
+	btn.add_theme_color_override("font_disabled_color", Color(0.480, 0.420, 0.360))
 
 
 static func _warm_ghost_btn(btn: Button, r: float = 8.0) -> void:
@@ -524,6 +552,7 @@ func _build_list(data: Variant) -> void:
 
 		var player_cell := HBoxContainer.new()
 		player_cell.size_flags_horizontal    = Control.SIZE_EXPAND_FILL
+		player_cell.size_flags_vertical      = Control.SIZE_SHRINK_CENTER
 		player_cell.size_flags_stretch_ratio = 0.45
 		player_cell.add_theme_constant_override("separation", int(ref * 0.010))
 		player_cell.alignment = BoxContainer.ALIGNMENT_BEGIN
@@ -531,6 +560,7 @@ func _build_list(data: Variant) -> void:
 
 		var avatar_size := int(ref * 0.040)
 		var avatar := _make_nimiq_avatar(address, avatar_size)
+		avatar.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 		player_cell.add_child(avatar)
 
 		var nick_col : Color = _C_BROWN
@@ -539,6 +569,7 @@ func _build_list(data: Variant) -> void:
 		id_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 		id_lbl.clip_text = true
 		id_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		id_lbl.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 		UITheme.apply_label(id_lbl, nick_col, int(ref * (0.028 if i < 3 else 0.026)))
 		player_cell.add_child(id_lbl)
 
@@ -599,6 +630,14 @@ func _make_col_label(txt: String, ref: float, w_ratio: float, col: Color, bold: 
 	lbl.size_flags_stretch_ratio = w_ratio
 	lbl.clip_text = true
 	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	# BUG FIX: HBoxContainer doesn't stretch children to its own height by
+	# default — each Label kept its natural (short) text-line height and sat
+	# top-aligned inside the taller row (row height is set by the avatar/play
+	# button), so `vertical_alignment = CENTER` above had no extra room to
+	# center within and the text visually hugged the top of each pill. Only
+	# the play button (rp_btn below) had SIZE_SHRINK_CENTER set, which is why
+	# it alone looked centered. Same flag here fixes every text column.
+	lbl.size_flags_vertical = Control.SIZE_SHRINK_CENTER
 	return lbl
 
 
@@ -829,8 +868,10 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 		var seed     : int    = int(seed_str)
 		var log_b64  : String = str(d.get("replay_log", ""))
 		var char_idx : int    = int(d.get("char", 0))
+		var gyro_active : bool = bool(d.get("gyro_active", false))
 		var nickname : String = str(d.get("nickname", ""))
 		var player_seed : int = int(str(d.get("player_seed", "0")))
+		var address  : String = str(d.get("player_id", ""))
 		if log_b64 == "" or seed == 0: return
 		var log_bytes := Marshalls.base64_to_raw(log_b64)
 		if log_bytes.is_empty(): return
@@ -838,7 +879,7 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 		# which made the signal dispatch run with _leaderboard_panel.visible == false.
 		# Main._on_leaderboard_replay_requested guards `if not _leaderboard_panel.visible: return`
 		# so the replay never started. Solution: emit first, then close deferred.
-		replay_requested.emit(seed, log_bytes, char_idx, nickname, player_seed)
+		replay_requested.emit(seed, log_bytes, char_idx, nickname, player_seed, address, gyro_active)
 		# Deferred so the visibility guard has already been evaluated by the time
 		# hide runs. closed.emit() is kept separate — hide_panel() does not emit it.
 		hide_panel.call_deferred()

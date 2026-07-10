@@ -7,7 +7,8 @@ import NimiqAvatar from "./NimiqAvatar";
 
 function fmtDate(ts: number) {
   if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString();
+  // Pinned to UTC+3 — see AnalyticsTab.tsx's fmt() for why.
+  return new Date(ts * 1000).toLocaleString(undefined, { timeZone: "Europe/Istanbul" });
 }
 
 function fmtRelative(ts: number) {
@@ -20,6 +21,18 @@ function fmtRelative(ts: number) {
 }
 
 function nim(n?: number) { return (n ?? 0).toFixed(2); }
+
+// flagEmoji — computes a country flag emoji from a 2-letter ISO code via the
+// Unicode "regional indicator symbol" trick (each letter A-Z maps to
+// U+1F1E6..U+1F1FF in the same order) — no bundled flag image assets
+// needed. Returns a neutral globe for unknown/private/malformed codes.
+function flagEmoji(countryCode: string): string {
+  const cc = (countryCode || "").toUpperCase();
+  if (cc.length !== 2 || cc === "XX" || !/^[A-Z]{2}$/.test(cc)) return "🌐";
+  const base = 0x1f1e6;
+  const chars = [...cc].map((c) => base + (c.charCodeAt(0) - 65));
+  return String.fromCodePoint(...chars);
+}
 
 const PAGE_SIZE = 50;
 
@@ -176,6 +189,7 @@ export default function PlayersListTab() {
                   <th style={th}>Sessions</th>
                   <th style={th}>Daily Quests</th>
                   <th style={th}>Rank (D/W)</th>
+                  <th style={th}>Streak</th>
                   <th style={th}>Daily Cap</th>
                   <th style={th}>Total NIM</th>
                   <th style={th}>Last Seen</th>
@@ -240,6 +254,13 @@ function PlayerRow({ player, even, onClick }: { player: RegisteredPlayer; even: 
         <span style={{ color: player.weekly_rank ? "#e2e8f0" : "#475569" }}>
           {player.weekly_rank ? `#${player.weekly_rank}` : "—"}
         </span>
+      </td>
+      <td style={{ ...td, fontSize: 13 }}>
+        {player.streak > 0 ? (
+          <span style={{ color: "#e0a030", fontWeight: 600 }}>🔥 {player.streak}</span>
+        ) : (
+          <span style={{ color: "#475569" }}>—</span>
+        )}
       </td>
       <td style={td}>
         <DailyCapBar earned={player.daily_cap?.daily_earned ?? 0} cap={player.daily_cap?.daily_cap ?? 0} />
@@ -348,12 +369,29 @@ function PlayerDetailModal({
             {/* Stats */}
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 18 }}>
               <StatPill label="Total NIM received" value={Number(nim(profile.total_nim_received))} color="#4caf50" />
+              <StatPill label="Streak (days)" value={profile.streak?.count ?? 0} color="#e0a030" />
               <StatPill label="Best score" value={profile.stats.best_score} color="#4caf50" />
               <StatPill label="Games" value={profile.stats.total_games} color="#6366f1" />
               <StatPill label="Kills" value={profile.stats.total_kills} color="#e0a030" />
               <StatPill label="Platforms" value={profile.stats.total_platforms} color="#22d3ee" />
               <StatPill label="Ticks" value={profile.stats.total_ticks} color="#94a3b8" />
+              <StatPill label="Cosmetics owned" value={profile.cosmetics?.owned?.length ?? 0} color="#c084fc" />
             </div>
+
+            {/* Equipped cosmetics */}
+            {profile.cosmetics && Object.keys(profile.cosmetics.equipped || {}).length > 0 && (
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 18, fontSize: 13 }}>
+                <div style={{ color: "#64748b", marginRight: 4 }}>Equipped:</div>
+                {Object.entries(profile.cosmetics.equipped).map(([slot, itemId]) => (
+                  <span
+                    key={slot}
+                    style={{ background: "#2a1e40", border: "1px solid #4c1d95", borderRadius: 6, padding: "2px 8px", color: "#d8b4fe" }}
+                  >
+                    {slot}: {itemId}
+                  </span>
+                ))}
+              </div>
+            )}
 
             {/* Leaderboard + daily cap */}
             <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 18, fontSize: 13 }}>
@@ -399,6 +437,44 @@ function PlayerDetailModal({
                       {q.claimed && <span className="badge badge-green" style={{ fontSize: 10 }}>claimed</span>}
                     </div>
                   ))}
+                </div>
+              )}
+            </div>
+
+            {/* Connection IPs */}
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 8, color: "#e2e8f0" }}>Connection IPs</div>
+              {!profile.ips || profile.ips.length === 0 ? (
+                <div style={{ color: "#64748b", fontSize: 12 }}>No IP history recorded yet.</div>
+              ) : (
+                <div style={{ overflowX: "auto" }}>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                    <thead>
+                      <tr style={{ color: "#64748b", textAlign: "left" }}>
+                        <th style={{ padding: "4px 8px" }}>Country</th>
+                        <th style={{ padding: "4px 8px" }}>IP</th>
+                        <th style={{ padding: "4px 8px" }}>Logins</th>
+                        <th style={{ padding: "4px 8px" }}>First seen</th>
+                        <th style={{ padding: "4px 8px" }}>Last seen</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...profile.ips]
+                        .sort((a, b) => (b.last_seen ?? 0) - (a.last_seen ?? 0))
+                        .map((ipRec) => (
+                          <tr key={ipRec.ip} style={{ color: "#e2e8f0" }}>
+                            <td style={{ padding: "4px 8px", whiteSpace: "nowrap" }}>
+                              <span style={{ marginRight: 6 }}>{flagEmoji(ipRec.country_code)}</span>
+                              <span style={{ color: "#94a3b8" }}>{ipRec.country_name || "Unknown"}</span>
+                            </td>
+                            <td style={{ padding: "4px 8px", fontFamily: "monospace", color: "#e2e8f0" }}>{ipRec.ip}</td>
+                            <td style={{ padding: "4px 8px", color: "#94a3b8" }}>{ipRec.count}</td>
+                            <td style={{ padding: "4px 8px", color: "#64748b" }}>{fmtDate(ipRec.first_seen)}</td>
+                            <td style={{ padding: "4px 8px", color: "#64748b" }}>{fmtRelative(ipRec.last_seen)}</td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
                 </div>
               )}
             </div>
@@ -471,3 +547,4 @@ const td: React.CSSProperties = {
   padding: "10px 14px",
   verticalAlign: "middle",
 };
+

@@ -310,9 +310,18 @@ func _tick_patrol(delta: float) -> void:
 	var phase  := (_patrol_timer / _patrol_period) * TAU
 	var mid_x  := (_patrol_left_x + _patrol_right_x) * 0.5
 	var half   := (_patrol_right_x - _patrol_left_x) * 0.5
-	var new_x  := mid_x + cos(phase) * half
+	# DETERMINISM: lut_cos, not cos() — see GameConstants.gd's big comment.
+	# This is the gameplay-critical position write (feeds straight into
+	# _tick_player_overlap()'s hit/stomp check), so it must be airtight, not
+	# just "snapped enough" — a raw sin()/cos() ULP difference between WASM
+	# and native libm can survive the 0.01 snap on the rare tick where the
+	# pre-snap value sits almost exactly on a rounding boundary.
+	var new_x  := mid_x + GameConstants.lut_cos(phase) * half
 	if not _is_headless and is_instance_valid(_anim):
-		var s := sin(phase)
+		# Cosmetic only (sprite flip direction) — never runs headless/server,
+		# so it can't affect scoring. Left as real sin() is fine here, but
+		# lut_sin costs nothing extra and keeps this file consistent.
+		var s := GameConstants.lut_sin(phase)
 		# 24=ALIEN_GREEN 25=ALIEN_BLUE 26=ALIEN_PINK 27=ALIEN_YELLOW
 		var alien_types_set : bool = enemy_type >= 24 and enemy_type <= 27
 		if s > 0.0001:
@@ -331,7 +340,9 @@ func _tick_bob(delta: float) -> void:
 	while _bob_timer >= _bob_period:
 		_bob_timer -= _bob_period
 	var phase := (_bob_timer / _bob_period) * TAU
-	global_position.y = _start_y + sin(phase) * _bob_amplitude
+	# DETERMINISM: lut_sin, not sin() — see GameConstants.gd's big comment
+	# and the identical note in _tick_patrol above.
+	global_position.y = _start_y + GameConstants.lut_sin(phase) * _bob_amplitude
 
 
 func _snap_to_platform() -> void:
@@ -524,11 +535,17 @@ func _start_patrol_from(center_x: float, speed_mult: float = 1.0, resume: bool =
 		var half  := (right_x - left_x) * 0.5
 		var cur_x := clampf(global_position.x, left_x, right_x)
 		var cos_val := clampf((cur_x - mid_x) / half, -1.0, 1.0)
-		_patrol_timer = acos(cos_val) / TAU * _patrol_period
+		# DETERMINISM: lut_acos/lut_cos, not acos()/cos() — see GameConstants.gd's
+		# big comment. This runs once per patrol resume (chase→patrol
+		# transition), but the resulting _patrol_timer then feeds every
+		# subsequent tick's phase via pure +,-,*,/ (deterministic), so a single
+		# acos() ULP difference here would otherwise bias the entire patrol
+		# sweep that follows until the next resume.
+		_patrol_timer = GameConstants.lut_acos(cos_val) / TAU * _patrol_period
 		# Snap the enemy exactly onto the patrol path for THIS phase, so the first
 		# tick after resuming produces no positional jump at all.
 		var phase := (_patrol_timer / _patrol_period) * TAU
-		global_position.x = mid_x + cos(phase) * half
+		global_position.x = mid_x + GameConstants.lut_cos(phase) * half
 	else:
 		# Random phase offset — her düşman farklı noktadan başlasın
 		_patrol_timer = _rng.randf() * _patrol_period

@@ -7,7 +7,8 @@ package game
 // Kurallar:
 //   • Günlük maksimum: 100 NIM (DAILY_EARN_CAP_NIM env ile değiştirilebilir).
 //   • Sadece "in_game_coins" reason'lı ödüller cap'e sayılır.
-//   • Quest tamamlama ve leaderboard ödülleri cap'e dahil DEĞİLDİR.
+//   • Quest tamamlama, leaderboard ödülleri ve streak ödülleri (streak_reward.go)
+//     cap'e dahil DEĞİLDİR — kendi ayrı (küçük, sabit) limitleri var.
 //   • Gün sonu UTC+3 gece yarısı sıfırlanır (leaderboard ile aynı timezone).
 //   • DB key: "dailycap:<playerID>:<YYYY-MM-DD>"  (48 saat TTL, gün geçince otomatik silinir)
 //

@@ -17,7 +17,8 @@ const SORT_LABELS: Record<SortKey, string> = {
 
 function fmt(ts: number) {
   if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString("en-GB");
+  // Pinned to UTC+3 — see AnalyticsTab.tsx's fmt() for why.
+  return new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Istanbul" });
 }
 function scoreDiff(s: Session) {
   if (!s.submitted_at || s.client_score === 0) return "—";

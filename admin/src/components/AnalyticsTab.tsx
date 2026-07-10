@@ -16,7 +16,14 @@ function fmtTime(sec: number) {
 }
 function fmt(ts: number) {
   if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString("en-GB");
+  // BUG FIX: was rendering in the admin browser's own local timezone, but
+  // every period boundary on the backend (daily/weekly leaderboard, resets,
+  // payouts — see backend/game/leaderboard.go's UTC3) is fixed UTC+3. A
+  // session at 00:30 UTC+3 (backend buckets it as "today") rendered as
+  // ~21:30 the PREVIOUS day in a browser set to e.g. UTC — exactly why the
+  // same "daily" list could show two different calendar dates. Pin display
+  // to the same UTC+3 the backend uses.
+  return new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Istanbul" });
 }
 
 // ── Stat card ──────────────────────────────────────────────────────────────────

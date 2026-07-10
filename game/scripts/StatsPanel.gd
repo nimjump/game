@@ -2,7 +2,7 @@ extends CanvasLayer
 ## StatsPanel.gd — Player statistics + last 10 games
 
 signal closed
-signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int)
+signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int, gyro_active: bool)
 signal connect_requested   # emitted when user taps Connect inside stats panel
 
 const UITheme := preload("res://scripts/UITheme.gd")
@@ -322,12 +322,15 @@ func _build_ui() -> void:
 	_stat_labels["cap_pct_lbl"] = null
 	_add_cap_bar(cap_vbox, 0.0, 0, 100, ref, false)
 
-	# 2x2 grid + 1 wide card — stats with hud icons
+	# 2x2 grid — stats with hud icons. "platforms" swapped out for the login
+	# streak (more interesting to players day-to-day) — also fixes the
+	# awkward 5th-item orphan row this grid used to have (2 columns, 5
+	# items = a lonely streak card by itself on its own row before).
 	var stats_defs := [
 		{"key": "games",     "icon": "gamepad-2", "label": "Games Played", "col": _C_ORANGE},
 		{"key": "playtime",  "icon": "clock",     "label": "Play Time",    "col": _C_ORANGE},
 		{"key": "kills",     "icon": "zap",       "label": "Kills",        "col": _C_ORANGE},
-		{"key": "platforms", "icon": "star",      "label": "Platforms",    "col": _C_ORANGE},
+		{"key": "streak",    "icon": "calendar",  "label": "Login Streak", "col": _C_ORANGE},
 	]
 
 	var grid := GridContainer.new()
@@ -514,19 +517,24 @@ func _add_cap_bar(vbox: VBoxContainer, pct: float, earned: int, cap_max: int, re
 
 static func _warm_btn(btn: Button, r: float = 8.0) -> void:
 	var ri := int(r)
-	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new()
-	for s in [sn, sh, sp]:
+	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new(); var sd := StyleBoxFlat.new()
+	for s in [sn, sh, sp, sd]:
 		s.corner_radius_top_left = ri; s.corner_radius_top_right = ri
 		s.corner_radius_bottom_left = ri; s.corner_radius_bottom_right = ri
 	sn.bg_color = Color(0.780, 0.380, 0.120)
 	sh.bg_color = Color(0.820, 0.450, 0.160)
 	sp.bg_color = Color(0.640, 0.300, 0.080)
-	btn.add_theme_stylebox_override("normal",  sn)
-	btn.add_theme_stylebox_override("hover",   sh)
-	btn.add_theme_stylebox_override("pressed", sp)
+	# BUG FIX: no "disabled" stylebox was set — a disabled button fell back
+	# to Godot's raw default grey panel, clashing with the warm theme.
+	sd.bg_color = Color(0.720, 0.660, 0.580)
+	btn.add_theme_stylebox_override("normal",   sn)
+	btn.add_theme_stylebox_override("hover",    sh)
+	btn.add_theme_stylebox_override("pressed",  sp)
+	btn.add_theme_stylebox_override("disabled", sd)
 	btn.add_theme_color_override("font_color",         Color(0.957, 0.898, 0.800))
 	btn.add_theme_color_override("font_hover_color",   Color(1.0, 1.0, 1.0))
 	btn.add_theme_color_override("font_pressed_color", Color(0.957, 0.898, 0.800))
+	btn.add_theme_color_override("font_disabled_color", Color(0.480, 0.420, 0.360))
 
 
 static func _warm_ghost_btn(btn: Button, r: float = 8.0) -> void:
@@ -679,8 +687,8 @@ func _on_stats_response(_result: int, response_code: int, _headers: PackedString
 		_stat_labels["games"].text = str(int(data.get("total_games", 0)))
 	if _stat_labels.has("kills"):
 		_stat_labels["kills"].text = str(int(data.get("total_kills", 0)))
-	if _stat_labels.has("platforms"):
-		_stat_labels["platforms"].text = str(int(data.get("total_platforms", 0)))
+	if _stat_labels.has("streak"):
+		_stat_labels["streak"].text = str(int(data.get("streak", 0)))
 	# Total play time: ticks → m/s
 	var total_ticks : int = int(data.get("total_ticks", 0))
 	if _stat_labels.has("playtime"):
@@ -973,6 +981,7 @@ func _fetch_and_watch(session_id: String, btn: Button) -> void:
 		var seed     : int    = int(seed_str)
 		var log_b64  : String = data.get("replay_log", "")
 		var char_idx : int    = int(data.get("char", 0))
+		var gyro_active : bool = bool(data.get("gyro_active", false))
 		var nickname : String = data.get("nickname", "")
 		var player_seed : int = int(str(data.get("player_seed", "0")))
 
@@ -983,7 +992,7 @@ func _fetch_and_watch(session_id: String, btn: Button) -> void:
 		if log_bytes.is_empty():
 			return
 
-		emit_signal("replay_requested", seed, log_bytes, char_idx, nickname, player_seed)
+		emit_signal("replay_requested", seed, log_bytes, char_idx, nickname, player_seed, gyro_active)
 		hide_panel.call_deferred()
 	)
 
@@ -1012,12 +1021,13 @@ func show_panel() -> void:
 
 func hide_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
-	if is_instance_valid(_panel_ctrl):
-		_anim_tween = create_tween()
-		if _anim_tween:
-			_anim_tween.set_parallel(true)
-			_anim_tween.tween_property(_panel_ctrl, "modulate:a", 0.0,                 0.15).set_trans(Tween.TRANS_QUAD)
-			_anim_tween.tween_property(_panel_ctrl, "scale",      Vector2(0.90, 0.90), 0.15).set_trans(Tween.TRANS_QUAD)
-			_anim_tween.chain().tween_callback(func(): hide())
-			return
+	# BUG FIX: hide() used to only run inside a tween.chain().tween_callback()
+	# fired after the fade-out finished. If hide_panel() got called again
+	# before that fired, .kill() above stops the tween WITHOUT running its
+	# chained callback, so hide() never ran — this CanvasLayer (with its
+	# full-rect, input-blocking dim layer) stayed stuck on top of the lobby.
+	# Fix: hide immediately/synchronously, treat the fade as pure decoration.
 	hide()
+	if is_instance_valid(_panel_ctrl):
+		_panel_ctrl.modulate.a = 1.0
+		_panel_ctrl.scale      = Vector2.ONE

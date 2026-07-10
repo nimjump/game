@@ -86,8 +86,27 @@ def write_loader_script(export_folder: pathlib.Path, split_filenames: list[str])
 // Some .wasm exports were split into two files to stay under
 // Cloudflare Pages' 25MB per-file limit. This patches window.fetch so
 // that when Godot's engine requests one of those files, it instead
-// fetches the two .part1/.part2 halves, stitches them back together,
-// and hands back a normal Response — Godot never notices the split.
+// fetches the two .part1/.part2 halves and hands back a normal-looking
+// Response — Godot never knows the file was split.
+//
+// MEMORY: the two halves are stitched together via a ReadableStream that
+// re-emits each part's chunks as they arrive, sequentially — this file's
+// bytes are never fully buffered in this script's own memory (previously
+// this awaited both parts' arrayBuffer() and concatenated them into one
+// new same-size Uint8Array, meaning 3 full copies of the wasm — part1 +
+// part2 + combined — briefly coexisted in memory at the exact moment the
+// download finished, right before WASM compile/instantiate even started.
+// On low-RAM devices/older phones that peak was enough to get the tab's
+// process killed for OOM right after "100% loaded", which some WebView
+// hosts recover from by silently reloading the page — looking like an
+// infinite reload loop with no visible error). Streaming also lets
+// Godot's own loader use WebAssembly.instantiateStreaming if it does,
+// compiling as bytes arrive instead of needing the whole file resident
+// in memory first.
+//
+// Falls back to the old buffer-concat approach if ReadableStream (or the
+// Response-from-stream constructor) isn't available — belt and suspenders
+// for any engine/browser combination this hasn't been tested against.
 //
 // IMPORTANT: this script must load and run BEFORE Godot's own
 // engine/loader script (index.js). build.py inserts it as the first
@@ -95,6 +114,55 @@ def write_loader_script(export_folder: pathlib.Path, split_filenames: list[str])
 (function () {{
   var SPLIT_FILES = [{names_js}];
   var originalFetch = window.fetch.bind(window);
+  var supportsStreamingResponse = (typeof ReadableStream !== "undefined");
+
+  function combineViaBuffers(r1, r2) {{
+    return Promise.all([r1.arrayBuffer(), r2.arrayBuffer()]).then(function (buffers) {{
+      var b1 = buffers[0], b2 = buffers[1];
+      var combined = new Uint8Array(b1.byteLength + b2.byteLength);
+      combined.set(new Uint8Array(b1), 0);
+      combined.set(new Uint8Array(b2), b1.byteLength);
+      return new Response(combined, {{
+        status: 200,
+        headers: {{ "Content-Type": "application/wasm" }}
+      }});
+    }});
+  }}
+
+  function combineViaStream(r1, r2) {{
+    var len1 = parseInt(r1.headers.get("Content-Length") || "0", 10);
+    var len2 = parseInt(r2.headers.get("Content-Length") || "0", 10);
+    var totalLen = (len1 && len2) ? (len1 + len2) : null;
+
+    var stream = new ReadableStream({{
+      start: function (controller) {{
+        var reader1 = r1.body.getReader();
+        function pump1() {{
+          return reader1.read().then(function (res) {{
+            if (res.done) return pump2start();
+            controller.enqueue(res.value);
+            return pump1();
+          }});
+        }}
+        function pump2start() {{
+          var reader2 = r2.body.getReader();
+          function pump2() {{
+            return reader2.read().then(function (res) {{
+              if (res.done) {{ controller.close(); return; }}
+              controller.enqueue(res.value);
+              return pump2();
+            }});
+          }}
+          return pump2();
+        }}
+        pump1().catch(function (e) {{ controller.error(e); }});
+      }}
+    }});
+
+    var headers = {{ "Content-Type": "application/wasm" }};
+    if (totalLen) headers["Content-Length"] = String(totalLen);
+    return new Response(stream, {{ status: 200, headers: headers }});
+  }}
 
   window.fetch = function (input, init) {{
     var url = typeof input === "string" ? input : input.url;
@@ -112,16 +180,18 @@ def write_loader_script(export_folder: pathlib.Path, split_filenames: list[str])
       if (!r1.ok || !r2.ok) {{
         throw new Error("wasm-loader: failed to fetch parts for " + filename);
       }}
-      return Promise.all([r1.arrayBuffer(), r2.arrayBuffer()]);
-    }}).then(function (buffers) {{
-      var b1 = buffers[0], b2 = buffers[1];
-      var combined = new Uint8Array(b1.byteLength + b2.byteLength);
-      combined.set(new Uint8Array(b1), 0);
-      combined.set(new Uint8Array(b2), b1.byteLength);
-      return new Response(combined, {{
-        status: 200,
-        headers: {{ "Content-Type": "application/wasm" }}
-      }});
+      if (supportsStreamingResponse) {{
+        try {{
+          return combineViaStream(r1, r2);
+        }} catch (e) {{
+          // Fall through to buffered combine below with the same responses
+          // only if their bodies haven't been consumed yet — combineViaStream
+          // throws synchronously (before touching .body) on unsupported
+          // engines, so this is safe.
+          return combineViaBuffers(r1, r2);
+        }}
+      }}
+      return combineViaBuffers(r1, r2);
     }});
   }};
 }})();

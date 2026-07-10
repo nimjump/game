@@ -89,6 +89,25 @@ func (s *Server) handleAuthVerify(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
+	// Streak: read-only. BUG FIX — this used to call RecordDailyActivity
+	// here, advancing the streak counter on every fresh sign-in whether or
+	// not the player had actually claimed anything, which is exactly why
+	// the lobby's "N day streak! Keep it going" toast could fire the
+	// instant someone opened the app, before they'd done anything at all.
+	// The streak now only advances at actual claim time (see
+	// game/streak_reward.go's ClaimStreakReward) — this just reports the
+	// current (already-claimed) count for the client's badge/toast.
+	streak := s.Store.GetStreak(sess.PlayerID)
+
+	// Best-effort connection-IP history — powers the admin panel's
+	// per-player "connection IPs" list (see player_ip.go). Never blocks
+	// login on error, same style as the device-tracking call above.
+	if ip := realClientIP(ctx); ip != "" {
+		if e := s.Store.RecordPlayerIP(sess.PlayerID, ip); e != nil {
+			log.Printf("[AUTH] ip record failed player=%s err=%v", sess.PlayerID[:min8(sess.PlayerID)], e)
+		}
+	}
+
 	writeJSON(ctx, 200, map[string]any{
 		"ok":            true,
 		"token":         sess.Token,
@@ -96,6 +115,7 @@ func (s *Server) handleAuthVerify(ctx *fasthttp.RequestCtx) {
 		"nimiq_address": sess.NimiqAddress,
 		"device_id":     sess.DeviceID,
 		"expires_at":    sess.ExpiresAt,
+		"streak":        streak.Count,
 	})
 }
 
@@ -122,10 +142,25 @@ func (s *Server) handleAuthMe(ctx *fasthttp.RequestCtx) {
 		writeErr(ctx, 401, "token_expired")
 		return
 	}
+	// Streak: read-only, same as handleAuthVerify above — see that
+	// function's comment for why this no longer calls RecordDailyActivity.
+	streak := s.Store.GetStreak(sess.PlayerID)
+
+	// Best-effort connection-IP history (see handleAuthVerify above for the
+	// same call — this covers session-restore logins too, so an IP that's
+	// only ever used to restore an existing session, never to sign in
+	// fresh, still shows up in the admin panel).
+	if ip := realClientIP(ctx); ip != "" {
+		if e := s.Store.RecordPlayerIP(sess.PlayerID, ip); e != nil {
+			log.Printf("[AUTH] ip record failed player=%s err=%v", sess.PlayerID[:min8(sess.PlayerID)], e)
+		}
+	}
+
 	writeJSON(ctx, 200, map[string]any{
 		"ok":            true,
 		"player_id":     sess.PlayerID,
 		"nimiq_address": sess.NimiqAddress,
 		"expires_at":    sess.ExpiresAt,
+		"streak":        streak.Count,
 	})
 }

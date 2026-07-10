@@ -47,6 +47,15 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/developer-mode", s.handleDeveloperModeGet) // public, read-only — no auth needed
 	r.POST("/backend/admin/developer-mode", s.requireAdminSession(s.handleDeveloperModeSet))
 	r.POST("/backend/admin/prizes", s.requireAdminSession(s.handleAdminSetPrizes))
+	// GET mirror of the public /backend/leaderboard/prizes below, same
+	// app_sig problem as the replay route: the public path requires the
+	// game client's HMAC signature (see appsig.go), which the admin panel
+	// can't produce. Admin's PrizesCard used to call the public path
+	// directly, got app_signature_invalid, and — because its component body
+	// is `if (!cfg) return null`, cfg never got set — the entire "how much
+	// to pay out daily/weekly" editor silently rendered as nothing, with no
+	// visible error. This exempts it via the admin session gate instead.
+	r.GET("/backend/admin/prizes", s.requireAdminSession(s.handleLeaderboardPrizes))
 	r.POST("/backend/admin/snapshot", s.requireAdminSession(s.handleAdminSnapshot))
 	r.POST("/backend/admin/nimiq-config", s.requireAdminSession(s.handleAdminNimiqConfig))
 	r.GET("/backend/admin/nimiq-config", s.requireAdminSession(s.handleAdminNimiqConfigGet))
@@ -66,14 +75,14 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/admin/replay-failed", s.requireAdminSession(s.handleAdminReplayFailed))
 	r.GET("/backend/admin/player", s.requireAdminSession(s.handleAdminPlayer))
 	r.GET("/backend/admin/players", s.requireAdminSession(s.handleAdminPlayersList))
+	r.GET("/backend/admin/streaks", s.requireAdminSession(s.handleAdminStreaks))
 	r.POST("/backend/admin/session/{session_id}", s.requireAdminSession(s.handleAdminSessionPatch))
 	r.GET("/backend/admin/analytics", s.requireAdminSession(s.handleAdminAnalytics))
 
-	// App config — leaderboard on/off, update mode, replay version, replay binary upload
+	// App config — leaderboard on/off, update lock, replay binary upload
 	r.GET("/backend/admin/config", s.requireAdminSession(s.handleAdminGetConfig))
 	r.POST("/backend/admin/config", s.requireAdminSession(s.handleAdminSetConfig))
-	r.POST("/backend/admin/update-mode", s.requireAdminSession(s.handleAdminSetUpdateMode))
-	r.POST("/backend/admin/update-complete", s.requireAdminSession(s.handleAdminCompleteUpdate))
+	r.POST("/backend/admin/update-active", s.requireAdminSession(s.handleAdminSetUpdateActive))
 	r.GET("/backend/admin/device-breakdown", s.requireAdminSession(s.handleAdminDeviceBreakdown))
 	r.GET("/backend/admin/quest-pool", s.requireAdminSession(s.handleAdminQuestPool))
 	r.POST("/backend/admin/quest-reward", s.requireAdminSession(s.handleAdminSetQuestReward))
@@ -91,13 +100,6 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/admin/failed-replay-archive", s.requireAdminSession(s.handleAdminFailedReplayArchiveList))
 	r.GET("/backend/admin/failed-replay-archive/{id}/download", s.requireAdminSession(s.handleAdminFailedReplayArchiveDownload))
 
-	// Scheduled deploy jobs — Cloudflare Pages push + replay binary
-	// activation + version bump, triggered now/at-time/daily-lb-end/weekly-lb-end.
-	r.GET("/backend/admin/deploy/status", s.requireAdminSession(s.handleAdminDeployStatus))
-	r.POST("/backend/admin/deploy/schedule", s.requireAdminSession(s.handleAdminScheduleDeploy))
-	r.GET("/backend/admin/deploy/jobs", s.requireAdminSession(s.handleAdminListDeployJobs))
-	r.POST("/backend/admin/deploy/jobs/{id}/cancel", s.requireAdminSession(s.handleAdminCancelDeployJob))
-
 	// Golden replays — pinned reference replays used to catch determinism
 	// regressions (a code/binary change silently altering simulation
 	// results) before they show up as real player flags.
@@ -110,6 +112,17 @@ func (s *Server) Register(r *router.Router) {
 	// determinism-breaking patterns (bare RNG, wall-clock time, hard free(),
 	// array mutation during iteration). See backend/game/determinism_lint.go.
 	r.GET("/backend/admin/determinism-lint", s.requireAdminSession(s.handleAdminDeterminismLint))
+
+	// Admin replay viewer — same handler as the public /backend/replay/{id}
+	// below, registered a second time under /backend/admin/ so it gets the
+	// session-cookie gate instead of the app_ts/app_sig HMAC check.
+	// corsMiddleware in main.go only enforces app_sig on paths OUTSIDE
+	// "/backend/admin" — the public route requires a signature only the
+	// compiled game client can produce (see appsig.go), so the admin panel
+	// calling the public path directly always got app_signature_invalid
+	// ("sig failed") once that signing requirement was added. The admin
+	// panel now calls this path instead (see admin/src/lib/api.ts).
+	r.GET("/backend/admin/replay/{session_id}", s.requireAdminSession(s.handleReplay))
 
 	// Admin panel UI — reverse-proxied to the Next.js admin app (runs
 	// separately, see admin/.env for ADMIN_PORT). Same session-cookie gate,
@@ -142,9 +155,17 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/quests/progress", rl(s.handleQuestProgress))
 	r.POST("/backend/quests/claim", rl(s.handleQuestClaim))
 	r.POST("/backend/quests/claim_all", rl(s.handleQuestClaimAll))
+	r.GET("/backend/streak/status", rl(s.handleStreakStatus))
+	r.POST("/backend/streak/claim", rl(s.handleStreakClaim))
 	r.GET("/backend/replay-status", rl(s.handleReplayStatus))
 	r.GET("/backend/rewards/history", rl(s.handleRewardHistory))
 	r.POST("/backend/client-log", rl(s.handleClientLog))
+
+	// Cosmetics — character customization (hat/glasses/outfit/shoes), bought
+	// with NIM. Payment verified the same way as VS room entry fees.
+	r.GET("/backend/cosmetics/catalog", rl(s.handleCosmeticsCatalog))
+	r.POST("/backend/cosmetics/buy", rl(s.handleCosmeticsBuy))
+	r.POST("/backend/cosmetics/equip", rl(s.handleCosmeticsEquip))
 
 	// VS Rooms — async 1v1 challenge with optional NIM entry fee, plus a
 	// live spectator relay (see vs_live.go) for whichever side is currently
@@ -185,17 +206,15 @@ func (s *Server) StartBackgroundServices() {
 	s.Store.StartRewardQueue()
 	s.Store.StartRetryLoop()
 	s.Store.StartBalanceMonitor()
-	s.Store.StartUpdateScheduler()
-	s.Store.StartDeployJobScheduler()
 	s.Store.StartVSRoomSweep()
 	s.Store.StartVSPaymentReconciler()
 	s.Store.StartLeaderboardPayoutLoop()
 	StartCloudflareIPRefresher()
-	log.Printf("[STARTUP] background services started (retry loop + balance monitor + update scheduler + deploy job scheduler + vs room sweep + vs payment reconciler + leaderboard payout loop + cloudflare ip refresher)")
+	log.Printf("[STARTUP] background services started (retry loop + balance monitor + vs room sweep + vs payment reconciler + leaderboard payout loop + cloudflare ip refresher)")
 }
 
 // GET /backend/developer-mode — public, read-only status endpoint. Also
-// carries the update-mode flag (client polls this to know whether starting
+// carries the update-lock flag (client polls this to know whether starting
 // a new game should be blocked) and the leaderboard on/off flags.
 func (s *Server) handleDeveloperModeGet(ctx *fasthttp.RequestCtx) {
 	on := s.Store.GetDeveloperMode()
@@ -207,7 +226,6 @@ func (s *Server) handleDeveloperModeGet(ctx *fasthttp.RequestCtx) {
 		"update_message":             "Game updating. Please check back shortly — thanks for your patience!",
 		"daily_leaderboard_enabled":  cfg.DailyLeaderboardEnabled,
 		"weekly_leaderboard_enabled": cfg.WeeklyLeaderboardEnabled,
-		"replay_version":             cfg.ReplayVersion,
 	})
 }
 
@@ -354,14 +372,21 @@ type submitReq struct {
 	Score         int     `json:"score"`
 	Ticks         int     `json:"ticks"`
 	Char          int     `json:"char"`
+	GyroActive    bool    `json:"gyro_active"` // gyro-only movement ramp active this match — see Player.gd's set_gyro_control_active doc comment
 	PlayerID      string  `json:"player_id"`
 	Nickname      string  `json:"nickname"`
 	Nonce         float64 `json:"nonce"`
 	ReplayLog     string  `json:"replay_log"`
 	PlayerSeed    string  `json:"player_seed"`
-	ClientVersion int     `json:"client_version"`       // must match AppConfig.ReplayVersion or submit is rejected
+	ClientVersion int     `json:"client_version"`       // REMOVED: no longer checked against anything server-side (the replay-version gate was removed) — still accepted on the wire so old/new clients can send it harmlessly, just unused now
 	VSRoomID      string  `json:"vs_room_id,omitempty"` // set when this play is one side of a VS room match
 	VSRole        string  `json:"vs_role,omitempty"`    // "creator" or "opponent"
+	// Ckpt — diagnostic-only checkpoint log (see GameManager.gd _ckpt_log).
+	// Never used for scoring/flagging decisions — only compared against the
+	// server replay's own checkpoint log (best-effort, logged) when a replay
+	// gets flagged, so we can pinpoint the first diverging tick instead of
+	// just an aggregate score-diff percentage. Safe to ignore/absent on old clients.
+	Ckpt json.RawMessage `json:"ckpt,omitempty"`
 }
 
 func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
@@ -430,21 +455,6 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 			writeErr(ctx, 400, "bad_vs_role")
 			return
 		}
-	}
-
-	// ── Version check ─────────────────────────────────────────────────────────
-	// Client and server replay version must match exactly. Mismatch means
-	// this submit came from an old client build (or an old/stale replay
-	// binary is running server-side) — silently reject, don't save, don't
-	// simulate. Logged as a client-log entry so it shows up in the admin
-	// panel under the player's activity ("version_mismatch").
-	appCfg := s.Store.GetAppConfig()
-	if req.ClientVersion != appCfg.ReplayVersion {
-		log.Printf("[SUBMIT] version_mismatch session=%s client_version=%d expected=%d player=%s ip=%s",
-			sid8, req.ClientVersion, appCfg.ReplayVersion, authedPlayer, ip)
-		_ = s.Store.UpsertClientLog("warn", "version_mismatch", authedPlayer, ip, "")
-		writeErr(ctx, 409, "version_mismatch")
-		return
 	}
 
 	// ── Seed duplicate check ─────────────────────────────────────────────────
@@ -536,6 +546,7 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		ServerScore: 0,
 		Ticks:       req.Ticks,
 		Char:        req.Char,
+		GyroActive:  req.GyroActive,
 		PlayerID:    authedPlayer,
 		Nickname:    nick,
 		Flagged:     flagged,
@@ -554,9 +565,18 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 
 	// Replay simulation (background)
 	if !flagged {
-		go func(sessionID, playerID string, clientScore int, log64 string, seed int64, charIdx int, playerSeed int64, ticks int, vsRoomID, vsRole string) {
+		// BUG-AVOIDANCE: ctx (fasthttp.RequestCtx) gets reused/reset by
+		// fasthttp the moment this handler returns — this goroutine keeps
+		// running well after that. Reading ctx.RemoteIP()/headers from
+		// INSIDE the goroutine would race that reuse and could read a
+		// completely different request's IP. Resolve it here, on the
+		// handler's own goroutine, and pass the plain string through
+		// (same reason every other piece of request data below is passed
+		// as an explicit param instead of closing over ctx/req directly).
+		clientIP := realClientIP(ctx)
+		go func(sessionID, playerID string, clientScore int, log64 string, seed int64, charIdx int, gyroActive bool, playerSeed int64, ticks int, vsRoomID, vsRole string, clientCkpt json.RawMessage, clientIP string) {
 			log.Printf("[REPLAY_SIM] queued session=%s seed=%d b64=%d ticks=%d", sessionID[:8], seed, len(log64), ticks)
-			result := game.SimulateReplayWithRetry(sessionID, log64, seed, charIdx, playerSeed, ticks)
+			result := game.SimulateReplayWithRetry(sessionID, log64, seed, charIdx, gyroActive, playerSeed, ticks)
 
 			stored, gerr := s.Store.Get(sessionID)
 			if gerr != nil {
@@ -584,6 +604,12 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 				stored.Reason = simReason
 				stored.State = models.StateFlagged
 				log.Printf("[REPLAY_FLAG] session=%s reason=%s", sessionID[:8], simReason)
+				// Best-effort forensic diff: pinpoints the first tick where the
+				// client's own recorded checkpoints and the server's re-simulation
+				// checkpoints parted ways (position/score/rng-state), instead of
+				// just the aggregate score-diff percentage above. Never affects
+				// the flagging decision itself — purely diagnostic logging.
+				game.LogCheckpointDivergence(sessionID, clientCkpt, result)
 				// İsteğe bağlı arşiv: score mismatch'leri de worker timeout'larıyla
 				// aynı failed_replays klasörüne kaydet — sebebi anlamak için elindeki
 				// log'lar kalıcı olsun, manuel olarak yeniden simüle edebilesin.
@@ -633,17 +659,33 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 					coinRate := s.Store.CoinNIMRate()
 					requestedNIM := float64(result.QuestCoins) * coinRate
 					if requestedNIM > 0 {
-						earned, cerr := s.Store.QueueRewardCapped(playerID, requestedNIM, result.QuestCoins)
-						if cerr != nil {
-							log.Printf("[COIN_REWARD] error player=%s session=%s err=%v", playerID, sessionID[:8], cerr)
+						// Same shared per-IP anti-multi-accounting guard as
+						// streak claims (game/ip_reward_guard.go) — an IP
+						// that's already funded MaxRewardAccountsPerIP()
+						// distinct accounts today gets every FURTHER
+						// account's coin reward blocked too, not just its
+						// streak claim. Coins are still recorded/spent in
+						// the run itself either way — only the NIM payout
+						// is withheld.
+						okIP, ierr := s.Store.CheckAndRecordIPRewardEligibility(clientIP, playerID)
+						if ierr != nil {
+							log.Printf("[COIN_REWARD] ip guard error player=%s session=%s err=%v", playerID, sessionID[:8], ierr)
+						} else if !okIP {
+							log.Printf("[COIN_REWARD] BLOCKED (ip limit) player=%s ip=%s session=%s requested=%.4f",
+								playerID, clientIP, sessionID[:8], requestedNIM)
 						} else {
-							log.Printf("[COIN_REWARD] player=%s session=%s coins=%d rate=%.6f requested=%.4f earned=%.4f NIM",
-								playerID, sessionID[:8], result.QuestCoins, coinRate, requestedNIM, earned)
+							earned, cerr := s.Store.QueueRewardCapped(playerID, requestedNIM, result.QuestCoins)
+							if cerr != nil {
+								log.Printf("[COIN_REWARD] error player=%s session=%s err=%v", playerID, sessionID[:8], cerr)
+							} else {
+								log.Printf("[COIN_REWARD] player=%s session=%s coins=%d rate=%.6f requested=%.4f earned=%.4f NIM",
+									playerID, sessionID[:8], result.QuestCoins, coinRate, requestedNIM, earned)
+							}
 						}
 					}
 				}
 			}
-		}(req.Session, authedPlayer, req.Score, replayLog, gameSeed, req.Char, parsedPlayerSeed, req.Ticks, req.VSRoomID, req.VSRole)
+		}(req.Session, authedPlayer, req.Score, replayLog, gameSeed, req.Char, req.GyroActive, parsedPlayerSeed, req.Ticks, req.VSRoomID, req.VSRole, req.Ckpt, clientIP)
 	}
 
 	writeJSON(ctx, 200, map[string]any{

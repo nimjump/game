@@ -15,13 +15,12 @@ var BACKEND_URL : String = ApiConfig.base_url()
 
 var _started    := false
 
-# ── Server update-mode status (polled) ──────────────────────────────
-# When the admin panel puts the game into update mode, the server flips
-# update_active on (either immediately — "force" — or automatically once
-# the current weekly leaderboard period ends — "normal"). While active,
-# starting a NEW game is blocked and a toast is shown instead; anyone
-# already mid-run is left alone. See backend/handlers/server.go
-# handleDeveloperModeGet + backend/game/appconfig.go.
+# ── Server update-lock status (polled) ──────────────────────────────
+# When the admin panel activates the Game Update Lock, the server flips
+# update_active on immediately. While active, starting a NEW game is
+# blocked and a toast is shown instead; anyone already mid-run is left
+# alone. See backend/handlers/server.go handleDeveloperModeGet +
+# backend/game/appconfig.go.
 var _update_active  := false
 var _update_message := "Game updating. Please check back shortly — thanks for your patience!"
 var _status_poll_timer : Timer = null
@@ -55,6 +54,7 @@ var _prev_lives : int = 3   # detect damage by lives decrease
 var _hud        : CanvasLayer
 var _go_panel   : PanelContainer
 var _replay_bar : CanvasLayer
+var _replay_bar_root : Control = null   # CanvasLayer has no modulate — fade this child instead
 var _bg_rect    : TextureRect
 var _bg_rect2   : TextureRect   # second layer for background transitions
 var _bg_index   : int = -1
@@ -74,6 +74,7 @@ var _gm         : Node2D
 var _cam        : Camera2D
 var _player     : CharacterBody2D
 var _life_icons : Array[TextureRect] = []
+var _life_panel : PanelContainer = null   # bottom-left hearts panel — shifted up while _replay_bar is open (see _build_replay_bar/_exit_replay_ui)
 
 var _claim_lbl    : Label
 var _claim_btn    : Button
@@ -91,6 +92,17 @@ var _settings_dim      : ColorRect  # full-rect input-blocking dimmer inside _se
 var _settings_rebuilding := false  # re-entrancy guard for _rebuild_settings_if_open()
 var _settings_closing    := false  # true while _close_settings()'s fade-out tween is running
 var _nick_overlay      : Control   # tam ekran nickname düzenleme overlay'i
+var _onboarding_overlay : Control = null   # ilk açılışta bir kez gösterilen "nasıl oynanır" katmanı
+var _streak_badge      : Control = null   # lobide sürekli görünen "🔥 N" streak rozeti
+var _streak_badge_lbl  : Label   = null
+# Claimable NIM reward — see backend/game/streak_reward.go. NOT auto-paid;
+# tapping the badge OPENS StreakPanel.gd (see _open_streak_panel), which
+# owns the actual claim flow. Main.gd only tracks enough state to show the
+# small "+N.NN" hint on the corner badge itself, fetched via GET
+# /backend/streak/status (_fetch_streak_status).
+var _streak_claimable_nim   := 0.0
+var _streak_already_claimed := false
+var _streak_claim_hint_lbl  : Label = null   # small "+N.NN" hint shown on the badge when something's claimable
 var _sound_toggle      : CheckButton
 var _volume_slider     : HSlider
 var _sound_icon        : TextureRect
@@ -129,6 +141,12 @@ const _TEX_TORCH_ON_B := preload("res://assets/pack/torch_on_b.png")
 # ── Backend state ──────────────────────────────────────────────────
 var _play_btn      : Button = null   # PLAY button reference
 var _vs_panel      : CanvasLayer = null
+var _customize_panel : CanvasLayer = null   # hat/glasses/outfit/shoes shop — see CustomizePanel.gd
+# Cosmetics feature switch — OFF for now (placeholder art wasn't good enough,
+# menu entry point hidden until real art exists). Backend/CustomizePanel.gd/
+# Player.gd overlay code all still there, untouched — flip this back to true
+# to bring the whole feature back with no other changes needed.
+const _COSMETICS_ENABLED := false
 
 # ── VS live spectating — see _watch_vs_live() and friends below. Reuses the
 # real replay player/HUD (same one "Watch Replay" uses); these vars are just
@@ -308,7 +326,23 @@ func _ready() -> void:
 						window._activeTouches.push(e.touches[i].clientX);
 				}, {passive: true});
 			}
-			// Gyro listener — all logic in JS so direction is ready the instant the event fires
+			// Gyro listener — all logic in JS so direction is ready the instant the event fires.
+			//
+			// LATENCY FIX: this used to listen to 'deviceorientation' and read
+			// e.gamma — gamma/beta/alpha are the browser's FUSED orientation
+			// angles (accelerometer + gyroscope + magnetometer combined through
+			// an internal filter for stability against drift). That fusion
+			// filter is exactly what real-world tilt-control games avoid,
+			// because it adds a noticeable low-pass delay on top of the raw
+			// sensor reading — the device physically tilts, but the fused
+			// angle catches up a beat later. 'devicemotion's
+			// accelerationIncludingGravity is the ~raw accelerometer vector
+			// with none of that fusion/smoothing, so it reflects a tilt the
+			// instant the sensor reports it. This is also the SAME sensor
+			// convention the native (non-web) fallback below already uses —
+			// Input.get_gravity().x/9.8*90.0 — so web and native now compute
+			// their "tilt in degrees-equivalent" the same way instead of web
+			// alone paying the fusion-latency tax.
 			window._gyroRaw      = 0;
 			window._gyroDir      = 0;
 			window._gyroBase     = 0;
@@ -317,17 +351,58 @@ func _ready() -> void:
 			window._startGyroListener = function() {
 				if (window._gyroListenerSet) return;
 				window._gyroListenerSet = true;
-				window.addEventListener('deviceorientation', function(e) {
-					var g = e.gamma || 0;
+				// BUG FIX: "calibration takes whatever tilt the phone happens to
+				// be at the instant I press Play as zero". The listener typically
+				// (re)starts right around a user gesture (switching to gyro mode
+				// in Settings, or granting the iOS motion-permission prompt —
+				// both commonly happen in the same breath as tapping Play), and
+				// the "first 15 events" calibration below used to start counting
+				// from the VERY FIRST devicemotion event after that (fires within
+				// ~15-250ms) — still mid-gesture, phone tilted toward wherever the
+				// player's thumb just reached to tap the screen, not the relaxed
+				// two-handed angle they actually hold it at a moment later.
+				// Recording a start timestamp and skipping samples for the first
+				// 400ms lets that transient settle before anything counts toward
+				// the baseline.
+				var _listenerStartMs = Date.now();
+				window.addEventListener('devicemotion', function(e) {
+					var acc = e.accelerationIncludingGravity;
+					if (!acc || acc.x === null || acc.x === undefined) return;
+					// BUG FIX (sağ/sol ters algılanıyordu): accelerationIncludingGravity
+					// is the accelerometer's REACTION force against gravity — tilting the
+					// device's right edge DOWN makes acc.x go NEGATIVE (the sensor reads
+					// the force pushing back "up", which points toward the device's local
+					// -X once the +X edge is the one dipping toward the ground). The
+					// native fallback below uses Godot's Input.get_gravity().x, which is
+					// the opposite convention on purpose (it's gravity's own direction,
+					// not the reaction against it) — tilting right there gives a
+					// POSITIVE value. Without the negation here, tilting right produced
+					// gyroDir = -1 (read as "move left") while every other control
+					// scheme (tap, keyboard, native gyro) treats +1 = right / -1 = left.
+					// Negating acc.x brings the web path in line with that convention.
+					var g = -(acc.x / 9.8) * 90.0;
 					window._gyroRaw = g;
-					// Fast calibration: first 15 events
-					if (window._gyroCalibN < 15) {
+					// Fast calibration: first 15 events, but only once the
+					// post-listener-start grace window (see _startGyroListener's
+					// doc comment above) has passed — skip samples that land
+					// during the initial gesture transient.
+					if (window._gyroCalibN < 15 && (Date.now() - _listenerStartMs) >= 400) {
 						var a = window._gyroCalibN < 5 ? 0.6 : 0.3;
 						window._gyroBase = g * a + window._gyroBase * (1 - a);
 						window._gyroCalibN++;
 					}
 					var tilted = g - window._gyroBase;
-					var thr    = window._gyroThreshold || 3.5;
+					// TUNING: was 3.5° — twitchy in practice on a real phone (a small
+					// hand tremor or resting tilt was enough to flip direction).
+					// Bumped to 5.0° (with the same 0.5x hysteresis ratio, so the
+					// "stop moving" threshold rises to 2.5° too) — a more deliberate
+					// tilt is needed to trigger a turn, while the ramp in Player.gd's
+					// simulate_tick() still keeps the actual speed change smooth once
+					// triggered. Purely a live-input feel tweak — the discretized
+					// -1/0/1 direction is all that ever gets recorded, so this has
+					// zero effect on replay determinism (see Player.gd's set_gyro_
+					// control_active doc comment for the actual determinism boundary).
+					var thr    = window._gyroThreshold || 5.0;
 					var nthr   = thr * 0.5;
 					if (window._gyroDir !== 0 && Math.abs(tilted) < nthr)
 						window._gyroDir = 0;
@@ -335,16 +410,33 @@ func _ready() -> void:
 					else if (tilted < -thr) window._gyroDir = -1;
 				}, {capture: true, passive: true});
 			};
-			// Non-iOS: start immediately
-			if (!(typeof DeviceOrientationEvent !== 'undefined' &&
-				  typeof DeviceOrientationEvent.requestPermission === 'function')) {
+			// Non-iOS: start immediately. iOS 13+ Safari gates DeviceMotion
+			// behind the same kind of requestPermission() as DeviceOrientation
+			// (a separate gate — granting one does NOT grant the other), so
+			// the check here has to key off DeviceMotionEvent now.
+			if (!(typeof DeviceMotionEvent !== 'undefined' &&
+				  typeof DeviceMotionEvent.requestPermission === 'function')) {
 				window._startGyroListener();
 			}
+			// Manual calibration ("Set Zero Now" / a previously-saved baseline)
+			// overrides the running auto-calibration average directly — without
+			// this, the calibration screen only updated GDScript's own
+			// _gyro_baseline (used just for that screen's degree readout) while
+			// actual in-game direction (_getGyroDir above) kept reading purely
+			// from window._gyroBase, so a manual calibration never affected
+			// real gameplay at all. Pinning _gyroCalibN past the 15-sample
+			// auto-calibration window stops it from immediately drifting back
+			// over the value that was just explicitly set.
+			window._setGyroBase = function(v) {
+				window._gyroBase   = +v || 0;
+				window._gyroCalibN = 999;
+			};
 		""", true)
 		# Pre-compile getter functions — called per frame with zero string parsing
 		JavaScriptBridge.eval("""
 			window._getGyroDir = function(){ return window._gyroPermDenied ? 0 : (window._gyroDir|0); };
 			window._getGyroRaw = function(){ return +(window._gyroRaw||0); };
+			window._getGyroBase = function(){ return +(window._gyroBase||0); };  // "Auto Set" reads this back after re-averaging
 			window._getTapDir  = function(){
 				var t = window._activeTouches;
 				if (!t || t.length === 0) return 0;
@@ -421,6 +513,7 @@ func _web_fetch_and_start_replay(session_id: String) -> void:
 		var d : Dictionary = j.get_data()
 		var seed_val : int = int(str(d.get("seed", "0")))
 		var char_idx : int = int(d.get("char", 0))
+		var gyro_active : bool = bool(d.get("gyro_active", false))
 		var log_b64  : String = str(d.get("replay_log", ""))
 		if log_b64 == "":
 			push_warning("[WEB_REPLAY] no replay_log in response")
@@ -430,7 +523,7 @@ func _web_fetch_and_start_replay(session_id: String) -> void:
 			push_warning("[WEB_REPLAY] base64 decode failed")
 			return
 		print("[WEB_REPLAY] starting replay seed=%d char=%d bytes=%d" % [seed_val, char_idx, raw.size()])
-		await _start_replay(seed_val, raw, char_idx, "web")
+		await _start_replay(seed_val, raw, char_idx, "web", 0, "", "", gyro_active)
 	)
 	http.request(ApiConfig.sign_url(url))
 
@@ -443,6 +536,10 @@ func _run_server_replay(args: PackedStringArray) -> void:
 	var log_path    : String = ""
 	var out_path    : String = ""
 	var max_tick    : int    = -1   # [CRASH BISECT] -1 = no cap, run full replay
+	# gyro-only movement ramp — see Player.gd's set_gyro_control_active doc
+	# comment. Value-less flag (no i+1 arg), so it's also checked separately
+	# below since it doesn't fit the "--flag value" pattern of the match arms.
+	var gyro_active : bool = false
 
 	var replay_speed : float = 16.0  # default: 16x for fast server validation
 
@@ -455,6 +552,8 @@ func _run_server_replay(args: PackedStringArray) -> void:
 			"--speed":       replay_speed = float(args[i + 1])
 			"--max-tick":    max_tick     = int(args[i + 1])
 			"--player-seed": player_seed  = int(args[i + 1])
+	if args.has("--gyro"):
+		gyro_active = true
 
 	if log_path == "" or out_path == "" or seed == 0:
 		printerr("[SERVER_REPLAY] Missing arguments: --seed --log --out required")
@@ -531,6 +630,7 @@ func _run_server_replay(args: PackedStringArray) -> void:
 	gm_node.set("_replay_seed",        seed)
 	gm_node.set("_replay_log",         raw_bytes)
 	gm_node.set("_replay_char",        char_idx)
+	gm_node.set("_replay_gyro_active", gyro_active)
 	gm_node.set("_replay_player_seed", player_seed)
 	gm_node.set("_replay_nickname",    "server")
 	# _replay_total_ticks'i de set et (seek_to_tick clamp için kullanır)
@@ -687,6 +787,9 @@ func _run_server_worker() -> void:
 		var job         : Dictionary = json.get_data()
 		var seed        : int        = int(str(job.get("seed",        "0")))
 		var char_idx    : int        = int(job.get("char",        0))
+		# gyro-only movement ramp — see Player.gd's set_gyro_control_active
+		# doc comment. Mirrors char_idx's own read one line above.
+		var gyro_active : bool       = bool(job.get("gyro_active", false))
 		var player_seed : int        = int(str(job.get("player_seed", "0")))
 		var log_hex     : String     = str(job.get("log",         ""))
 		var out_path    : String     = str(job.get("out",         ""))
@@ -738,6 +841,7 @@ func _run_server_worker() -> void:
 		gm_node.set("_replay_seed",        seed)
 		gm_node.set("_replay_log",         raw_bytes)
 		gm_node.set("_replay_char",        char_idx)
+		gm_node.set("_replay_gyro_active", gyro_active)
 		gm_node.set("_replay_player_seed", player_seed)
 		gm_node.set("_replay_nickname",    "server")
 		gm_node.set("_replay_total_ticks", _total_ticks)
@@ -805,6 +909,10 @@ func _write_replay_result(path: String, score: int, ticks: int, error: String, g
 		out["kills_no_dmg"]    = int(gm.get("_quest_kills_no_dmg"))
 		out["highest_y"]       = int(gm.get("_quest_highest_y"))
 		out["quest_has_result"] = true
+		# Diagnostic checkpoint log (see GameManager.gd _ckpt_log) — same
+		# format the client sends in its own submit payload, so the backend
+		# can diff the two arrays and pinpoint the first diverging tick.
+		out["ckpt"] = gm.get("_ckpt_log")
 	var file := FileAccess.open(path, FileAccess.WRITE)
 	if file:
 		file.store_string(JSON.stringify(out))
@@ -826,7 +934,7 @@ func _sync_panels() -> void:
 	var has_wallet : bool   = nimiq_address != ""
 	var authed     : bool   = token != ""
 
-	for panel in [_leaderboard_panel, _quest_panel, _stats_panel, _vs_panel]:
+	for panel in [_leaderboard_panel, _quest_panel, _stats_panel, _vs_panel, _customize_panel, _streak_panel]:
 		if not is_instance_valid(panel): continue
 		if panel.has_method("set_has_wallet"):     panel.call("set_has_wallet", has_wallet)
 		if panel.has_method("set_player_id"):      panel.call("set_player_id", pid)
@@ -848,6 +956,11 @@ func _on_nimiq_ready(address: String, label: String, avatar_data_url: String, de
 	if avatar_data_url.begins_with("data:image/"):
 		_avatar_tex = _data_url_to_texture(avatar_data_url)
 	_sync_panels()
+	# Defense-in-depth alongside _on_auth_success's own call — nimiq_ready
+	# always fires after poll()'s restore-wait resolves one way or another,
+	# so this is a safe extra sync point in case any future timing edge case
+	# causes the badge to miss auth_success's own update.
+	_update_streak_badge()
 
 
 func _on_auth_success(token: String, player_id: String) -> void:
@@ -856,6 +969,16 @@ func _on_auth_success(token: String, player_id: String) -> void:
 	_fetch_nickname(player_id, token)
 	_sync_panels()
 	_rebuild_settings_if_open()
+	# Build the customize panel now (hidden) if it doesn't exist yet, purely
+	# so it can silently fetch + apply the player's saved cosmetics onto the
+	# live preview — they shouldn't have to open the shop first to see their
+	# own hat/glasses/etc. show up.
+	if not is_instance_valid(_customize_panel):
+		_build_customize_panel()
+	if is_instance_valid(_customize_panel):
+		_customize_panel.call("set_auth_token", token)
+		if _customize_panel.has_method("refresh"):
+			_customize_panel.call("refresh")
 	# Flush any pending score submits now that we're authed
 	if is_instance_valid(_gm) and _gm.has_method("flush_pending"):
 		_gm.call("flush_pending")
@@ -865,6 +988,216 @@ func _on_auth_success(token: String, player_id: String) -> void:
 		if sid == "":
 			print("[MAIN] Auth arrived late — triggering _start_session")
 			_gm.call("_start_session")
+	_update_streak_badge()
+	_maybe_toast_streak()
+	_fetch_streak_status()
+
+
+## Persistent lobby badge — top-left corner, small "🔥 N" pill, visible on
+## every visit to the lobby (not just once like the onboarding overlay, and
+## not fading away like a toast). Built empty/hidden here since the real
+## streak count only arrives later over the network (auth verify/restore);
+## _update_streak_badge() (called from _on_auth_success) fills it in and
+## reveals it. Independent Control anchored to its own corner — doesn't
+## touch the title/Play button/settings gear's own anchors or spacing at
+## all, so it can't push anything else out of place.
+func _build_streak_badge() -> void:
+	if is_instance_valid(_streak_badge):
+		_streak_badge.queue_free()
+	_streak_badge = PanelContainer.new()
+	_streak_badge.visible = false   # revealed by _update_streak_badge() once we actually know the count
+	_streak_badge.anchor_left = 0.0; _streak_badge.anchor_right = 0.0
+	_streak_badge.anchor_top  = 0.0; _streak_badge.anchor_bottom = 0.0
+	_streak_badge.offset_left = int(_p(0.030))
+	_streak_badge.offset_top  = int(_p(0.030))
+	# CHANGED FROM IGNORE: tapping the badge now opens StreakPanel.gd (an
+	# actual openable panel, same as the quest/leaderboard/stats icons) —
+	# see _on_streak_badge_input / _open_streak_panel.
+	_streak_badge.mouse_filter = Control.MOUSE_FILTER_STOP
+	_streak_badge.gui_input.connect(_on_streak_badge_input)
+	_streak_badge.z_index = 15   # above the lobby background, below popups (20+)
+	var badge_st := StyleBoxFlat.new()
+	badge_st.bg_color = Color(0.220, 0.130, 0.060, 0.82)
+	# SIZE FIX: scaled ~1.3x from the original sizing, then another ~1.1x on
+	# top per follow-up feedback (~1.43x original overall) — corner radius,
+	# margins, icon, and both labels below.
+	badge_st.set_corner_radius_all(int(_p(0.057)))
+	badge_st.content_margin_left   = _p(0.034)
+	badge_st.content_margin_right  = _p(0.034)
+	badge_st.content_margin_top    = _p(0.018)
+	badge_st.content_margin_bottom = _p(0.018)
+	_streak_badge.add_theme_stylebox_override("panel", badge_st)
+	_ui_root.add_child(_streak_badge)
+
+	# BUG FIX: this used to be a single Label with "🔥 N" as raw text. The
+	# pixel font has no emoji glyph and web has no system emoji font to fall
+	# back to (see the onboarding overlay's identical fix above) — on web
+	# this persistent, always-visible badge rendered as a tofu box + number
+	# instead of a flame + number. Split into an icon + a plain numeric Label.
+	# CONSISTENCY FIX: originally used "zap" here — but StatsPanel.gd's own
+	# streak card (the "Login Streak" tile in the stats grid) already uses
+	# "calendar" for this exact same concept, AND "zap" is already spoken
+	# for in that same stats grid as the "Kills" icon. Matching StatsPanel's
+	# choice here means the lobby badge and the stats screen now show the
+	# same icon for "streak" everywhere, instead of two different icons for
+	# one concept (and freeing "zap" from double-duty as both "streak" and
+	# "kills").
+	var badge_hb := HBoxContainer.new()
+	badge_hb.add_theme_constant_override("separation", int(_p(0.014)))
+	_streak_badge.add_child(badge_hb)
+	badge_hb.add_child(UITheme.lucide_icon("calendar", int(_p(0.048)), Color(1.0, 0.85, 0.55)))
+
+	_streak_badge_lbl = Label.new()
+	_streak_badge_lbl.text = "0"
+	UITheme.apply_label(_streak_badge_lbl, Color(1.0, 0.85, 0.55), int(_p(0.046)))
+	badge_hb.add_child(_streak_badge_lbl)
+
+	# Claim hint — "+0.70" style, only visible when _streak_claimable_nim > 0
+	# and not yet claimed today (see _update_streak_claim_visual). A bright
+	# green so a claimable reward visually pops against the badge's warm
+	# orange/brown, same "something's waiting for you" language as an
+	# unclaimed-quest indicator elsewhere in the UI.
+	_streak_claim_hint_lbl = Label.new()
+	_streak_claim_hint_lbl.text = ""
+	_streak_claim_hint_lbl.visible = false
+	UITheme.apply_label(_streak_claim_hint_lbl, Color(0.55, 0.95, 0.55), int(_p(0.043)))
+	badge_hb.add_child(_streak_claim_hint_lbl)
+	# BUG FIX: "streak badge only shows up after I finish a match" — if
+	# _on_auth_success() fires (auth already resolved from a cached token)
+	# BEFORE this function ever runs (e.g. a very fast local/cached restore
+	# racing ahead of _build_start_ui() during startup), _update_streak_badge()
+	# early-returns because _streak_badge doesn't exist yet — and nothing
+	# calls it again until the NEXT auth event, which for an already-verified
+	# session may never happen again this visit. The only thing that DID
+	# happen to re-sync it was finishing a match and returning to the lobby,
+	# which rebuilds this badge via _build_start_ui() (see the calls added
+	# there for the resize/rotation version of this same bug). Sync right
+	# here too, unconditionally, so it's correct the instant the badge is
+	# built regardless of whether auth resolved before or after this point.
+	_update_streak_badge()
+	_fetch_streak_status()
+
+
+## Fills in and reveals the lobby streak badge. Shown from day 1 (streak
+## count of 1) onward — previously hidden until day 2 to avoid clutter for
+## brand-new players, but that meant the badge never appeared during same-
+## day testing (streak only increments once per calendar day), so it looked
+## broken/missing. Only hidden for a genuine 0 (no streak data yet / not
+## logged in).
+func _update_streak_badge() -> void:
+	if not is_instance_valid(_streak_badge) or not is_instance_valid(_streak_badge_lbl):
+		return
+	if not is_instance_valid(_nimiq_bridge):
+		return
+	var days : int = int(_nimiq_bridge.get("streak"))
+	if days < 1:
+		_streak_badge.visible = false
+		return
+	_streak_badge_lbl.text = "%d" % days
+	_streak_badge.visible = true
+
+
+## Repeat-value UX: celebrates the daily login streak the backend already
+## tracks (see backend/game/streak.go, plumbed through NimiqBridge.auth_
+## success/restore as `.streak`). Fires from _on_auth_success, which runs
+## on every fresh sign-in AND every session restore — restore alone fires
+## on every page load / "Play Again" reload, so this dedupes to at most
+## once per calendar day via localStorage, otherwise it'd re-toast the
+## same streak every single round.
+##
+## NOTE: no NIM amount mentioned here anymore — the reward is claim-based
+## now (tap the badge, see _on_streak_badge_input), not auto-paid on login,
+## so there's nothing to report at this point. _fetch_streak_status() (also
+## called from _on_auth_success) is what actually reveals whether something
+## is claimable, via the badge's green "+N.NN" hint.
+func _maybe_toast_streak() -> void:
+	if not OS.has_feature("web") or not is_instance_valid(_nimiq_bridge):
+		return
+	var days : int = int(_nimiq_bridge.get("streak"))
+	if days < 1:
+		return  # nothing worth celebrating yet
+	var today_key := Time.get_date_string_from_system()  # local device date — a rough once-a-day dedup key, doesn't need to match the server's UTC+3 day boundary exactly
+	var last_shown = JavaScriptBridge.eval("localStorage.getItem('nj_streak_toast_day') || ''", true)
+	if str(last_shown) == today_key:
+		return
+	JavaScriptBridge.eval("localStorage.setItem('nj_streak_toast_day', '%s')" % today_key, true)
+	var inst := Toast.get_instance()
+	if inst == null:
+		return
+	# No emoji here (same tofu-box-on-web issue as elsewhere) — Toast's own
+	# SUCCESS kind already renders its own check-circle icon, so the text
+	# doesn't need to carry one too.
+	inst.show_toast("%d day streak! Keep it going." % days, Toast.Kind.SUCCESS)
+
+
+## ── Streak reward: opens StreakPanel (tap the lobby badge) ───────────────
+## See backend/game/streak_reward.go + backend/handlers/streak.go +
+## game/scripts/StreakPanel.gd. Same pattern as tapping a quest icon opens
+## QuestPanel: the badge itself just shows the streak count + a small
+## claimable-amount hint (see _update_streak_claim_visual below); the
+## actual "see the details, press Claim" flow lives in the openable panel,
+## not instant-claimed on a bare tap of the corner badge.
+
+func _on_streak_badge_input(event: InputEvent) -> void:
+	var tapped := false
+	if event is InputEventMouseButton and event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
+		tapped = true
+	elif event is InputEventScreenTouch and event.pressed:
+		tapped = true
+	if not tapped:
+		return
+	_open_streak_panel()
+
+
+## Opens the streak panel, closing any other open panel first (same
+## single-modal-at-a-time UX as the bottom tab bar's panels, even though
+## this one is triggered from the corner badge instead of a tab icon).
+func _open_streak_panel() -> void:
+	if not is_instance_valid(_streak_panel):
+		return
+	for panel in [_quest_panel, _leaderboard_panel, _stats_panel, _vs_panel, _customize_panel]:
+		if is_instance_valid(panel) and panel.has_method("hide_panel"):
+			panel.call("hide_panel")
+	_streak_panel.call("show_panel")
+
+
+## Refreshes _streak_claimable_nim / _streak_already_claimed from the
+## server and updates the badge's visual hint. Call after auth success and
+## after a claim attempt (to pick up the new "already claimed" state).
+func _fetch_streak_status() -> void:
+	if not OS.has_feature("web") or not is_instance_valid(_nimiq_bridge):
+		return
+	var token : String = str(_nimiq_bridge.get("auth_token"))
+	if token == "":
+		return
+	var http := HTTPRequest.new()
+	http.timeout = 6.0
+	add_child(http)
+	http.request_completed.connect(func(result, code, _h, body):
+		http.queue_free()
+		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
+			var j := JSON.new()
+			if j.parse(body.get_string_from_utf8()) == OK:
+				var d : Dictionary = j.get_data()
+				_streak_claimable_nim   = float(d.get("claimable_nim", 0.0))
+				_streak_already_claimed = bool(d.get("already_claimed", false))
+				_update_streak_claim_visual()
+	)
+	var headers : PackedStringArray = ["Authorization: Bearer " + token]
+	http.request(ApiConfig.sign_url(ApiConfig.base_url() + "/backend/streak/status"), headers)
+
+
+## Updates the badge's green "+N.NN" hint — visible only when something is
+## actually claimable right now. Safe to call even if the badge hasn't been
+## built/revealed yet (_update_streak_badge handles overall visibility).
+func _update_streak_claim_visual() -> void:
+	if not is_instance_valid(_streak_claim_hint_lbl):
+		return
+	if _streak_claimable_nim > 0.0 and not _streak_already_claimed:
+		_streak_claim_hint_lbl.text = "+%.2f" % _streak_claimable_nim
+		_streak_claim_hint_lbl.visible = true
+	else:
+		_streak_claim_hint_lbl.visible = false
 
 
 func _on_auth_failed(reason: String) -> void:
@@ -882,14 +1215,34 @@ func _on_auth_failed(reason: String) -> void:
 	# challenge request instead of playing offline. Auth just stays unverified;
 	# leaderboard/replay submission stays blocked (server needs a valid token
 	# for those), but the game itself always opens.
-	if not _started:
+	#
+	# BUG FIX: "game sometimes auto-starts the instant I open it, without
+	# touching Play" — this fallback used to fire for ANY auth_failed event
+	# as long as `not _started`, which included NimiqBridge's own silent
+	# BACKGROUND sign attempt (_wait_for_safe_moment_then_sign(), fired the
+	# moment the player is sitting idle in the lobby — "safe moment" means
+	# "not mid-run", and the lobby itself qualifies instantly). If that
+	# background attempt failed (no wallet installed, user dismissed a
+	# leftover prompt, flaky network) while the player hadn't pressed Play
+	# at all yet, this still unconditionally called _do_start_game() — an
+	# unrequested match starting itself in the background. The "let them
+	# play anyway" fallback is only meant for the case where the PLAYER
+	# actually pressed Play and got stuck waiting on a failed sign — gated
+	# by _play_waiting_for_auth, which _on_play_pressed() sets right before
+	# it kicks off its own auth attempt. If that flag isn't set, this is the
+	# passive background attempt failing — just leave auth unverified and
+	# let the player press Play whenever they actually want to.
+	if not _started and _play_waiting_for_auth:
 		print("[MAIN] auth failed (%s) — starting game without wallet" % reason)
+		_play_waiting_for_auth = false
 		_started = true
 		_block_lb_replay = true
 		if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
 		if is_instance_valid(_stats_panel):       _stats_panel.hide_panel()
 		if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
 		_do_start_game()
+	elif not _started:
+		print("[MAIN] auth failed (%s) — background attempt, player hasn't pressed Play, staying in lobby" % reason)
 
 
 ## Called when server returns 401 — token invalid, clear it
@@ -963,7 +1316,7 @@ func _set_nickname_async(nickname: String, token: String, on_done: Callable) -> 
 		HTTPClient.METHOD_POST, body)
 
 
-var _resize_timer   : SceneTreeTimer = null
+var _resize_token   : int   = 0     # BUG FIX: see _on_viewport_resized's debounce comment
 var _last_vw_real   : float = 0.0   # klavye olmadan son gerçek genişlik
 var _last_vh_real   : float = 0.0   # klavye olmadan son gerçek yükseklik
 
@@ -1039,7 +1392,7 @@ func _on_viewport_resized() -> void:
 	# paneli kapat (içeriği bozmadan) — kullanıcı sekmeye tekrar dokunduğunda
 	# panel sıfırdan, doğru ref ile kurulur. Küçük/klavye kaynaklı
 	# değişikliklerde panel açık kalır, sadece _vw/_vh güncellenir.
-	for panel in [_vs_panel, _quest_panel, _stats_panel, _leaderboard_panel]:
+	for panel in [_vs_panel, _quest_panel, _stats_panel, _leaderboard_panel, _streak_panel]:
 		if is_instance_valid(panel) and panel.visible:
 			_vw  = new_w
 			_vh  = new_h
@@ -1056,14 +1409,30 @@ func _on_viewport_resized() -> void:
 	_last_vw_real = new_w
 	_last_vh_real = new_h
 
-	# Debounce: 300ms içinde tekrar resize gelirse öncekini iptal et
-	if is_instance_valid(_resize_timer):
-		_resize_timer = null
-	_resize_timer = get_tree().create_timer(0.3)
-	await _resize_timer.timeout
-	if not is_instance_valid(_resize_timer):
+	# Debounce: 300ms içinde tekrar resize gelirse öncekini iptal et.
+	#
+	# BUG FIX: bu eskiden `is_instance_valid(_resize_timer)` ile "hâlâ güncel
+	# miyim" diye kontrol ediyordu — ama bir SceneTreeTimer, değişkeni null'a
+	# çekmekle FREE olmuyor; sadece referans bırakılmış oluyor, timer'ın
+	# kendisi yine de 0.3s sonra timeout ATIYOR ve await'i bekleyen HER
+	# coroutine (o an aktif tüm eski çağrılar dahil) is_instance_valid
+	# kontrolünden geçiyordu — çünkü kontrol "bu benim timer'ım mı" değil
+	# "şu an _resize_timer diye BİR ŞEY var mı" diye bakıyordu, ki neredeyse
+	# her zaman true. Sonuç: pencereyi sürükleyerek/hızlıca resize ederken
+	# (kullanıcının "ekranı büktüm" dediği senaryo) art arda tetiklenen HER
+	# resize event'i kendi UI teardown+rebuild'ini kuyruğa alıyor, hepsi de
+	# sırayla ateşleniyor — ve en son değil, ARADAKİ (geçici/ara) bir resize
+	# event'inin rebuild'i en son çalışırsa PLAY/Settings gibi anchor'lı
+	# elemanlar o anki (final olmayan) boyuta göre yanlış yere yerleşip
+	# öylece kalıyordu. Basit artan bir "token" ile tekilleştirme:
+	# sadece EN SON planlanan resize'ın token'ı geçerli sayılır, daha
+	# önce kuyruğa giren her coroutine kendi token'ının artık eski
+	# olduğunu görüp hiçbir şey yapmadan çıkar.
+	_resize_token += 1
+	var _my_resize_token := _resize_token
+	await get_tree().create_timer(0.3).timeout
+	if _my_resize_token != _resize_token:
 		return
-	_resize_timer = null
 	# UI'ı teardown + rebuild
 	# determinism-ok (whole block): viewport-resize UI rebuild — only reachable via
 	# vp.size_changed, which is never connected/fired during --server-replay/--server-worker.
@@ -1077,6 +1446,7 @@ func _on_viewport_resized() -> void:
 	if is_instance_valid(_quest_panel):      _quest_panel.free();      _quest_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.free(); _leaderboard_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_stats_panel):      _stats_panel.free();      _stats_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
+	if is_instance_valid(_streak_panel):     _streak_panel.free();     _streak_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	# BUG FIX: _vs_panel was missing from this list entirely. VSPanel is the
 	# ONLY one of the four panels with actual text-input fields (NIM amount,
 	# invite link) — so it's the only one that ever has a LineEdit focused
@@ -1087,6 +1457,7 @@ func _on_viewport_resized() -> void:
 	# never freed, never nulled, still holding an active HTTPRequest/Timer
 	# from mid-typing — which is what was actually crashing the game.
 	if is_instance_valid(_vs_panel):         _vs_panel.free();         _vs_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
+	if is_instance_valid(_customize_panel):  _customize_panel.free();  _customize_panel = null  # determinism-ok: same viewport-resize rebuild as the other panels above
 	_build_start_ui()
 
 
@@ -1129,8 +1500,8 @@ func _input(event: InputEvent) -> void:
 # ─────────────────────────────────────────────────────
 
 var _calib_layer     : CanvasLayer = null
+var _calib_root      : Control     = null   # CanvasLayer has no modulate — fade this child instead
 var _calib_angle_lbl : Label       = null
-var _calib_ok_lbl    : Label       = null
 
 # Saved state for calibration mode
 var _calib_saved_gm      : Node         = null
@@ -1202,7 +1573,14 @@ func _open_gyro_calib_screen() -> void:
 	var root := Control.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# BUG FIX: CanvasLayer has no `modulate` property (it's a Node, not a
+	# CanvasItem) — animating `_calib_layer.modulate.a` crashed with "Invalid
+	# access to property or key 'modulate'". Fade this wrapper Control
+	# (which IS a CanvasItem) instead; it's the CanvasLayer's only child so
+	# fading it fades everything the same way.
+	root.modulate.a = 0.0   # fades in below — see the tween right after set_process(true)
 	_calib_layer.add_child(root)
+	_calib_root = root
 
 	# Angle pill — top center
 	var angle_pill := PanelContainer.new()
@@ -1233,16 +1611,13 @@ func _open_gyro_calib_screen() -> void:
 	UITheme.apply_label(_calib_angle_lbl, UITheme.COL_GOLD, int(ref * 0.034))
 	pill_hbox.add_child(_calib_angle_lbl)
 
-	# "Calibrated!" label
-	_calib_ok_lbl = Label.new()
-	_calib_ok_lbl.text = "OK. Zero point set!"
-	UITheme.apply_label(_calib_ok_lbl, Color(0.3, 0.9, 0.4), int(ref * 0.038))
-	_calib_ok_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	_calib_ok_lbl.set_anchors_preset(Control.PRESET_TOP_WIDE)
-	_calib_ok_lbl.offset_top    = int(vh * 0.12)
-	_calib_ok_lbl.offset_bottom = int(vh * 0.12) + int(ref * 0.055)
-	_calib_ok_lbl.modulate.a    = 0.0
-	root.add_child(_calib_ok_lbl)
+	# UX FIX: this used to be a bespoke fade-in/hold/fade-out Label ("OK. Zero
+	# point set!") built from scratch just for this one screen — its own
+	# color, its own tween, its own positioning, none of it shared with the
+	# rest of the app's feedback language. Replaced with the same Toast
+	# system every other confirmation in the game already uses (see the
+	# Auto Set button above) — one consistent look or "confirmation flew by,
+	# same as everywhere else" rather than a one-off custom animation.
 
 	# Buttons
 	var btn_w   := vw * 0.72
@@ -1263,15 +1638,18 @@ func _open_gyro_calib_screen() -> void:
 	zero_btn.pressed.connect(func():
 		if OS.has_feature("web"):
 			_gyro_baseline = (_js_window._getGyroRaw() if _js_window != null else 0.0)
+			# Push straight into the JS listener's own running average —
+			# see _setGyroBase's doc comment: without this, "Set Zero Now"
+			# only updated this screen's degree readout and never touched
+			# the value real gameplay direction is computed from.
+			JavaScriptBridge.eval("if(window._setGyroBase) window._setGyroBase(%f);" % _gyro_baseline, true)
 		else:
 			_gyro_baseline = Input.get_gravity().x / 9.8 * 90.0
-		if is_instance_valid(_calib_ok_lbl):
-			var tw := create_tween()
-			if tw:
-				tw.tween_property(_calib_ok_lbl, "modulate:a", 1.0, 0.12)
-				tw.tween_interval(0.7)
-				tw.tween_property(_calib_ok_lbl, "modulate:a", 0.0, 0.20)
-				tw.tween_callback(func(): _close_gyro_calib_screen())
+		_save_settings()
+		var t := Toast.get_instance()
+		if t: t.show_toast("Zero point set!", Toast.Kind.SUCCESS)
+		await get_tree().create_timer(1.0).timeout
+		_close_gyro_calib_screen()
 	)
 
 	var back_btn := Button.new()
@@ -1286,6 +1664,10 @@ func _open_gyro_calib_screen() -> void:
 	UITheme.apply_ghost_button(back_btn)
 	root.add_child(back_btn)
 	back_btn.pressed.connect(func(): _close_gyro_calib_screen())
+
+	var _calib_open_tw := create_tween()
+	if _calib_open_tw:
+		_calib_open_tw.tween_property(root, "modulate:a", 1.0, 0.20).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 
 	set_process(true)
 
@@ -1315,8 +1697,11 @@ func _close_gyro_calib_screen() -> void:
 	if not is_instance_valid(_calib_layer): return
 
 	var tw := create_tween()
-	if tw:
-		tw.tween_property(_calib_layer, "modulate:a", 0.0, 0.18)
+	# BUG FIX: was tweening _calib_layer (a CanvasLayer — no `modulate`,
+	# see the matching fix in _open_gyro_calib_screen) instead of its
+	# Control child. Fade _calib_root, same fix as the open side.
+	if tw and is_instance_valid(_calib_root):
+		tw.tween_property(_calib_root, "modulate:a", 0.0, 0.18)
 		tw.tween_callback(func(): _calib_cleanup())
 	else:
 		_calib_cleanup()
@@ -1327,8 +1712,8 @@ func _calib_cleanup() -> void:
 	if is_instance_valid(_calib_layer):
 		_calib_layer.queue_free()
 	_calib_layer     = null
+	_calib_root      = null
 	_calib_angle_lbl = null
-	_calib_ok_lbl    = null
 
 	# Destroy calib GM + player
 	if is_instance_valid(_calib_real_player):
@@ -1362,14 +1747,16 @@ func _calib_cleanup() -> void:
 func _ensure_gyro_js() -> void:
 	if not OS.has_feature("web"):
 		return
-	JavaScriptBridge.eval("window._gyroThreshold = %f;" % (3.5 / maxf(_gyro_sensitivity, 0.1)), true)
+	JavaScriptBridge.eval("window._gyroThreshold = %f;" % (5.0 / maxf(_gyro_sensitivity, 0.1)), true)
 	JavaScriptBridge.eval("""
-		// iOS: request permission (non-iOS already started in _ready)
-		if (typeof DeviceOrientationEvent !== 'undefined' &&
-			typeof DeviceOrientationEvent.requestPermission === 'function') {
+		// iOS: request permission (non-iOS already started in _ready).
+		// Gated on DeviceMotionEvent now — see the latency-fix comment on
+		// _startGyroListener for why this switched from DeviceOrientationEvent.
+		if (typeof DeviceMotionEvent !== 'undefined' &&
+			typeof DeviceMotionEvent.requestPermission === 'function') {
 			if (!window._gyroPermAsked) {
 				window._gyroPermAsked = true;
-				DeviceOrientationEvent.requestPermission().then(function(state) {
+				DeviceMotionEvent.requestPermission().then(function(state) {
 					if (state === 'granted') window._startGyroListener();
 					else window._gyroPermDenied = true;
 				}).catch(function() {
@@ -1380,6 +1767,12 @@ func _ensure_gyro_js() -> void:
 			window._startGyroListener();
 		}
 	""", true)
+	# Re-apply a previously-saved manual calibration (loaded from settings at
+	# boot) every time gyro is (re)enabled, so a zero-point set in an earlier
+	# session is honored immediately instead of only after the player
+	# recalibrates again from scratch.
+	if _gyro_baseline != 0.0:
+		JavaScriptBridge.eval("if(window._setGyroBase) window._setGyroBase(%f);" % _gyro_baseline, true)
 
 ## Returns -1 / 0 / 1 direction; GameManager uses this value.
 func get_control_dir() -> int:
@@ -1413,6 +1806,8 @@ func _get_tap_dir() -> int:
 
 ## Gyro (device tilt) — web: pre-compiled JS getter, no per-frame string parsing
 var _gyro_calib_frames := 0  # used for native fallback only
+var _gyro_calib_start_ms : int = -1  # native fallback only — see the grace-window comment below
+var _native_gyro_dir   := 0  # native fallback only — mirrors window._gyroDir's hysteresis state (see below)
 func _get_gyro_dir() -> int:
 	if OS.has_feature("web"):
 		if _js_window == null:
@@ -1422,15 +1817,39 @@ func _get_gyro_dir() -> int:
 	else:
 		# Native: GDScript reads gravity directly
 		var raw_gamma := Input.get_gravity().x / 9.8 * 90.0
-		if _gyro_calib_frames < 15:
+		# BUG FIX: mirrors the web path's grace window (see
+		# _startGyroListener's doc comment) — the first call into this
+		# function after a reset used to start counting immediately, so
+		# whatever tilt the phone happened to be at right as gyro mode
+		# (re)started got baked into the "zero" baseline. Track when
+		# calibration started (determinism-ok: input-discretization/UI
+		# timing only, never read during replay re-simulation — same as
+		# the web fix) and skip samples for the first 400ms.
+		if _gyro_calib_start_ms < 0:
+			_gyro_calib_start_ms = Time.get_ticks_msec()
+		if _gyro_calib_frames < 15 and Time.get_ticks_msec() - _gyro_calib_start_ms >= 400:
 			if abs(raw_gamma) < 60.0:
 				var alpha := 0.6 if _gyro_calib_frames < 5 else 0.3
 				_gyro_baseline = raw_gamma * alpha + _gyro_baseline * (1.0 - alpha)
 				_gyro_calib_frames += 1
 		var tilted    := raw_gamma - _gyro_baseline
-		var threshold := 3.5 / maxf(_gyro_sensitivity, 0.1)
-		if abs(tilted) < threshold * 0.5: return 0
-		return 1 if tilted > 0 else -1
+		# TUNING: was 3.5° / a single fixed half-threshold dead zone with no
+		# direction memory at all — meaningfully MORE twitchy than the web
+		# path even before that one's own bump (see _startGyroListener's
+		# matching comment), since native had no hysteresis: a tilt sitting
+		# right at the boundary could flicker between 0 and ±1 every frame.
+		# Now matches web exactly — 5.0° to trigger a turn, hysteresis down
+		# to 2.5° to return to neutral, using _native_gyro_dir as the same
+		# kind of persisted state window._gyroDir already was on web.
+		var threshold := 5.0 / maxf(_gyro_sensitivity, 0.1)
+		var nthr      := threshold * 0.5
+		if _native_gyro_dir != 0 and abs(tilted) < nthr:
+			_native_gyro_dir = 0
+		elif tilted > threshold:
+			_native_gyro_dir = 1
+		elif tilted < -threshold:
+			_native_gyro_dir = -1
+		return _native_gyro_dir
 
 
 func _save_settings() -> void:
@@ -1448,6 +1867,14 @@ func _save_settings_flush() -> void:
 	var d := {
 		"control_mode":    _control_mode,
 		"gyro_sensitivity": _gyro_sensitivity,
+		# Manual "Set Zero Now" calibration reference — without saving this,
+		# a manual calibration only lasted until the next page reload (the
+		# Nimiq Pay WebView reloads on backgrounding), silently falling back
+		# to the JS auto-calibration heuristic every time. Now it persists,
+		# while auto-calibration still runs fresh on top of it each session
+		# (see _startGyroListener's _gyroCalibN averaging) — so the player
+		# gets both: a saved manual zero-point AND automatic fine-tuning.
+		"gyro_baseline":   _gyro_baseline,
 		"vibration":       _vibration,
 		"muted":           _muted,
 		# BUG FIX: master "volume" was never saved here at all — every fresh
@@ -1480,6 +1907,7 @@ func _load_settings() -> void:
 	var d : Dictionary = result
 	if d.has("control_mode"):     _control_mode     = str(d["control_mode"])
 	if d.has("gyro_sensitivity"): _gyro_sensitivity = float(d["gyro_sensitivity"])
+	if d.has("gyro_baseline"):    _gyro_baseline    = float(d["gyro_baseline"])
 	if d.has("vibration"):        _vibration        = bool(d["vibration"])
 	if d.has("muted"):            _muted            = bool(d["muted"])
 	if d.has("volume"):           _volume           = float(d["volume"])
@@ -1528,11 +1956,11 @@ func _build_game() -> void:
 	# ── Teardown previous build — free all game nodes before rebuilding ──────
 	# Use free() not queue_free() — new nodes are added in the same frame
 	var _nodes_to_free := [_hud, _ui_layer, _gm, _player, _replay_bar,
-		_quest_panel, _leaderboard_panel, _stats_panel]
+		_quest_panel, _leaderboard_panel, _stats_panel, _streak_panel]
 	for node in _nodes_to_free:
 		if is_instance_valid(node): node.free()  # determinism-ok: client-only UI teardown, never runs in --server-replay/--server-worker (those return before _build_game() is ever called)
 	_hud = null; _ui_layer = null; _gm = null; _player = null
-	_replay_bar = null; _quest_panel = null; _leaderboard_panel = null; _stats_panel = null
+	_replay_bar = null; _quest_panel = null; _leaderboard_panel = null; _stats_panel = null; _streak_panel = null
 	_powerup_row = null
 	# Free all CanvasLayers except landscape/calib overlays
 	for child in get_children().duplicate():
@@ -1656,22 +2084,22 @@ func _build_game() -> void:
 	var heart_sep := int(_p(0.003))
 	var heart_mg  := int(_p(0.004))
 
-	var life_pc := PanelContainer.new()
-	life_pc.anchor_left   = 0.0; life_pc.anchor_top    = 1.0
-	life_pc.anchor_right  = 0.0; life_pc.anchor_bottom = 1.0
-	life_pc.offset_left   = M;   life_pc.offset_top    = -M
-	life_pc.offset_right  = M;   life_pc.offset_bottom = -M
-	life_pc.grow_horizontal = Control.GROW_DIRECTION_END
-	life_pc.grow_vertical   = Control.GROW_DIRECTION_BEGIN
-	UITheme.apply_panel(life_pc)
-	hud_root.add_child(life_pc)
+	_life_panel = PanelContainer.new()
+	_life_panel.anchor_left   = 0.0; _life_panel.anchor_top    = 1.0
+	_life_panel.anchor_right  = 0.0; _life_panel.anchor_bottom = 1.0
+	_life_panel.offset_left   = M;   _life_panel.offset_top    = -M
+	_life_panel.offset_right  = M;   _life_panel.offset_bottom = -M
+	_life_panel.grow_horizontal = Control.GROW_DIRECTION_END
+	_life_panel.grow_vertical   = Control.GROW_DIRECTION_BEGIN
+	UITheme.apply_panel(_life_panel)
+	hud_root.add_child(_life_panel)
 
 	var life_mc := MarginContainer.new()
 	life_mc.add_theme_constant_override("margin_left",   heart_mg)
 	life_mc.add_theme_constant_override("margin_right",  heart_mg)
 	life_mc.add_theme_constant_override("margin_top",    heart_mg)
 	life_mc.add_theme_constant_override("margin_bottom", heart_mg)
-	life_pc.add_child(life_mc)
+	_life_panel.add_child(life_mc)
 
 	var life_row := HBoxContainer.new()
 	life_row.add_theme_constant_override("separation", heart_sep)
@@ -1841,6 +2269,8 @@ func _build_game() -> void:
 			el.text = d[1] as String
 			UITheme.apply_label(el, Color(0.480, 0.340, 0.200), int(_p(0.038)))
 			el.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+			el.vertical_alignment  = VERTICAL_ALIGNMENT_CENTER
+			el.custom_minimum_size.y = ico_sz
 			icon_row.add_child(el)
 
 		var vl := Label.new()
@@ -1854,6 +2284,15 @@ func _build_game() -> void:
 		# number sat higher than the icon (icon looked "slightly lower / not
 		# level with it"). Centering the text vertically fixes the misalignment.
 		vl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+		# FURTHER FIX: SIZE_SHRINK_CENTER alone still let the Label's rect be
+		# whatever its *natural* minimum height is — which includes the
+		# font's full line-height (ascent+descent), not just the visible
+		# digit glyph. Digits have no descender, so that invisible extra
+		# space below the glyph made the number sit visibly higher than the
+		# icon even though both boxes were technically "centered". Pinning
+		# the label's height to the icon's own size removes that mismatch —
+		# both now center within the exact same box height.
+		vl.custom_minimum_size.y = ico_sz
 		icon_row.add_child(vl)
 		_stat_val_nodes.append(vl)
 
@@ -2235,6 +2674,35 @@ func _build_start_ui() -> void:
 	right_btn.pressed.connect(func(): _change_char(1))
 	sel_pc.add_child(right_btn)
 
+	# ── Customize button — hats/glasses/outfits/shoes shop, right next to
+	# the character selector since it's the same "who am I playing as" area.
+	# TEMPORARILY DISABLED (see _COSMETICS_ENABLED below): the placeholder
+	# cosmetic art didn't work out, so the whole entry point is hidden from
+	# the menu for now — backend, CustomizePanel.gd, and the Player.gd
+	# overlay-rendering code are all left intact so this is just a single
+	# flag flip to bring back once real art exists.
+	if _COSMETICS_ENABLED:
+		var customize_btn := Button.new()
+		customize_btn.custom_minimum_size = Vector2(nav_sz, nav_sz)
+		customize_btn.tooltip_text = "Customize"
+		var cst := StyleBoxFlat.new()
+		cst.bg_color = Color(0.700, 0.520, 0.340, 0.30)
+		cst.set_corner_radius_all(int(nav_sz * 0.5))
+		var cst_h := StyleBoxFlat.new()
+		cst_h.bg_color = Color(0.700, 0.520, 0.340, 0.45)
+		cst_h.set_corner_radius_all(int(nav_sz * 0.5))
+		customize_btn.add_theme_stylebox_override("normal", cst)
+		customize_btn.add_theme_stylebox_override("hover",  cst_h)
+		customize_btn.add_theme_stylebox_override("pressed", cst_h)
+		customize_btn.flat = false
+		var customize_center := CenterContainer.new()
+		customize_center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+		customize_center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		customize_btn.add_child(customize_center)
+		customize_center.add_child(UITheme.lucide_icon("sparkles", int(nav_sz * 0.55), Color(0.780, 0.380, 0.120)))
+		customize_btn.pressed.connect(_open_customize_panel)
+		sel_pc.add_child(customize_btn)
+
 	# ── PLAY and Settings buttons ────────────────────
 	# VS button removed from this build (see _open_vs_panel/_build_vs_panel —
 	# code kept intact, just not linked to a menu button here, so VS can be
@@ -2253,7 +2721,18 @@ func _build_start_ui() -> void:
 	var bottom_bar_h       : float = _vh * 0.09  # must match _build_bottom_bar()'s bar_h formula
 	var bottom_bar_top_abs : float = _vh - bottom_bar_h
 	var block_h            : float = play_h + gap + set_h
-	var avail_h             : float = bottom_bar_top_abs - sel_bottom_abs
+	# BUG FIX: on an extreme resize (very short window — someone dragging a
+	# desktop window's corner into a tall/thin or short/wide shape) this
+	# could go small or even negative, since it's the raw gap between the
+	# selector's bottom and the bottom bar's top. A negative avail_h still
+	# clamped equal_margin to 0 below, but block_top_abs = sel_bottom_abs
+	# in that case — fine on its own — the real problem was the SEPARATE
+	# resize-debounce bug (see _on_viewport_resized) that could rebuild this
+	# whole block against a stale in-between size mid-drag and then never
+	# rebuild again with the final settled size. Clamping avail_h to never
+	# go below block_h is just an extra safety net so this math can never
+	# push the block somewhere nonsensical even if called with a weird size.
+	var avail_h             : float = maxf(bottom_bar_top_abs - sel_bottom_abs, block_h)
 	var equal_margin        : float = maxf((avail_h - block_h) * 0.5, 0.0)
 	var block_top_abs       : float = sel_bottom_abs + equal_margin
 	var base_bottom := int(block_top_abs + block_h - _vh)
@@ -2357,6 +2836,24 @@ func _build_start_ui() -> void:
 	_build_bottom_bar()
 	_build_quest_panel()
 	_check_vsroom_deeplink()
+	_build_streak_badge()
+	# BUG FIX: "streak button sometimes just isn't there" — _build_streak_badge()
+	# always creates the badge HIDDEN (visible=false) and only _update_streak_
+	# badge() (called from _on_auth_success) reveals it. _build_start_ui() (this
+	# function) doesn't only run once at startup — _on_viewport_resized() tears
+	# down and rebuilds the whole start UI (including the badge, from scratch,
+	# hidden again) on any real resize/rotation, WITHOUT auth re-firing
+	# afterward (the player's already signed in from before; NimiqBridge itself
+	# isn't recreated on resize, only the UI is). So the freshly rebuilt badge
+	# had nothing left to ever reveal it again — it stayed hidden for the rest
+	# of the session after the first resize/rotation, matching the "works,
+	# then randomly gone" report. Fix: re-sync it right here too, using
+	# whatever auth state NimiqBridge already has (both calls already no-op
+	# safely if we're not authenticated yet — no need to gate this).
+	_update_streak_badge()
+	_fetch_streak_status()
+	_maybe_show_onboarding()
+	_check_pending_submissions()
 
 
 # ─────────────────────────────────────────────────────
@@ -2367,6 +2864,7 @@ var _bottom_bar        : Control
 var _quest_panel       : CanvasLayer
 var _leaderboard_panel : CanvasLayer
 var _stats_panel       : CanvasLayer
+var _streak_panel      : CanvasLayer   # opened by tapping the lobby streak badge — see _on_streak_badge_input
 var _active_tab        : String = ""
 var _tab_btns          : Dictionary = {}
 
@@ -2544,6 +3042,30 @@ func _open_vs_panel() -> void:
 	_vs_panel.call("show_panel")
 
 
+func _open_customize_panel() -> void:
+	if not is_instance_valid(_customize_panel):
+		_build_customize_panel()
+	_customize_panel.call("show_panel")
+
+
+func _build_customize_panel() -> void:
+	_customize_panel = CanvasLayer.new()
+	_customize_panel.set_script(load("res://scripts/CustomizePanel.gd"))
+	_customize_panel.layer = 16
+	add_child(_customize_panel)
+	var pid := nimiq_address if nimiq_address != "" else nimiq_device_id
+	_customize_panel.call("setup", pid)
+	if _auth_token != "":
+		_customize_panel.call("set_auth_token", _auth_token)
+	# Push equipped cosmetics straight onto the live player preview (menu
+	# idle pose and in-run alike — Player.gd's set_cosmetics() is safe to
+	# call from either context).
+	_customize_panel.connect("cosmetics_changed", func(equipped: Dictionary):
+		if is_instance_valid(_player) and _player.has_method("set_cosmetics"):
+			_player.call("set_cosmetics", equipped)
+	)
+
+
 func _build_vs_panel() -> void:
 	_vs_panel = CanvasLayer.new()
 	_vs_panel.set_script(load("res://scripts/VSPanel.gd"))
@@ -2552,10 +3074,10 @@ func _build_vs_panel() -> void:
 	var pid := nimiq_address if nimiq_address != "" else nimiq_device_id
 	_vs_panel.call("setup", pid)
 	_vs_panel.connect("play_requested", _start_vs_round)
-	_vs_panel.connect("replay_requested", func(seed: int, log: PackedByteArray, char_idx: int, nick: String, player_seed: int):
+	_vs_panel.connect("replay_requested", func(seed: int, log: PackedByteArray, char_idx: int, nick: String, player_seed: int, address: String, gyro_active: bool = false):
 		if _started: return
 		_block_lb_replay = false
-		await _start_replay(seed, log, char_idx, "vs", player_seed)
+		await _start_replay(seed, log, char_idx, "vs", player_seed, nick, address, gyro_active)
 	)
 	_vs_panel.connect("watch_requested", _watch_vs_live)
 	_sync_panels()
@@ -2752,7 +3274,11 @@ func _vs_watch_handle_control(raw: String) -> void:
 		"viewers":
 			if is_instance_valid(_vs_watch_viewer_lbl):
 				var n : int = int(d.get("n", 0))
-				_vs_watch_viewer_lbl.text = "👁 %d watching" % n
+				# No eye emoji here — same web tofu-box issue, and there's no
+				# bundled Lucide "eye" icon to swap it for (unlike the ones
+				# above that had a real substitute). Plain text is at least
+				# always readable everywhere.
+				_vs_watch_viewer_lbl.text = "%d watching" % n
 		"status":
 			var playing : bool = bool(d.get("playing", false))
 			if playing:
@@ -2777,7 +3303,7 @@ func _build_vs_watch_hud() -> void:
 	_vs_watch_hud.add_child(root)
 
 	_vs_watch_viewer_lbl = Label.new()
-	_vs_watch_viewer_lbl.text = "👁 — watching"
+	_vs_watch_viewer_lbl.text = "— watching"
 	_vs_watch_viewer_lbl.anchor_left = 1.0; _vs_watch_viewer_lbl.anchor_right = 1.0
 	_vs_watch_viewer_lbl.offset_left  = -_p(0.32)
 	_vs_watch_viewer_lbl.offset_right = -_p(0.02)
@@ -2917,18 +3443,45 @@ func _build_quest_panel() -> void:
 	_stats_panel.call("setup", _gm)
 	# token _sync_panels() ile gelecek
 	_stats_panel.connect("closed", func(): _deactivate_tab())
-	_stats_panel.connect("replay_requested", func(seed: int, log: PackedByteArray, char_idx: int, nick: String, player_seed: int):
+	_stats_panel.connect("replay_requested", func(seed: int, log: PackedByteArray, char_idx: int, nick: String, player_seed: int, gyro_active: bool = false):
 		if _started: return
 		_block_lb_replay = false
-		await _start_replay(seed, log, char_idx, "stats", player_seed)
+		# Stats panel only ever shows YOUR OWN recent games — use your own
+		# name/address for the watch badge, same as the game_over replay path.
+		var own_name := _player_nickname if _player_nickname != "" else "You"
+		await _start_replay(seed, log, char_idx, "stats", player_seed, own_name, nimiq_address, gyro_active)
 	)
 	_stats_panel.connect("connect_requested", func():
 		if not is_instance_valid(_nimiq_bridge): return
 		if _nimiq_bridge.nimiq_address != "":
 			_nimiq_bridge._do_sign_auth()
 		else:
+			# BUG FIX: if there's genuinely no wallet provider (not running
+			# inside Nimiq Pay), the retried _poll() below just times out
+			# silently after 15s with zero feedback — same "Connect Wallet
+			# looks broken" gap as NimiqJS.request_account's no_provider case
+			# (see NimiqJS.gd), just via this panel's separate poll-based
+			# path instead. Same install popup, checked up front instead of
+			# waiting out a doomed 15s poll first.
+			if OS.has_feature("web") and bool(JavaScriptBridge.eval("!!window._nimiqProviderMissing", true)):
+				JavaScriptBridge.eval("if(window._showNimiqInstallPopup) window._showNimiqInstallPopup();", true)
+				return
 			_nimiq_bridge._poll_started = false
 			_nimiq_bridge._poll()
+	)
+
+	# Streak panel — opened by tapping the lobby streak badge, not part of
+	# the bottom tab bar (see _on_streak_badge_input / _open_streak_panel).
+	_streak_panel = CanvasLayer.new()
+	_streak_panel.set_script(load("res://scripts/StreakPanel.gd"))
+	_streak_panel.layer = 15
+	add_child(_streak_panel)
+	_streak_panel.call("setup")
+	_streak_panel.connect("closed", func():
+		# Refresh the badge's small claimable-amount hint in case something
+		# changed while the panel was open (claimed, or newly became
+		# claimable after a day rollover mid-session).
+		_fetch_streak_status()
 	)
 
 	# Panels created — feed current auth state to all of them
@@ -3355,7 +3908,154 @@ func _build_settings_popup() -> void:
 		vib_lbl.modulate.a        = 0.45
 		vib_lbl.text              = "Vibration (unavailable on iOS)"
 
-	_control_mode = "tap"
+	# ── Control scheme: Tap vs Gyro (tilt) ──────────
+	# BUG FIX: this used to be a bare `_control_mode = "tap"` here with no UI
+	# at all — every settings rebuild silently forced tap mode and threw away
+	# whatever the player had saved, even though the entire gyro system
+	# (JS listener, per-frame direction getter, calibration screen) was
+	# already fully built and wired into GameManager — there was just no way
+	# to ever actually pick it. This card is that missing switch.
+	var ctrl_pc := PanelContainer.new()
+	ctrl_pc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ctrl_pc.add_theme_stylebox_override("panel", _card_st.call())
+	vbox.add_child(ctrl_pc)
+
+	var ctrl_mc := _make_margin_container(pad)
+	ctrl_mc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ctrl_pc.add_child(ctrl_mc)
+
+	var ctrl_vbox := VBoxContainer.new()
+	ctrl_vbox.add_theme_constant_override("separation", int(_p(0.010)))
+	ctrl_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ctrl_mc.add_child(ctrl_vbox)
+
+	var ctrl_title := Label.new()
+	ctrl_title.text = "Control"
+	UITheme.apply_label(ctrl_title, S_BROWN, fs)
+	ctrl_vbox.add_child(ctrl_title)
+
+	var ctrl_row := HBoxContainer.new()
+	ctrl_row.add_theme_constant_override("separation", int(_p(0.012)))
+	ctrl_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ctrl_vbox.add_child(ctrl_row)
+
+	var tap_btn := Button.new()
+	tap_btn.text = "Tap"
+	tap_btn.custom_minimum_size = Vector2(0, int(_p(0.070)))
+	tap_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ctrl_row.add_child(tap_btn)
+
+	var gyro_btn := Button.new()
+	gyro_btn.text = "Gyro"
+	gyro_btn.custom_minimum_size = Vector2(0, int(_p(0.070)))
+	gyro_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ctrl_row.add_child(gyro_btn)
+
+	var tap_info := Label.new()
+	tap_info.text = "Tap the left or right half of the screen to move that direction."
+	tap_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	UITheme.apply_label(tap_info, S_MID, int(_p(0.022)))
+	ctrl_vbox.add_child(tap_info)
+
+	var gyro_info := Label.new()
+	gyro_info.text = "Tilt your device left/right to move. Calibrate below to set your comfortable holding angle as center."
+	gyro_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	UITheme.apply_label(gyro_info, S_MID, int(_p(0.022)))
+	ctrl_vbox.add_child(gyro_info)
+
+	# Two calibration options, side by side: a one-tap "Auto Set" (re-runs the
+	# same auto-averaging the listener already does on start, just triggered
+	# on demand — good enough for "just hold it comfortably and tap"), and
+	# "Manual Calibrate" which opens the full flat-platform screen with the
+	# live degree readout for someone who wants to fine-tune by eye.
+	#
+	# UX FIX: both used to share _warm_btn_st's solid-vs-ghost pair (Auto Set
+	# ghost, Manual Calibrate solid) — but that's the EXACT same visual coding
+	# the Tap/Gyro row right above uses for "unselected vs. selected mode"
+	# (see _refresh_ctrl_ui below). Sitting directly under a real state toggle,
+	# a solid "Manual Calibrate" button read as if it were some kind of
+	# currently-active mode, when it's actually just a one-off action (opens a
+	# screen, doesn't persist as a selection) — same as Auto Set. Both are now
+	# ghost so neither implies a false "selected" state; they're peers, not a
+	# toggle.
+	var calib_row := HBoxContainer.new()
+	calib_row.add_theme_constant_override("separation", int(_p(0.012)))
+	calib_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	ctrl_vbox.add_child(calib_row)
+
+	var auto_calib_btn := Button.new()
+	auto_calib_btn.text = "Auto Set"
+	auto_calib_btn.custom_minimum_size = Vector2(0, int(_p(0.066)))
+	auto_calib_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	calib_row.add_child(auto_calib_btn)
+	_warm_btn_st(auto_calib_btn, true)   # ghost — peer action, not a selected mode
+
+	var calib_btn := Button.new()
+	calib_btn.text = "Manual Calibrate"
+	calib_btn.custom_minimum_size = Vector2(0, int(_p(0.066)))
+	calib_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	calib_row.add_child(calib_btn)
+	_warm_btn_st(calib_btn, true)   # ghost too — see UX FIX comment above
+	calib_btn.pressed.connect(_open_gyro_calib_screen)
+
+	auto_calib_btn.pressed.connect(func():
+		# UX FIX: the button used to give zero feedback for the ~0.6s between
+		# tap and the final "Gyro auto-calibrated!" toast — nothing changes
+		# fast enough for a thumb-tap on a small button to visually register,
+		# so a player couldn't tell if their tap actually landed or not.
+		# Fire an immediate toast the instant the press is registered, before
+		# any of the async JS/averaging work below even starts.
+		var t0 := Toast.get_instance()
+		if t0: t0.show_toast("Calibrating...", Toast.Kind.INFO)
+		if not OS.has_feature("web"):
+			# Native fallback path re-zeroes on the next 15 physics reads —
+			# see _get_gyro_dir()'s own _gyro_calib_frames counter. Previously
+			# silent beyond that — now confirms it too, same as the web path.
+			_gyro_calib_frames = 0
+			_gyro_calib_start_ms = -1  # re-arm the 400ms post-reset grace window too
+			_native_gyro_dir   = 0  # clear stale hysteresis state from before recalibration
+			if t0: t0.show_toast("Gyro recalibrated!", Toast.Kind.SUCCESS)
+			return
+		auto_calib_btn.disabled = true
+		auto_calib_btn.text = "Hold still..."
+		JavaScriptBridge.eval("window._gyroCalibN = 0;", true)
+		await get_tree().create_timer(0.6).timeout
+		var b = JavaScriptBridge.eval("window._getGyroBase ? window._getGyroBase() : 0;", true)
+		_gyro_baseline = float(b) if b != null else 0.0
+		_save_settings()
+		auto_calib_btn.disabled = false
+		auto_calib_btn.text = "Auto Set"
+		var t := Toast.get_instance()
+		if t: t.show_toast("Gyro auto-calibrated!", Toast.Kind.SUCCESS)
+	)
+
+	# Ghost (outline) style = unselected, solid orange = selected — same
+	# visual language _warm_btn_st already provides everywhere else.
+	var _refresh_ctrl_ui := func():
+		var is_gyro := _control_mode == "gyro"
+		_warm_btn_st(tap_btn,  is_gyro)      # ghost when NOT the active mode
+		_warm_btn_st(gyro_btn, not is_gyro)
+		tap_info.visible  = not is_gyro
+		gyro_info.visible = is_gyro
+		calib_row.visible = is_gyro
+	_refresh_ctrl_ui.call()
+
+	tap_btn.pressed.connect(func():
+		if _control_mode == "tap": return
+		_control_mode = "tap"
+		_refresh_ctrl_ui.call()
+		_save_settings()
+	)
+	gyro_btn.pressed.connect(func():
+		if _control_mode == "gyro": return
+		_control_mode = "gyro"
+		# Requesting permission here happens on a real user tap (this button
+		# press), which is required for iOS Safari's
+		# DeviceOrientationEvent.requestPermission() gate to succeed at all.
+		_ensure_gyro_js()
+		_refresh_ctrl_ui.call()
+		_save_settings()
+	)
 
 	# ── Background Selection ───────────────────────
 	var bg_pc := PanelContainer.new()
@@ -3779,6 +4479,21 @@ func _rebuild_settings_if_open() -> void:
 	_settings_popup.modulate.a = 1.0
 	_settings_rebuilding = false
 
+## Fades the nickname overlay out instead of the instant queue_free() every
+## caller used to do — same fade used by the onboarding/settings/game-over
+## overlays for a consistent feel across the whole game.
+func _close_nick_overlay() -> void:
+	if not is_instance_valid(_nick_overlay): return
+	var ov := _nick_overlay
+	_nick_overlay = null
+	var tw := create_tween()
+	if tw:
+		tw.tween_property(ov, "modulate:a", 0.0, 0.15).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+		tw.tween_callback(func(): if is_instance_valid(ov): ov.queue_free())
+	else:
+		ov.queue_free()
+
+
 func _open_nick_overlay() -> void:
 	if is_instance_valid(_nick_overlay):
 		_nick_overlay.queue_free()
@@ -3857,7 +4572,7 @@ func _open_nick_overlay() -> void:
 	x_ic.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	x_ic.custom_minimum_size = Vector2(x_ic_sz, x_ic_sz)
 	x_center.add_child(x_ic)
-	x_btn.pressed.connect(func(): _nick_overlay.queue_free(); _nick_overlay = null)
+	x_btn.pressed.connect(_close_nick_overlay)
 	hdr_row.add_child(x_btn)
 
 	# Hint
@@ -3942,8 +4657,7 @@ func _open_nick_overlay() -> void:
 				UITheme.apply_label(st_lbl, Color(0.3, 0.85, 0.4, 1.0), int(_p(0.026)))
 				_rebuild_settings_if_open()
 				await get_tree().create_timer(0.5).timeout
-				if is_instance_valid(_nick_overlay):
-					_nick_overlay.queue_free(); _nick_overlay = null
+				_close_nick_overlay()
 			else:
 				var msg := err
 				if err.begins_with("cooldown"):
@@ -3991,10 +4705,195 @@ func _open_nick_overlay() -> void:
 	# resize — no manual repositioning code is needed at all.
 
 
+# ─────────────────────────────────────────────────────
+#  ONBOARDING OVERLAY — shown once, ever, per device
+# ─────────────────────────────────────────────────────
+# UX FIX: a brand-new player got zero in-game explanation of controls or
+# what the bottom nav bar (Quest / Leaderboard / Stats) even does — the
+# only way to learn any of it was trial and error. Shown once, on the
+# very first lobby screen a device ever sees, gated by localStorage
+# (which survives the "Play Again" -> reload_current_scene() cycle —
+# unlike any in-memory flag, localStorage is the one thing that actually
+# persists across a scene reload; see NimiqBridge.gd's own auth-token
+# comments for the same reasoning). Purely additive on top of the
+# existing lobby screen — never blocks Play, never touches auth/gameplay,
+# dismissible any time via the button.
+func _maybe_show_onboarding() -> void:
+	if is_instance_valid(_onboarding_overlay):
+		return  # already showing — don't stack a second one
+	# DEV/EDITOR TESTING: the native-export early-return used to live here
+	# ("native export is the headless replay-verifier only — never a real
+	# play surface") — removed on request so the overlay is visible when
+	# running straight from the Godot editor, not just in a real web export.
+	# The localStorage "seen it once" check only makes sense on web (no
+	# JavaScriptBridge/localStorage outside a browser), so it's now gated
+	# behind has_feature("web") itself instead of gating the whole function
+	# — in the editor this just always shows the overlay every run, which is
+	# exactly what you want for testing it repeatedly.
+	if OS.has_feature("web"):
+		var already_seen = JavaScriptBridge.eval("!!localStorage.getItem('nj_onboarding_seen')", true)
+		if already_seen:
+			return
+	_build_onboarding_overlay()
+
+
+func _build_onboarding_overlay() -> void:
+	# Same warm palette as the nickname overlay (_open_nick_overlay above) —
+	# keeps every full-screen popup in the game visually consistent.
+	const OB_BG     := Color(0.957, 0.898, 0.800)
+	const OB_BORDER := Color(0.700, 0.520, 0.340)
+	const OB_BROWN  := Color(0.220, 0.130, 0.060)
+	const OB_MID    := Color(0.480, 0.340, 0.200)
+
+	_onboarding_overlay = Control.new()
+	_onboarding_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_onboarding_overlay.z_index = 60   # above the nick overlay (50) and settings popup (20)
+	_ui_root.add_child(_onboarding_overlay)
+
+	var dim := ColorRect.new()
+	dim.color = Color(0, 0, 0, 0.65)
+	dim.modulate.a = 0.0   # fades in below, instead of popping in instantly
+	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	_onboarding_overlay.add_child(dim)
+
+	var pc := PanelContainer.new()
+	pc.anchor_left   = 0.08; pc.anchor_right  = 0.92
+	# A bit taller than before (was 0.16-0.76) — a 5th info row was added
+	# below, so the panel gets a little extra headroom to stay comfortably
+	# clear of both the title above and the confirm button below.
+	pc.anchor_top    = 0.13; pc.anchor_bottom = 0.80
+	var pc_st := StyleBoxFlat.new()
+	pc_st.bg_color = OB_BG
+	pc_st.border_color = OB_BORDER
+	pc_st.set_border_width_all(3)
+	pc_st.set_corner_radius_all(16)
+	pc_st.shadow_color = Color(0, 0, 0, 0.3)
+	pc_st.shadow_size  = 12
+	pc.add_theme_stylebox_override("panel", pc_st)
+	pc.modulate.a = 0.0   # fades/scales in below, matches nick overlay's entrance
+	pc.scale      = Vector2(0.92, 0.92)
+	_onboarding_overlay.add_child(pc)
+
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", int(_p(0.020)))
+	pc.add_child(vb)
+
+	var mc := _make_margin_container(int(_p(0.036)))
+	mc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vb.add_child(mc)
+
+	var inner := VBoxContainer.new()
+	inner.add_theme_constant_override("separation", int(_p(0.022)))
+	mc.add_child(inner)
+
+	var title := Label.new()
+	title.text = "Welcome to NimJump!"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	UITheme.apply_label(title, OB_BROWN, int(_p(0.048)))
+	inner.add_child(title)
+
+	# Five short lines — controls, goal, the NIM hook, a pointer at the bottom
+	# nav bar (the actual "navigation" ask: nothing else in the game tells a
+	# new player those three tabs exist or what they're for), and a pointer to
+	# the Tap/Gyro control toggle in Settings for anyone who'd rather tilt
+	# their device than swipe.
+	# BUG FIX: these used to be raw emoji characters (👆🏔️🏆🎯⚙️) drawn as text
+	# via the game's own pixel font (UITheme's PIXEL_FONT_PATH). That font has
+	# no emoji glyphs, and on the WEB export Godot has no system emoji font to
+	# fall back to either (unlike native desktop, where the OS sometimes
+	# supplies one) — so every row rendered as a "missing glyph" tofu box in
+	# a browser instead of an icon, exactly what showed up in testing. Switched
+	# to the game's own bundled Lucide icon PNGs (UITheme.lucide_icon) — the
+	# same icon system Toast.gd and the settings panel already rely on for
+	# this exact reason, guaranteed to render identically on every platform.
+	var rows := [
+		["gamepad-2",  "Swipe left/right to move — your bunny jumps automatically on landing."],
+		["trending-up","Climb as high as you can. Falling off the bottom ends the run."],
+		["trophy",     "Daily & weekly leaderboards pay real NIM to the top climbers."],
+		["target",     "Quests, Leaderboard, and Stats are all in the bar at the bottom — tap around!"],
+		["rotate-ccw", "You can set your controls to Tap or Gyro (tilt) anytime in Settings."],
+	]
+	for row in rows:
+		var hb := HBoxContainer.new()
+		hb.add_theme_constant_override("separation", int(_p(0.020)))
+		inner.add_child(hb)
+		var ic := UITheme.lucide_icon(row[0], int(_p(0.040)), OB_BROWN)
+		hb.add_child(ic)
+		var txt := Label.new()
+		txt.text = row[1]
+		txt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		txt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(txt, OB_MID, int(_p(0.028)))
+		hb.add_child(txt)
+
+	# UX FIX: VBoxContainer top-aligns children by default when nothing has
+	# an EXPAND_FILL flag — since `inner` is stretched to fill the whole
+	# panel height (via the MarginContainer/PanelContainer chain above it),
+	# the title+rows+button were all clumping together near the TOP, leaving
+	# a dead gap between the button and the panel's bottom edge instead of
+	# the button actually sitting at the bottom. This spacer eats that
+	# leftover space itself, so the button lands flush against the bottom
+	# regardless of screen height / how many info rows are above it.
+	var spacer := Control.new()
+	spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	inner.add_child(spacer)
+
+	var got_it := Button.new()
+	got_it.text = "Got it — let's play!"
+	got_it.custom_minimum_size = Vector2(0, int(_p(0.088)))
+	UITheme.apply_play_button(got_it)
+	got_it.pressed.connect(_dismiss_onboarding)
+	inner.add_child(got_it)
+
+	var ov_tw := create_tween()
+	if ov_tw:
+		ov_tw.set_parallel(true)
+		ov_tw.tween_property(dim, "modulate:a", 1.0, 0.25)
+		ov_tw.tween_property(pc,  "modulate:a", 1.0, 0.28)
+		ov_tw.tween_property(pc,  "scale", Vector2.ONE, 0.28).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+
+
+# UX FIX (error handling): score submission already retries automatically
+# from an offline queue (see GameManager.gd's _send_submit_with_retry /
+# _pending_save — a run's score+replay is written to localStorage BEFORE
+# the network call, and re-sent on the next retry tick if it fails or the
+# device is offline). That safety net already works, but a player who
+# submitted while offline got zero visible confirmation their run wasn't
+# lost — just a toast that faded away with no way to tell "queued for
+# later" apart from "gone forever". This just surfaces the already-working
+# state instead of leaving it silent. Read-only — never touches the queue.
+func _check_pending_submissions() -> void:
+	if not OS.has_feature("web"):
+		return
+	var raw = JavaScriptBridge.eval("localStorage.getItem('nj_pending_submissions') || '[]'", true)
+	var parsed = JSON.parse_string(str(raw))
+	var count := 0
+	if parsed is Array:
+		count = parsed.size()
+	if count > 0:
+		var inst := Toast.get_instance()
+		if inst != null:
+			var word := "run" if count == 1 else "runs"
+			inst.show_toast("%d %s waiting to sync — will retry automatically." % [count, word], Toast.Kind.INFO)
+
+
+func _dismiss_onboarding() -> void:
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval("localStorage.setItem('nj_onboarding_seen', '1')", true)
+	if is_instance_valid(_onboarding_overlay):
+		var ov := _onboarding_overlay
+		var tw := create_tween()
+		if tw:
+			tw.tween_property(ov, "modulate:a", 0.0, 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+			tw.tween_callback(func(): if is_instance_valid(ov): ov.queue_free())
+		else:
+			ov.queue_free()
+	_onboarding_overlay = null
+
+
 func _close_settings() -> void:
-	if is_instance_valid(_nick_overlay):
-		_nick_overlay.queue_free()
-		_nick_overlay = null
+	_close_nick_overlay()
 	if _settings_popup:
 		# LOCK FIX: the popup used to only lose its full-screen, click-blocking
 		# dim layer once the fade-out tween's chained callback fired 0.15s
@@ -4226,7 +5125,21 @@ func _on_play_pressed() -> void:
 					if _started or _auth_token != "": return
 					if is_instance_valid(_nimiq_bridge) and not _nimiq_bridge.auth_verified and not bool(_nimiq_bridge.get("_signing_in_progress")):
 						print("[MAIN] wallet-connect detour still not resolved after 6s — forcing sign-in directly")
-						_nimiq_bridge._do_sign_auth()
+						# BUG FIX: this used to call _nimiq_bridge._do_sign_auth()
+						# directly, bypassing _ensure_wallet_then_sign()'s address
+						# refresh entirely. If nimiq_address was still blank/stale
+						# at this point (e.g. right after Settings > Disconnect,
+						# which clears it locally without touching the actual
+						# wallet connection), _do_sign_auth() would sign with
+						# whatever the wallet extension's REAL current account is
+						# but report a blank/wrong nimiq_address to the backend's
+						# verify call — a guaranteed 401, which used to auto-retry
+						# forever (see NimiqBridge.gd's _verify_401_retries fix),
+						# each retry popping a brand new native sign prompt. Route
+						# through _ensure_wallet_then_sign() here too so the
+						# address always gets (re)resolved fresh right before
+						# signing, no matter which path triggers it.
+						_ensure_wallet_then_sign()
 				)
 		# On success start game, on error/rejection reset — user can press play again
 		var _conn_s := _nimiq_bridge.connect("auth_success", func(_t, _p):
@@ -4504,11 +5417,26 @@ func _on_quests_updated() -> void:
 
 func _hide_go_panel() -> void:
 	if not is_instance_valid(_go_panel): return
-	_go_panel.visible = false
 	var cont = _go_panel.get_meta("container") if _go_panel.has_meta("container") else null
 	var dim  = _go_panel.get_meta("dim")       if _go_panel.has_meta("dim")       else null
-	if dim  and is_instance_valid(dim):  dim.visible  = false
-	if cont and is_instance_valid(cont): cont.visible = false
+	var gp   := _go_panel
+	# Mirror of _show_go_panel's open animation — fades+shrinks out instead
+	# of vanishing instantly, then hides all three pieces (panel/dim/container)
+	# together once the tween finishes.
+	var tw := create_tween()
+	if tw:
+		tw.set_parallel(true)
+		tw.tween_property(gp, "modulate:a", 0.0,                 0.16).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+		tw.tween_property(gp, "scale",      Vector2(0.90, 0.90), 0.16).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+		tw.chain().tween_callback(func():
+			if is_instance_valid(gp): gp.visible = false
+			if dim  and is_instance_valid(dim):  dim.visible  = false
+			if cont and is_instance_valid(cont): cont.visible = false
+		)
+	else:
+		gp.visible = false
+		if dim  and is_instance_valid(dim):  dim.visible  = false
+		if cont and is_instance_valid(cont): cont.visible = false
 
 
 func _show_go_panel() -> void:
@@ -4772,11 +5700,16 @@ func _on_replay_pressed() -> void:
 	var log_data : PackedByteArray = _gm.call("get_replay_log")
 	var seed_val : int = int(_gm.get("game_seed"))
 	var char_idx : int = int(_gm.get("_replay_char"))
+	# gyro-only movement ramp — see Player.gd's set_gyro_control_active doc
+	# comment. GameManager already populated this at recording-end time
+	# (mirrors how _replay_char is read one line above).
+	var gyro_active_val : bool = bool(_gm.get("_replay_gyro_active"))
 	var player_seed_val : int = int(_gm.get("_replay_player_seed"))
-	await _start_replay(seed_val, log_data, char_idx, "game_over", player_seed_val)
+	var own_name := _player_nickname if _player_nickname != "" else "You"
+	await _start_replay(seed_val, log_data, char_idx, "game_over", player_seed_val, own_name, nimiq_address, gyro_active_val)
 
 
-func _on_leaderboard_replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, _nickname: String, player_seed: int = 0) -> void:
+func _on_leaderboard_replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int = 0, address: String = "", gyro_active: bool = false) -> void:
 	# _block_lb_replay guards against stale HTTP callbacks firing after PLAY is pressed.
 	# But if the user is in the lobby viewing the leaderboard and presses a replay button,
 	# _block_lb_replay may still be true from a previous game session. Reset it here so
@@ -4785,11 +5718,20 @@ func _on_leaderboard_replay_requested(seed: int, replay_log: PackedByteArray, ch
 	_block_lb_replay = false
 	# NOTE: visibility guard removed — LeaderboardPanel now emits replay_requested
 	# before calling hide_panel() (deferred), so the panel is still visible here.
-	await _start_replay(seed, replay_log, char_idx, "leaderboard", player_seed)
+	await _start_replay(seed, replay_log, char_idx, "leaderboard", player_seed, nickname, address, gyro_active)
 
 
-func _start_replay(seed: int, replay_log: PackedByteArray, char_idx: int, source: String, player_seed: int = 0) -> void:
+## watch_name/watch_address identify whose run is being watched (leaderboard
+## entry, VS opponent, etc.) — user request: show a small avatar+name badge
+## top-right while watching someone ELSE's replay. Left "" for your own
+## replay (game_over/stats) so the badge stays hidden there.
+var _replay_watch_name    : String = ""
+var _replay_watch_address : String = ""
+
+func _start_replay(seed: int, replay_log: PackedByteArray, char_idx: int, source: String, player_seed: int = 0, watch_name: String = "", watch_address: String = "", gyro_active: bool = false) -> void:
 	if replay_log.is_empty(): return
+	_replay_watch_name    = watch_name
+	_replay_watch_address = watch_address
 	_replay_source = source
 	# Hide menus, show HUD
 	_enter_replay_ui_pre()
@@ -4801,7 +5743,7 @@ func _start_replay(seed: int, replay_log: PackedByteArray, char_idx: int, source
 	# Pause BEFORE starting so player stays at spawn position during countdown.
 	# Previously replay ran 3 frames before pausing — player had already jumped.
 	_gm.call("set_replay_paused", true)
-	_gm.call("start_replay_external", seed, replay_log, char_idx, nickname, player_seed)
+	_gm.call("start_replay_external", seed, replay_log, char_idx, nickname, player_seed, gyro_active)
 	_gm.call("set_replay_speed", 1.0)
 	# One frame so the scene renders the player at start position before countdown
 	await get_tree().process_frame
@@ -4938,8 +5880,27 @@ func _restore_lobby_ui() -> void:
 
 func _exit_replay_ui() -> void:
 	if is_instance_valid(_replay_bar):
-		_replay_bar.queue_free()
+		var rb   := _replay_bar
+		var rroot : Control = _replay_bar_root
+		var tw := create_tween()
+		# BUG FIX: was tweening `rb` (a CanvasLayer — no `modulate`, see the
+		# matching fix in _build_replay_bar). Fade the wrapper Control instead.
+		if tw and is_instance_valid(rroot):
+			tw.tween_property(rroot, "modulate:a", 0.0, 0.15).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+			tw.tween_callback(func(): if is_instance_valid(rb): rb.queue_free())
+		else:
+			rb.queue_free()
 		_replay_bar = null
+		_replay_bar_root = null
+	_replay_watch_name    = ""
+	_replay_watch_address = ""
+
+	# Put the hearts HUD back to its normal bottom-left margin — see the
+	# matching lift in _build_replay_bar().
+	if is_instance_valid(_life_panel):
+		var normal_offset := -int(_p(0.020))
+		_life_panel.offset_top    = normal_offset
+		_life_panel.offset_bottom = normal_offset
 
 	var src := _replay_source
 	_replay_source = ""
@@ -4968,6 +5929,204 @@ func _exit_replay_ui() -> void:
 # var _replay_speed_idx : int = 0 
 var _replay_speed_idx: int = 0
 
+## Small avatar+name badge sitting just above the right end of the replay
+## bar (bottom-right of the screen) — NOT top-right, which is where the
+## hearts/life HUD icons already live on the other side. Shown every time
+## a replay plays, whoever's run it is (yours in game_over/stats, or
+## someone else's from leaderboard/VS) — _start_replay's callers all pass
+## a name/address now.
+func _build_replay_watch_badge(bar_h: float) -> void:
+	if not is_instance_valid(_replay_bar): return
+	var disp := _replay_watch_name
+	if (disp == "" or disp == "null") and _replay_watch_address != "":
+		disp = (_replay_watch_address.left(6) + ".." + _replay_watch_address.right(3)) \
+			if _replay_watch_address.length() > 9 else _replay_watch_address
+	if disp == "": return
+	# Keep it short — this is a tiny corner chip, not a name plate.
+	if disp.length() > 12: disp = disp.left(11) + "…"
+
+	# BUG FIX: was 0.044 — too small to actually make out who you're watching
+	# at a glance (explicit user report: "çok küçük gözüken göremedim").
+	# Bumped avatar/padding/label up ~1.5x; still small enough to sit as a
+	# corner chip above the replay bar without overlapping it.
+	var sz  := int(_p(0.066))     # avatar diameter
+	var pad := int(_p(0.017))
+	var badge := PanelContainer.new()
+	var st := StyleBoxFlat.new()
+	st.bg_color     = Color(0.957, 0.898, 0.800, 0.92)
+	st.border_color = Color(0.700, 0.520, 0.340)
+	st.set_border_width_all(2)
+	st.set_corner_radius_all(int((sz + pad * 2) * 0.5))
+	st.content_margin_left   = pad
+	st.content_margin_right  = int(pad * 1.4)
+	st.content_margin_top    = pad
+	st.content_margin_bottom = pad
+	badge.add_theme_stylebox_override("panel", st)
+	badge.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# Same anchor+grow_direction trick _life_panel uses (see its "PanelContainer
+	# auto-sizes to content — no manual calculation needed" comment above),
+	# just mirrored to the opposite corner: pin a single point at the
+	# bottom-right, inset by edge_pad from the right edge and by
+	# (edge_pad + bar_h) from the bottom (so it sits just above the replay
+	# bar), then GROW_DIRECTION_BEGIN on both axes so the panel expands
+	# left/up from that pinned point to fit its content — no manual size
+	# measurement, no risk of spilling past the screen edge.
+	var edge_pad := int(_p(0.020))
+	badge.anchor_left   = 1.0; badge.anchor_top    = 1.0
+	badge.anchor_right  = 1.0; badge.anchor_bottom = 1.0
+	badge.offset_left    = -edge_pad
+	badge.offset_right   = -edge_pad
+	badge.offset_top     = -(edge_pad + bar_h)
+	badge.offset_bottom  = -(edge_pad + bar_h)
+	badge.grow_horizontal = Control.GROW_DIRECTION_BEGIN
+	badge.grow_vertical   = Control.GROW_DIRECTION_BEGIN
+	_replay_bar.add_child(badge)
+
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", int(pad * 0.8))
+	row.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	badge.add_child(row)
+
+	row.add_child(_build_watch_avatar(_replay_watch_address, disp, sz))
+
+	var lbl := Label.new()
+	lbl.text = disp
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	UITheme.apply_label(lbl, Color(0.220, 0.130, 0.060), int(_p(0.028)))
+	row.add_child(lbl)
+
+
+## Self-contained fallback avatar (same deterministic color+initial approach
+## as LeaderboardPanel._make_fallback_avatar / VSPanel's copy) — a colored
+## circle plus the display name's first letter, since this badge doesn't
+## need the full real-Nimiq-avatar async fetch those bigger panels do.
+func _build_watch_avatar(address: String, display: String, size: int) -> Control:
+	const PALETTE := [
+		Color(0.13, 0.60, 0.90), Color(0.40, 0.78, 0.22), Color(0.96, 0.65, 0.14),
+		Color(0.82, 0.28, 0.28), Color(0.60, 0.35, 0.85), Color(0.20, 0.72, 0.65),
+		Color(0.95, 0.38, 0.60), Color(0.45, 0.55, 0.70),
+	]
+	var key := address if address != "" else display
+	var hash_val := 0
+	for i in mini(key.length(), 12): hash_val = (hash_val * 31 + key.unicode_at(i)) & 0xFFFF
+	var bg_col : Color = PALETTE[hash_val % PALETTE.size()] if key != "" else Color(0.6, 0.6, 0.6)
+
+	var img := Image.create(maxi(1, size), maxi(1, size), false, Image.FORMAT_RGBA8)
+	var cx := size * 0.5; var cy := size * 0.5; var r := size * 0.5
+	for y in size:
+		for x in size:
+			var dx := x - cx + 0.5
+			var dy := y - cy + 0.5
+			img.set_pixel(x, y, bg_col if dx * dx + dy * dy <= r * r else Color(0, 0, 0, 0))
+
+	var wrap := CenterContainer.new()
+	wrap.custom_minimum_size = Vector2(size, size)
+	wrap.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var circle := TextureRect.new()
+	circle.custom_minimum_size = Vector2(size, size)
+	circle.texture = ImageTexture.create_from_image(img)
+	circle.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	wrap.add_child(circle)
+
+	var letter := "?"
+	for i in display.length():
+		var c := display.unicode_at(i)
+		if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57):
+			letter = display[i].to_upper()
+			break
+	var letter_lbl := Label.new()
+	letter_lbl.text = letter
+	letter_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	letter_lbl.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
+	letter_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	UITheme.apply_label(letter_lbl, Color.WHITE, int(size * 0.5))
+	wrap.add_child(letter_lbl)
+
+	# BUG FIX: this badge used to STOP here — colored circle + first letter
+	# only, forever. LeaderboardPanel.gd's _make_nimiq_avatar() does the
+	# exact same "draw the fallback immediately, then fetch the REAL Nimiq
+	# identicon on top once it loads" two-step for every other avatar in
+	# the game — this replay-watch badge was the one place that never got
+	# the second step, so it was stuck showing a plain letter instead of
+	# the actual avatar image. Reusing the same async fetch here (same JS
+	# bridge call, same swap-in-when-ready pattern) instead of duplicating
+	# a second copy of that logic.
+	if OS.has_feature("web") and address != "" and address != "null" and address != "undefined":
+		_load_watch_avatar_async(circle, letter_lbl, address, size)
+	return wrap
+
+
+## Same real-Nimiq-avatar fetch LeaderboardPanel._load_nimiq_avatar_async
+## uses (window.getNimiqAvatar via the Identicons CDN bridge already loaded
+## for that panel) — ported here so the replay-watch badge shows the real
+## avatar too, not just its colored-circle+letter fallback. On success,
+## swaps `circle`'s texture to the real avatar and hides the now-redundant
+## letter overlay; on any failure/timeout, just leaves the fallback as-is.
+func _load_watch_avatar_async(circle: TextureRect, letter_lbl: Label, address: String, size: int) -> void:
+	if not OS.has_feature("web"): return
+	var key := "watchavatar_" + address.left(8).validate_node_name()
+
+	# Wait if the Identicons CDN isn't ready yet (max ~3s) — same guard
+	# LeaderboardPanel uses.
+	for _w in 30:
+		var ready = JavaScriptBridge.eval("window._nimiqIconsReady === true", true)
+		if ready: break
+		await get_tree().create_timer(0.1).timeout
+		if not is_instance_valid(circle): return
+
+	var js_code := (
+		"(function(){"
+		+ "if(!window._nimiqPending) window._nimiqPending = {};"
+		+ "window._nimiqPending['" + key + "'] = null;"
+		+ "if(typeof window.getNimiqAvatar !== 'function'){"
+		+ "  window._nimiqPending['" + key + "'] = ''; return;"
+		+ "}"
+		+ "window.getNimiqAvatar('" + address + "')"
+		+ "  .then(function(svgData){"
+		+ "    if(!svgData){ window._nimiqPending['" + key + "'] = ''; return; }"
+		+ "    var img = new Image();"
+		+ "    img.onload = function(){"
+		+ "      try {"
+		+ "        var c = document.createElement('canvas');"
+		+ "        c.width = " + str(size) + "; c.height = " + str(size) + ";"
+		+ "        c.getContext('2d').drawImage(img, 0, 0, " + str(size) + ", " + str(size) + ");"
+		+ "        window._nimiqPending['" + key + "'] = c.toDataURL('image/png');"
+		+ "      } catch(e){ window._nimiqPending['" + key + "'] = ''; }"
+		+ "    };"
+		+ "    img.onerror = function(){ window._nimiqPending['" + key + "'] = ''; };"
+		+ "    img.src = svgData;"
+		+ "  })"
+		+ "  .catch(function(e){ window._nimiqPending['" + key + "'] = ''; });"
+		+ "})();"
+	)
+	JavaScriptBridge.eval(js_code, true)
+	for _i in 50:
+		await get_tree().create_timer(0.1).timeout
+		if not is_instance_valid(circle): return
+		var raw = JavaScriptBridge.eval("window._nimiqPending['%s']" % key, true)
+		if raw == null: continue
+		var result := str(raw)
+		if result == "" or result == "null" or result == "undefined":
+			return  # fetch failed — leave the colored-circle+letter fallback as the final state
+		_apply_watch_avatar_png(circle, letter_lbl, result)
+		return
+
+
+func _apply_watch_avatar_png(circle: TextureRect, letter_lbl: Label, data_url: String) -> void:
+	if DisplayServer.get_name() == "headless": return
+	if not is_instance_valid(circle): return
+	if not data_url.begins_with("data:image/png;base64,"): return
+	var b64   := data_url.substr(len("data:image/png;base64,")).strip_edges()
+	var bytes := Marshalls.base64_to_raw(b64)
+	if bytes.is_empty(): return
+	var img := Image.new()
+	if img.load_png_from_buffer(bytes) != OK: return
+	circle.texture = ImageTexture.create_from_image(img)
+	# Real avatar image is in — the fallback letter overlay is now redundant.
+	if is_instance_valid(letter_lbl):
+		letter_lbl.visible = false
+
+
 func _build_replay_bar() -> void:
 	# --- REPLAY HER AÇILDIĞINDA HIZI 1X'E SIFIRLAMA KISMI ---
 	_replay_speed_idx = 0
@@ -4994,6 +6153,21 @@ func _build_replay_bar() -> void:
 	var pad_sep : float = _p(0.012)
 	var btn_h   : float = _p(0.085)
 	var bar_h   : float = pad_top + seek_h * 3.2 + pad_sep + btn_h + pad_bot
+	_build_replay_watch_badge(bar_h)
+
+	# UI FIX: the replay bar is a full-width panel docked to the bottom of
+	# the screen (see panel_bg below) — the hearts HUD (_life_panel) is
+	# ALSO bottom-left-anchored (see _build_game()'s "BOTTOM LEFT: Life
+	# icons" block), on a lower CanvasLayer, so it used to sit directly
+	# UNDER the replay bar's opaque background and get completely covered/
+	# hidden whenever a replay was open. Push it up above the replay bar's
+	# height for as long as this bar is showing; _exit_replay_ui() puts it
+	# back down to its normal margin when the replay bar closes.
+	if is_instance_valid(_life_panel):
+		var lifted_offset := -(int(_p(0.020)) + int(bar_h))
+		_life_panel.offset_top    = lifted_offset
+		_life_panel.offset_bottom = lifted_offset
+
 	var sep     : int   = int(pad_sep)
 	var fs_sm   : int   = int(_p(0.026))
 	var ic_sm   : int   = int(btn_h * 0.50)
@@ -5049,6 +6223,12 @@ func _build_replay_bar() -> void:
 	var root := Control.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# BUG FIX: CanvasLayer (_replay_bar) has no `modulate` property — animating
+	# it directly crashed with "Invalid access to property or key 'modulate'
+	# on a base object of type 'CanvasLayer'". Fade this wrapper Control
+	# (a real CanvasItem) instead, same fix as the gyro calibration screen.
+	root.modulate.a = 0.0   # fades in — see the tween at the end of this function
+	_replay_bar_root = root
 	_replay_bar.add_child(root)
 
 	var panel_bg := Panel.new()
@@ -5101,9 +6281,27 @@ func _build_replay_bar() -> void:
 	seek_bar.add_theme_stylebox_override("fill",       sb_fill)
 	seek_hit.add_child(seek_bar)
 
-	var head_sz    : float = seek_h * 1.3
+	# UI FIX: was rendering the RAW, full-resolution slider_grabber.png
+	# stretched down live by the GPU — same source asset the volume slider
+	# in Settings uses, but that one (see UITheme.apply_slider) pre-resizes
+	# the image on the CPU with bilinear filtering BEFORE turning it into a
+	# texture, which is what actually makes it look small and crisp. Doing
+	# the constraint via custom_minimum_size alone (what this used to do)
+	# still uploads/draws the full huge image, which reads as an oversized,
+	# slightly-soft blob next to the thin track — exactly the "tutma şey
+	# çok büyük" complaint. Same fix here: shrink the source pixels first,
+	# same technique, same asset, so the seek bar's grip finally matches
+	# the volume slider's grip look instead of standing out as different
+	# (and clearly not-reused) UI.
+	var head_sz    : float = seek_h * 1.1
 	var head_panel := TextureRect.new()
-	head_panel.texture      = _load_icon.call("slider_grabber")
+	var _grab_tex : Texture2D = _load_icon.call("slider_grabber")
+	if _grab_tex != null:
+		var _grab_img := _grab_tex.get_image()
+		var _grab_w : int = maxi(1, int(head_sz))
+		var _grab_h : int = maxi(1, int(head_sz))
+		_grab_img.resize(_grab_w, _grab_h, Image.INTERPOLATE_BILINEAR)
+		head_panel.texture = ImageTexture.create_from_image(_grab_img)
 	head_panel.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	head_panel.expand_mode  = TextureRect.EXPAND_IGNORE_SIZE
 	head_panel.custom_minimum_size = Vector2(head_sz, head_sz)
@@ -5373,6 +6571,10 @@ func _build_replay_bar() -> void:
 			if is_instance_valid(_gm): _gm.call("set_replay_paused", true)
 			_refresh_pause_icon.call(pause_btn)
 	)
+
+	var _rb_open_tw := create_tween()
+	if _rb_open_tw:
+		_rb_open_tw.tween_property(root, "modulate:a", 1.0, 0.20).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 
 func apply_selected_background() -> void:
 	var tex : Texture2D = UITheme.get_background_texture(_bg_selected)

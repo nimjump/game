@@ -62,6 +62,7 @@ import (
 type workerJob struct {
 	Seed       string `json:"seed"`        // string — int64 > 2^53, JSON float64 precision loss olur
 	Char       int    `json:"char"`
+	GyroActive bool   `json:"gyro_active"` // gyro-only movement ramp — see Player.gd's set_gyro_control_active doc comment
 	PlayerSeed string `json:"player_seed"` // string — aynı sebep
 	Log        string `json:"log"`         // hex-encoded raw replay bytes
 	Out        string `json:"out"`         // result JSON path (written by Godot)
@@ -221,7 +222,7 @@ func nextJobID(seed int64) string {
 }
 
 // SimulateReplayFast — persistent worker pool kullanır, SimulateReplay ile aynı imza
-func SimulateReplayFast(replayLogB64 string, seed int64, charIdx int, timeoutSec int, playerSeedOpt ...int64) (*GodotReplayResult, error) {
+func SimulateReplayFast(replayLogB64 string, seed int64, charIdx int, gyroActive bool, timeoutSec int, playerSeedOpt ...int64) (*GodotReplayResult, error) {
 	var playerSeed int64
 	if len(playerSeedOpt) > 0 {
 		playerSeed = playerSeedOpt[0]
@@ -238,6 +239,7 @@ func SimulateReplayFast(replayLogB64 string, seed int64, charIdx int, timeoutSec
 	job := workerJob{
 		Seed:       fmt.Sprintf("%d", seed),
 		Char:       charIdx,
+		GyroActive: gyroActive,
 		PlayerSeed: fmt.Sprintf("%d", playerSeed),
 		Log:        hex.EncodeToString(raw),
 		Out:        outFile,
@@ -291,7 +293,7 @@ func SimulateReplayFast(replayLogB64 string, seed int64, charIdx int, timeoutSec
 // SimulateReplayWithRetry — worker bizim hatamızdan fail edebilir (crash, restart, timeout).
 // Max 3 deneme (ilk + 2 retry). Hepsi başarısız olursa nil döner → caller StateReplayFailed yazar.
 // Backoff: 3s → 6s
-func SimulateReplayWithRetry(sessionID, replayLogB64 string, seed int64, charIdx int, playerSeed int64, ticks int) *GodotReplayResult {
+func SimulateReplayWithRetry(sessionID, replayLogB64 string, seed int64, charIdx int, gyroActive bool, playerSeed int64, ticks int) *GodotReplayResult {
 	sid8 := sessionID
 	if len(sid8) > 8 {
 		sid8 = sid8[:8]
@@ -304,7 +306,7 @@ func SimulateReplayWithRetry(sessionID, replayLogB64 string, seed int64, charIdx
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		attemptStart := time.Now()
-		result, err := SimulateReplayFast(replayLogB64, seed, charIdx, timeoutSec, playerSeed)
+		result, err := SimulateReplayFast(replayLogB64, seed, charIdx, gyroActive, timeoutSec, playerSeed)
 		if err == nil {
 			if attempt > 1 {
 				log.Printf("[REPLAY_RETRY] success session=%s attempt=%d elapsed=%.1fs",

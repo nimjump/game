@@ -44,6 +44,13 @@ type GodotReplayResult struct {
 	QuestKillsNoDmg    int  `json:"kills_no_dmg"` // kills while no damage taken
 	QuestHighestY      int  `json:"highest_y"`    // max altitude (game units)
 	QuestHasResult     bool `json:"quest_has_result"` // true if [QUEST_RESULT] line was parsed
+
+	// Checkpoints — diagnostic-only checkpoint log the headless server wrote
+	// into the --out JSON (see GameManager.gd _ckpt_log / Main.gd
+	// _write_replay_result). Same shape as the client's own "ckpt" submit
+	// field: [{"t":tick,"s":score,"x":..,"y":..,"vy":..,"rng":".."}, ...].
+	// Never used for scoring — only for LogCheckpointDivergence below.
+	Checkpoints json.RawMessage `json:"ckpt,omitempty"`
 }
 
 // replayBinaryPath — cikartilmis binary yolunu onbellekte tutar
@@ -425,7 +432,7 @@ func ReplayBinaryStatus() map[string]interface{} {
 }
 
 // SimulateReplay — simulate replay log with Godot headless and return server score
-func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int, playerSeedOpt ...int64) (*GodotReplayResult, error) {
+func SimulateReplay(replayLogB64 string, seed int64, charIdx int, gyroActive bool, timeoutSec int, playerSeedOpt ...int64) (*GodotReplayResult, error) {
 	var playerSeed int64
 	if len(playerSeedOpt) > 0 {
 		playerSeed = playerSeedOpt[0]
@@ -504,6 +511,12 @@ func SimulateReplay(replayLogB64 string, seed int64, charIdx int, timeoutSec int
 		"--log", logFile,
 		"--out", outFile,
 		"--player-seed", strconv.FormatInt(playerSeed, 10),
+	}
+	if gyroActive {
+		// gyro-only movement ramp — see Player.gd's set_gyro_control_active
+		// doc comment. Read on the Godot side in _run_server_replay()
+		// (Main.gd) alongside the other --flags above.
+		args = append(args, "--gyro")
 	}
 
 	// godotBinary() is commonly a path relative to wherever the Go process
@@ -719,6 +732,131 @@ func SummaryLine(result *GodotReplayResult, clientScore int) string {
 	}
 	return fmt.Sprintf("server_score=%d client_score=%d ticks=%d err=%q",
 		result.ServerScore, clientScore, result.Ticks, result.Error)
+}
+
+// checkpointEntry — one decoded entry from a client or server "ckpt" array.
+// Loosely typed (map, not a strict struct) on purpose: this is best-effort
+// diagnostic logging bolted onto the live scoring path, and it must never be
+// able to crash or block a real submission just because a field is missing,
+// a client is on an older version that doesn't send checkpoints at all, or a
+// future format change adds/removes a key. Any parse problem is logged and
+// swallowed, never propagated.
+type checkpointEntry = map[string]interface{}
+
+// LogCheckpointDivergence — best-effort forensic diff between the client's
+// own recorded checkpoint log and the server replay's checkpoint log for an
+// ALREADY-FLAGGED session. Finds the first tick where they disagree on
+// score/position/velocity/rng-state and logs it prominently, so a rare
+// client-vs-server (WASM vs native) desync leaves an actual diagnostic trail
+// instead of just the aggregate score-diff percentage from ParseFlagReason.
+//
+// This function must NEVER be able to affect the flagging decision, crash
+// the calling goroutine, or block — it only reads already-computed data and
+// prints a log line. Wrapped in recover() as an extra safety net since it
+// runs inline in the live /submit verification path.
+func LogCheckpointDivergence(sessionID string, clientCkptRaw json.RawMessage, result *GodotReplayResult) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[CKPT_DIFF] session=%s recovered panic: %v", sessionID, r)
+		}
+	}()
+
+	if len(clientCkptRaw) == 0 || result == nil || len(result.Checkpoints) == 0 {
+		log.Printf("[CKPT_DIFF] session=%s no checkpoints to compare (client=%d bytes, server=%d bytes) — likely an old client build or a very short run",
+			sessionID, len(clientCkptRaw), len(result.GetCheckpointsRaw()))
+		return
+	}
+
+	var clientCkpt, serverCkpt []checkpointEntry
+	if err := json.Unmarshal(clientCkptRaw, &clientCkpt); err != nil {
+		log.Printf("[CKPT_DIFF] session=%s client checkpoint parse error: %v", sessionID, err)
+		return
+	}
+	if err := json.Unmarshal(result.Checkpoints, &serverCkpt); err != nil {
+		log.Printf("[CKPT_DIFF] session=%s server checkpoint parse error: %v", sessionID, err)
+		return
+	}
+
+	// Index server checkpoints by tick for O(1) lookup regardless of ordering.
+	serverByTick := make(map[int64]checkpointEntry, len(serverCkpt))
+	for _, e := range serverCkpt {
+		if t, ok := ckptInt(e["t"]); ok {
+			serverByTick[t] = e
+		}
+	}
+
+	firstDivergeTick := int64(-1)
+	var firstDivergeDetail string
+	matched := 0
+	for _, ce := range clientCkpt {
+		t, ok := ckptInt(ce["t"])
+		if !ok {
+			continue
+		}
+		se, found := serverByTick[t]
+		if !found {
+			continue // client outran the server's decoded log or vice versa — not itself a divergence
+		}
+		matched++
+		if diff := ckptFieldDiff(ce, se); diff != "" {
+			firstDivergeTick = t
+			firstDivergeDetail = diff
+			break
+		}
+	}
+
+	if firstDivergeTick >= 0 {
+		log.Printf("[CKPT_DIFF] session=%s FIRST DIVERGENCE at tick=%d: %s (checked %d/%d matching checkpoints)",
+			sessionID, firstDivergeTick, firstDivergeDetail, matched, len(clientCkpt))
+	} else if matched == 0 {
+		log.Printf("[CKPT_DIFF] session=%s no overlapping checkpoint ticks between client(%d) and server(%d) — cannot compare",
+			sessionID, len(clientCkpt), len(serverCkpt))
+	} else {
+		log.Printf("[CKPT_DIFF] session=%s all %d matching checkpoints agree — divergence (if real) happened between checkpoints, not caught by the %d-tick sampling interval",
+			sessionID, matched, matched)
+	}
+}
+
+// GetCheckpointsRaw — nil-safe accessor, used only for the byte-length log above.
+func (r *GodotReplayResult) GetCheckpointsRaw() json.RawMessage {
+	if r == nil {
+		return nil
+	}
+	return r.Checkpoints
+}
+
+// ckptInt — best-effort numeric extraction; JSON numbers decode as float64
+// via interface{}, so this normalizes that (and tolerates a stringified int).
+func ckptInt(v interface{}) (int64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case string:
+		iv, err := strconv.ParseInt(n, 10, 64)
+		return iv, err == nil
+	default:
+		return 0, false
+	}
+}
+
+// ckptFieldDiff — compares the gameplay-relevant fields of two checkpoint
+// entries (score, position, velocity, rng state). rng ("rng") is compared as
+// a string since it's a full 64-bit value sent as a string to avoid float64
+// precision loss; the rest are compared as integers. Returns "" if they agree.
+func ckptFieldDiff(a, b checkpointEntry) string {
+	for _, field := range []string{"s", "x", "y", "vy"} {
+		av, aok := ckptInt(a[field])
+		bv, bok := ckptInt(b[field])
+		if aok && bok && av != bv {
+			return fmt.Sprintf("field=%s client=%d server=%d", field, av, bv)
+		}
+	}
+	as, aok := a["rng"].(string)
+	bs, bok := b["rng"].(string)
+	if aok && bok && as != bs {
+		return fmt.Sprintf("field=rng client=%s server=%s", as, bs)
+	}
+	return ""
 }
 
 // ParseFlagReason — compares client and server score; flags if outside tolerance.

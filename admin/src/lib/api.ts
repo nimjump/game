@@ -23,7 +23,18 @@ export interface Session {
   server_score: number;
   ticks: number;
   char: number;
-  log?: string;
+  // Was gyro tilt control active during this match (drives the gyro-only
+  // movement ramp — see game/scripts/Player.gd's set_gyro_control_active
+  // doc comment). false/missing = tap control (instant movement, no ramp).
+  gyro_active?: boolean;
+  // BUG FIX: this used to be named `log`, but handleReplay in
+  // backend/handlers/replay_handlers.go has always sent the RLE-encoded
+  // input log back under the key "replay_log" (matching the game client's
+  // own field name for it) — never "log". Session.log was therefore
+  // always undefined here, silently, which is exactly why the replay
+  // detail page's Frame Timing / Input Heatmap charts always rendered
+  // "No log data" even for sessions that genuinely had a log recorded.
+  replay_log?: string;
   flagged: boolean;
   reason?: string;
   replay_error?: string;
@@ -128,7 +139,14 @@ export async function fetchAdminSessions(state?: string, player?: string): Promi
 }
 
 export async function fetchSession(id: string): Promise<Session | null> {
-  const r = await fetch(`${BASE}/backend/replay/${id}`, { cache: "no-store" });
+  // /backend/replay/{id} is the PUBLIC route — it requires the app_ts/app_sig
+  // HMAC signature that only the compiled game client can produce (see
+  // backend/handlers/appsig.go). The admin panel has no way to produce that
+  // signature and isn't supposed to — it authenticates via the admin session
+  // cookie instead, so this hits the admin-only mirror route
+  // (/backend/admin/replay/{id}, same handler, gated by requireAdminSession)
+  // which corsMiddleware exempts from the app_sig check entirely.
+  const r = await fetch(`${BASE}/backend/admin/replay/${id}`, { cache: "no-store" });
   if (!r.ok) return null;
   const text = await r.text();
   const fixed = text.replace(/"seed"\s*:\s*(\d+)/g, '"seed": "$1"');
@@ -255,10 +273,37 @@ export interface PlayerProfileSession {
   has_log: boolean;
 }
 
+export interface PlayerStreak {
+  count: number;        // consecutive days including today (0 if streak is dead)
+  last_day: string;      // "2026-07-08" (UTC+3) — last day actually counted
+  longest_run: number;   // best streak ever reached
+}
+
+export interface PlayerCosmetics {
+  owned: string[];               // item IDs the player has purchased
+  equipped: Record<string, string>; // slot -> item_id ("hat"/"glasses"/"outfit"/"shoes")
+}
+
+// Matches ipOut in backend/handlers/admin_player.go (backed by
+// game.PlayerIPRecord + game.IPGeo — see backend/game/player_ip.go).
+// country_code is "" if not yet/never resolvable, "XX" for
+// private/loopback/LAN addresses (dev/testing traffic).
+export interface PlayerIPEntry {
+  ip: string;
+  country_code: string;
+  country_name: string;
+  first_seen: number;
+  last_seen: number;
+  count: number;
+}
+
 export interface PlayerProfile {
   player_id: string;
   nickname: string;
   cooldown_end: number;
+  streak: PlayerStreak;
+  cosmetics: PlayerCosmetics;
+  ips: PlayerIPEntry[];
   stats: {
     best_score: number;
     total_games: number;
@@ -432,6 +477,7 @@ export interface RegisteredPlayer {
   weekly_rank: number; // 0 = not ranked this period
   daily_cap: DailyCapStats;
   total_nim_received: number; // lifetime, all "sent" rewards
+  streak: number; // consecutive days including today (0 if streak is dead)
 }
 
 export interface PlayersListResponse {
@@ -445,17 +491,56 @@ export async function fetchPlayersList(limit = 50, offset = 0): Promise<PlayersL
   return r.json();
 }
 
-// ── App config: leaderboard toggles, update mode, replay version ───────────────
+// ── Streak tab: aggregate + per-player breakdown ────────────────────────────
+
+export interface StreakPlayerRow {
+  player_id: string;
+  nickname: string;
+  streak_day: number;   // 0 = streak has lapsed
+  longest_run: number;
+  total_claimed_nim: number;
+  claims_count: number;
+  last_claim_at?: number;
+}
+
+export interface StreaksResponse {
+  total_nim_distributed: number;
+  total_claims: number;
+  unique_claimers: number;
+  active_streaks: number;
+  total: number;
+  offset: number;
+  limit: number;
+  players: StreakPlayerRow[];
+}
+
+export async function fetchStreaks(limit = 50, offset = 0): Promise<StreaksResponse> {
+  const r = await fetch(`${BASE}/backend/admin/streaks?limit=${limit}&offset=${offset}`, { cache: "no-store" });
+  if (!r.ok) throw new Error("streaks fetch failed");
+  return r.json();
+}
+
+// ── App config: leaderboard toggles, update lock ────────────────────────────
 
 export interface AppConfig {
   daily_leaderboard_enabled: boolean;
   weekly_leaderboard_enabled: boolean;
-  update_mode: "off" | "force" | "normal";
+  // update_active — true = new games are currently locked/blocked. Set via
+  // setUpdateActive() below, not through saveAppConfig (same reason as
+  // before: keeps the one on/off switch as a single dedicated route).
   update_active: boolean;
-  update_scheduled_week?: string;
-  replay_version: number;
   daily_earn_cap_nim?: number;
   coin_nim_rate?: number;
+  // Streak claim reward knobs — reward(day) = min(base + extra*(day-1), max).
+  // See backend/game/streak_reward.go. undefined = not configured yet
+  // (server falls back to its own hardcoded defaults).
+  streak_reward_base_nim?: number;
+  streak_reward_extra_per_day_nim?: number;
+  streak_reward_max_nim?: number;
+  // IP anti-multi-accounting guard — max distinct accounts per IP per day
+  // that can claim ANY reward (streak, quest, in-game coin). See
+  // backend/game/ip_reward_guard.go.
+  max_reward_accounts_per_ip?: number;
 }
 
 export async function fetchAppConfig(): Promise<AppConfig> {
@@ -467,9 +552,12 @@ export async function fetchAppConfig(): Promise<AppConfig> {
 export async function saveAppConfig(patch: Partial<{
   daily_leaderboard_enabled: boolean;
   weekly_leaderboard_enabled: boolean;
-  replay_version: number;
   daily_earn_cap_nim: number;
   coin_nim_rate: number;
+  streak_reward_base_nim: number;
+  streak_reward_extra_per_day_nim: number;
+  streak_reward_max_nim: number;
+  max_reward_accounts_per_ip: number;
 }>): Promise<AppConfig> {
   const r = await fetch(`${BASE}/backend/admin/config`, {
     method: "POST",
@@ -537,7 +625,13 @@ export interface LeaderboardConfig {
 }
 
 export async function fetchLeaderboardPrizes(): Promise<LeaderboardConfig> {
-  const r = await fetch(`${BASE}/backend/leaderboard/prizes`, { cache: "no-store" });
+  // /backend/leaderboard/prizes is the PUBLIC route, gated by the game
+  // client's app_ts/app_sig signature (appsig.go) — the admin panel can't
+  // produce that, so this hits the admin-session-gated mirror instead (see
+  // server.go). Was silently failing before: PrizesCard bails out with
+  // `if (!cfg) return null`, so the whole daily/weekly payout editor just
+  // never appeared, with no visible error.
+  const r = await fetch(`${BASE}/backend/admin/prizes`, { cache: "no-store" });
   if (!r.ok) throw new Error("prizes fetch failed");
   return r.json();
 }
@@ -551,19 +645,17 @@ export async function saveLeaderboardPrizes(cfg: LeaderboardConfig): Promise<voi
   if (!r.ok) throw new Error("prizes save failed");
 }
 
-export async function setUpdateMode(mode: "off" | "force" | "normal"): Promise<AppConfig> {
-  const r = await fetch(`${BASE}/backend/admin/update-mode`, {
+// setUpdateActive — the game-update lock's only two states now: pass true
+// to "Activate" (block new games from starting) or false to "Deactivate"
+// (resume normal play). Replaces the old 3-state setUpdateMode/completeUpdate
+// pair — see backend/game/appconfig.go's package doc comment for why.
+export async function setUpdateActive(active: boolean): Promise<AppConfig> {
+  const r = await fetch(`${BASE}/backend/admin/update-active`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ mode }),
+    body: JSON.stringify({ active }),
   });
-  if (!r.ok) throw new Error("update-mode failed");
-  return r.json();
-}
-
-export async function completeUpdate(): Promise<AppConfig> {
-  const r = await fetch(`${BASE}/backend/admin/update-complete`, { method: "POST" });
-  if (!r.ok) throw new Error("update-complete failed");
+  if (!r.ok) throw new Error("update-active failed");
   return r.json();
 }
 
@@ -665,10 +757,12 @@ export function failedReplayDownloadUrl(id: string): string {
   return `${BASE}/backend/admin/failed-replay-archive/${encodeURIComponent(id)}/download`;
 }
 
-export async function uploadReplayBinary(file: File, stage = false): Promise<{ ok: boolean; file: string; size: number; dir: string; staged: boolean }> {
+// uploadReplayBinary — always activates immediately now (the old "stage,
+// activate later via a scheduled Deploy job" path was removed along with
+// the Deploy tab — see backend/game/appconfig.go's package doc comment).
+export async function uploadReplayBinary(file: File): Promise<{ ok: boolean; file: string; size: number; dir: string }> {
   const form = new FormData();
   form.append("file", file);
-  if (stage) form.append("stage", "1");
   const r = await fetch(`${BASE}/backend/admin/replay-binary`, { method: "POST", body: form });
   if (!r.ok) {
     let msg = "upload failed";
@@ -676,70 +770,6 @@ export async function uploadReplayBinary(file: File, stage = false): Promise<{ o
     throw new Error(msg);
   }
   return r.json();
-}
-
-// ── Deploy tab: scheduled Cloudflare Pages / replay binary jobs ─────────────────
-
-export interface DeployStatus {
-  cloudflare_configured: boolean;
-  cloudflare_project: string;
-  cloudflare_export_dir: string;
-  cloudflare_branch: string;
-  staged_binary: string;
-  has_staged_binary: boolean;
-}
-
-export async function fetchDeployStatus(): Promise<DeployStatus> {
-  const r = await fetch(`${BASE}/backend/admin/deploy/status`, { cache: "no-store" });
-  if (!r.ok) throw new Error("deploy status fetch failed");
-  return r.json();
-}
-
-export type DeployTrigger = "now" | "at" | "daily_lb_end" | "weekly_lb_end";
-
-export interface DeployJob {
-  id: string;
-  trigger: DeployTrigger;
-  run_at: number;
-  activate_replay_binary: boolean;
-  deploy_cloudflare: boolean;
-  new_replay_version?: number;
-  status: "pending" | "running" | "done" | "failed" | "cancelled";
-  log?: string[];
-  error?: string;
-  created_at: number;
-  started_at?: number;
-  finished_at?: number;
-}
-
-export async function scheduleDeployJob(params: {
-  trigger: DeployTrigger;
-  at_unix?: number;
-  activate_replay_binary: boolean;
-  deploy_cloudflare: boolean;
-  new_replay_version?: number;
-}): Promise<DeployJob> {
-  const r = await fetch(`${BASE}/backend/admin/deploy/schedule`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params),
-  });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || "schedule failed");
-  return data;
-}
-
-export async function fetchDeployJobs(): Promise<DeployJob[]> {
-  const r = await fetch(`${BASE}/backend/admin/deploy/jobs`, { cache: "no-store" });
-  if (!r.ok) throw new Error("deploy jobs fetch failed");
-  const data = await r.json();
-  return data.jobs ?? [];
-}
-
-export async function cancelDeployJob(id: string): Promise<void> {
-  const r = await fetch(`${BASE}/backend/admin/deploy/jobs/${encodeURIComponent(id)}/cancel`, { method: "POST" });
-  const data = await r.json();
-  if (!r.ok) throw new Error(data.error || "cancel failed");
 }
 
 // ── Golden replays: determinism regression tests (backend/game/golden_replay.go) ──

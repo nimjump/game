@@ -6,42 +6,41 @@ package game
 //
 // Covers:
 //   - daily / weekly leaderboard on-off switches
-//   - game update mode (force / normal) + whether new games are blocked
-//   - replay version — must match the client's submitted version or the
-//     replay is rejected (see handleSubmit in handlers/server.go)
+//   - game update lock — a simple on/off switch that blocks new games from
+//     starting (used while pushing a new client build); see SetUpdateActive
+//
+// REMOVED (on request): the old 3-state "update mode" (off/force/normal,
+// with "normal" deferring the block until the current weekly leaderboard
+// period ended) collapsed down to a plain on/off switch — the game client
+// only ever read the derived `update_active` boolean anyway (see Main.gd's
+// _check_server_status), never `update_mode`/`update_scheduled_week`, so
+// this simplification needed zero client-side changes. Also removed: the
+// "replay version" gate (AppConfig.ReplayVersion / client_version submit
+// check in handlers/server.go) and the whole Deploy-jobs feature
+// (deploy_job.go, cloudflare_deploy.go, admin_deploy.go, replay_staging.go)
+// that used to bundle "activate replay binary + deploy to Cloudflare Pages
+// + bump replay version + force update mode" into one scheduled job.
 
 import (
 	"encoding/json"
 	"log"
 	"os"
 	"strconv"
-	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
 )
 
 const keyAppConfig = "cfg:app"
 
-// Update modes
-const (
-	UpdateModeOff    = "off"    // normal operation
-	UpdateModeForce  = "force"  // block new games immediately
-	UpdateModeNormal = "normal" // block new games once the current weekly leaderboard period ends
-)
-
 type AppConfig struct {
 	DailyLeaderboardEnabled  bool `json:"daily_leaderboard_enabled"`
 	WeeklyLeaderboardEnabled bool `json:"weekly_leaderboard_enabled"`
 
-	UpdateMode   string `json:"update_mode"`   // "off" | "force" | "normal"
-	UpdateActive bool   `json:"update_active"` // true = new games are currently blocked
-
-	// UpdateScheduledWeek — the weekly period key (e.g. "2026-W26") that was
-	// current when "normal" mode was requested. When CurrentPeriods() rolls
-	// past this week, UpdateActive flips to true automatically.
-	UpdateScheduledWeek string `json:"update_scheduled_week,omitempty"`
-
-	ReplayVersion int `json:"replay_version"` // client must submit a matching client_version
+	// UpdateActive — true = new games are currently blocked ("locked").
+	// Toggled straight on/off from the admin panel (SystemTab) via
+	// SetUpdateActive below — see the package doc comment above for why
+	// this used to be a 3-state mode and no longer is.
+	UpdateActive bool `json:"update_active"`
 
 	// DailyEarnCapNIM — admin-editable daily in-game-coin earn cap (NIM).
 	// 0 means "not set yet" → falls back to DAILY_EARN_CAP_NIM env var or the
@@ -71,6 +70,41 @@ type AppConfig struct {
 	// falls back to COIN_NIM_RATE env var or the 1.0 NIM/coin default
 	// (see CoinNIMRate() in daily_earn_cap.go).
 	CoinNIMRate float64 `json:"coin_nim_rate,omitempty"`
+
+	// ── Streak claim reward (see game/streak_reward.go) ─────────────────────
+	// Player must actively CLAIM this from the client (like a daily quest —
+	// not auto-paid on login). Formula: min(Base + ExtraPerDay*(streakDay-1),
+	// Max). All three are *pointers* (unlike DailyEarnCapNIM/CoinNIMRate
+	// above) because 0 is a legitimate, meaningful admin choice here — "turn
+	// this off" — not just "not configured yet". nil → env var fallback →
+	// hardcoded default; non-nil (including a pointer to 0.0) always wins.
+
+	// StreakRewardBaseNIM — reward on day 1 of a streak. nil → env
+	// STREAK_REWARD_BASE_NIM → 0.2 NIM default.
+	StreakRewardBaseNIM *float64 `json:"streak_reward_base_nim,omitempty"`
+
+	// StreakRewardExtraPerDayNIM — how much MORE the reward grows per
+	// additional consecutive day (day 2 = Base + 1*Extra, day 3 = Base +
+	// 2*Extra, ...), before the Max cap kicks in. nil → env
+	// STREAK_REWARD_EXTRA_PER_DAY_NIM → 0.5 NIM default.
+	StreakRewardExtraPerDayNIM *float64 `json:"streak_reward_extra_per_day_nim,omitempty"`
+
+	// StreakRewardMaxNIM — hard ceiling on the claimable amount for any
+	// single day, no matter how long the streak — keeps this from becoming
+	// an unbounded payout for very long streaks. nil → env
+	// STREAK_REWARD_MAX_NIM → 10.0 NIM default.
+	StreakRewardMaxNIM *float64 `json:"streak_reward_max_nim,omitempty"`
+
+	// MaxRewardAccountsPerIP — anti-multi-accounting guard (see
+	// game/ip_reward_guard.go): the same IP can only receive a NIM reward
+	// (streak claim today, initially — see that file's doc comment for how
+	// to extend it to other reward paths) for at most this many DISTINCT
+	// player accounts per UTC+3 day. A 6th/7th/etc alt account from the same
+	// IP that day is blocked with a clear reason, not silently dropped. nil
+	// → env MAX_REWARD_ACCOUNTS_PER_IP → 2 accounts default. Minimum
+	// enforced at 1 (0 would mean "nobody from any IP ever gets paid",
+	// almost certainly not what an admin setting this means).
+	MaxRewardAccountsPerIP *int `json:"max_reward_accounts_per_ip,omitempty"`
 }
 
 func envBoolDefault(key string, def bool) bool {
@@ -83,12 +117,6 @@ func envBoolDefault(key string, def bool) bool {
 
 // defaultAppConfig — used only when nothing has ever been saved to DB yet.
 func defaultAppConfig() AppConfig {
-	replayVer := 1
-	if v := os.Getenv("REPLAY_VERSION"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			replayVer = n
-		}
-	}
 	dailyCap := 0.0 // 0 = unset, DailyCapNIM() falls back to env/default
 	if v := os.Getenv("DAILY_EARN_CAP_NIM"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
@@ -101,6 +129,32 @@ func defaultAppConfig() AppConfig {
 			coinRate = f
 		}
 	}
+	// Streak reward fields stay nil unless an env var is actually set —
+	// leaving them nil (not a pointer to 0.0) means the accessor methods in
+	// streak_reward.go fall through to their hardcoded defaults, exactly
+	// like the "not configured yet" case is supposed to.
+	var streakBase, streakExtra, streakMax *float64
+	if v := os.Getenv("STREAK_REWARD_BASE_NIM"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			streakBase = &f
+		}
+	}
+	if v := os.Getenv("STREAK_REWARD_EXTRA_PER_DAY_NIM"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			streakExtra = &f
+		}
+	}
+	if v := os.Getenv("STREAK_REWARD_MAX_NIM"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			streakMax = &f
+		}
+	}
+	var maxAccountsPerIP *int
+	if v := os.Getenv("MAX_REWARD_ACCOUNTS_PER_IP"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 {
+			maxAccountsPerIP = &n
+		}
+	}
 
 	return AppConfig{
 		// Weekly leaderboard starts OFF on purpose (temporarily disabled —
@@ -108,11 +162,13 @@ func defaultAppConfig() AppConfig {
 		// via DAILY_LEADERBOARD_ENABLED / WEEKLY_LEADERBOARD_ENABLED env vars.
 		DailyLeaderboardEnabled:  envBoolDefault("DAILY_LEADERBOARD_ENABLED", true),
 		WeeklyLeaderboardEnabled: envBoolDefault("WEEKLY_LEADERBOARD_ENABLED", false),
-		UpdateMode:               UpdateModeOff,
 		UpdateActive:             false,
-		ReplayVersion:            replayVer,
-		DailyEarnCapNIM:          dailyCap,
-		CoinNIMRate:              coinRate,
+		DailyEarnCapNIM:            dailyCap,
+		CoinNIMRate:                coinRate,
+		StreakRewardBaseNIM:        streakBase,
+		StreakRewardExtraPerDayNIM: streakExtra,
+		StreakRewardMaxNIM:         streakMax,
+		MaxRewardAccountsPerIP:     maxAccountsPerIP,
 	}
 }
 
@@ -140,60 +196,16 @@ func (s *Store) SaveAppConfig(cfg AppConfig) error {
 	})
 }
 
-// SetUpdateMode — admin-triggered. "force" blocks new games right away.
-// "normal" waits until the current weekly leaderboard period ends. "off"
-// clears everything (same as CompleteUpdate).
-func (s *Store) SetUpdateMode(mode string) (AppConfig, error) {
+// SetUpdateActive — admin-triggered on/off switch. true blocks new games
+// from starting (see Main.gd's _check_server_status/_do_start_game); false
+// resumes normal play. Replaces the old 3-state "update mode" — see the
+// package doc comment above for why that got collapsed to this.
+func (s *Store) SetUpdateActive(active bool) (AppConfig, error) {
 	cfg := s.GetAppConfig()
-	cfg.UpdateMode = mode
-	switch mode {
-	case UpdateModeForce:
-		cfg.UpdateActive = true
-		cfg.UpdateScheduledWeek = ""
-	case UpdateModeNormal:
-		cfg.UpdateActive = false
-		_, weekly := CurrentPeriods()
-		cfg.UpdateScheduledWeek = weekly
-	default: // "off"
-		cfg.UpdateMode = UpdateModeOff
-		cfg.UpdateActive = false
-		cfg.UpdateScheduledWeek = ""
-	}
+	cfg.UpdateActive = active
 	if err := s.SaveAppConfig(cfg); err != nil {
 		return cfg, err
 	}
-	log.Printf("[UPDATE_MODE] set mode=%s active=%v scheduled_week=%s", cfg.UpdateMode, cfg.UpdateActive, cfg.UpdateScheduledWeek)
+	log.Printf("[UPDATE] active=%v", cfg.UpdateActive)
 	return cfg, nil
-}
-
-// CompleteUpdate — admin-triggered, resumes normal play after an update
-// has been pushed (new client build + new replay binary both live).
-func (s *Store) CompleteUpdate() (AppConfig, error) {
-	return s.SetUpdateMode(UpdateModeOff)
-}
-
-// StartUpdateScheduler — background loop. Every minute, checks whether a
-// "normal" mode update is waiting for the weekly leaderboard period to
-// roll over; if it has, flips UpdateActive on automatically.
-func (s *Store) StartUpdateScheduler() {
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		defer ticker.Stop()
-		for range ticker.C {
-			cfg := s.GetAppConfig()
-			if cfg.UpdateMode != UpdateModeNormal || cfg.UpdateActive || cfg.UpdateScheduledWeek == "" {
-				continue
-			}
-			_, weekly := CurrentPeriods()
-			if weekly != cfg.UpdateScheduledWeek {
-				cfg.UpdateActive = true
-				if err := s.SaveAppConfig(cfg); err != nil {
-					log.Printf("[UPDATE_MODE] auto-activate save failed: %v", err)
-					continue
-				}
-				log.Printf("[UPDATE_MODE] weekly period rolled over (%s -> %s) — update now ACTIVE, new games blocked",
-					cfg.UpdateScheduledWeek, weekly)
-			}
-		}
-	}()
 }

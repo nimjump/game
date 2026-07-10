@@ -1,12 +1,10 @@
-# BunnyJump Admin Panel
+# NimJump Admin Panel
 
-## Kurulum
+See the root `README.md`, section 7 ("Running the Admin Panel").
 
 ```bash
-cd admin
-npm install
-npm run dev
-# → http://localhost:3001
+cd backend
+go run .
 ```
 
-Backend'in localhost:8080'de çalışması gerekiyor.
+Open `http://localhost:8080/admin`.

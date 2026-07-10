@@ -1,8 +1,8 @@
 package handlers
 
 // admin_system.go — admin endpoints for:
-//   - daily/weekly leaderboard on/off + replay version config
-//   - game update mode (force / normal) + completing an update
+//   - daily/weekly leaderboard on/off config
+//   - game update lock (simple on/off — see handleAdminSetUpdateActive)
 //   - "Remove All Replays" (clears replay logs, keeps scores/stats)
 //   - uploading a new replay verifier binary (replay.zip / replay.exe)
 
@@ -20,22 +20,34 @@ import (
 )
 
 // GET /backend/admin/config — current app config (leaderboard toggles,
-// update mode, replay version).
+// update lock state, etc).
 func (s *Server) handleAdminGetConfig(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, s.Store.GetAppConfig())
 }
 
-// POST /backend/admin/config — update leaderboard toggles / replay version.
-// Body: {"daily_leaderboard_enabled":true,"weekly_leaderboard_enabled":false,"replay_version":2}
-// Update-mode fields are intentionally NOT settable here — use
-// /backend/admin/update-mode so the scheduling logic stays consistent.
+// POST /backend/admin/config — update leaderboard toggles / earn caps.
+// Body: {"daily_leaderboard_enabled":true,"weekly_leaderboard_enabled":false}
+// The update-lock field is intentionally NOT settable here — use
+// /backend/admin/update-active instead (see handleAdminSetUpdateActive).
 func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	var req struct {
 		DailyLeaderboardEnabled  *bool    `json:"daily_leaderboard_enabled"`
 		WeeklyLeaderboardEnabled *bool    `json:"weekly_leaderboard_enabled"`
-		ReplayVersion            *int     `json:"replay_version"`
 		DailyEarnCapNIM          *float64 `json:"daily_earn_cap_nim"`
 		CoinNIMRate              *float64 `json:"coin_nim_rate"`
+		// Streak claim reward knobs — see game/streak_reward.go.
+		// reward(day) = min(Base + ExtraPerDay*(day-1), Max).
+		// 0 IS a valid, meaningful value for all three (Base/Extra=0 turns
+		// a lever off; Max=0 would zero every claim out) unlike
+		// DailyEarnCapNIM/CoinNIMRate above, so this uses >= 0 not > 0 — an
+		// admin explicitly setting any of these to 0 must actually take
+		// effect, not be silently ignored.
+		StreakRewardBaseNIM        *float64 `json:"streak_reward_base_nim"`
+		StreakRewardExtraPerDayNIM *float64 `json:"streak_reward_extra_per_day_nim"`
+		StreakRewardMaxNIM         *float64 `json:"streak_reward_max_nim"`
+		// MaxRewardAccountsPerIP — see game/ip_reward_guard.go. Minimum 1
+		// enforced (0 would mean "block every claim from every IP").
+		MaxRewardAccountsPerIP *int `json:"max_reward_accounts_per_ip"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
@@ -48,21 +60,31 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	if req.WeeklyLeaderboardEnabled != nil {
 		cfg.WeeklyLeaderboardEnabled = *req.WeeklyLeaderboardEnabled
 	}
-	if req.ReplayVersion != nil && *req.ReplayVersion > 0 {
-		cfg.ReplayVersion = *req.ReplayVersion
-	}
 	if req.DailyEarnCapNIM != nil && *req.DailyEarnCapNIM > 0 {
 		cfg.DailyEarnCapNIM = *req.DailyEarnCapNIM
 	}
 	if req.CoinNIMRate != nil && *req.CoinNIMRate > 0 {
 		cfg.CoinNIMRate = *req.CoinNIMRate
 	}
+	if req.StreakRewardBaseNIM != nil && *req.StreakRewardBaseNIM >= 0 {
+		cfg.StreakRewardBaseNIM = req.StreakRewardBaseNIM
+	}
+	if req.StreakRewardExtraPerDayNIM != nil && *req.StreakRewardExtraPerDayNIM >= 0 {
+		cfg.StreakRewardExtraPerDayNIM = req.StreakRewardExtraPerDayNIM
+	}
+	if req.StreakRewardMaxNIM != nil && *req.StreakRewardMaxNIM >= 0 {
+		cfg.StreakRewardMaxNIM = req.StreakRewardMaxNIM
+	}
+	if req.MaxRewardAccountsPerIP != nil && *req.MaxRewardAccountsPerIP >= 1 {
+		cfg.MaxRewardAccountsPerIP = req.MaxRewardAccountsPerIP
+	}
 	if err := s.Store.SaveAppConfig(cfg); err != nil {
 		writeErr(ctx, 500, "save_error")
 		return
 	}
-	log.Printf("[ADMIN] config updated: daily=%v weekly=%v replay_version=%d daily_earn_cap_nim=%.4f coin_nim_rate=%.6f",
-		cfg.DailyLeaderboardEnabled, cfg.WeeklyLeaderboardEnabled, cfg.ReplayVersion, cfg.DailyEarnCapNIM, cfg.CoinNIMRate)
+	log.Printf("[ADMIN] config updated: daily=%v weekly=%v daily_earn_cap_nim=%.4f coin_nim_rate=%.6f streak_base=%v streak_extra=%v streak_max=%v max_accounts_per_ip=%v",
+		cfg.DailyLeaderboardEnabled, cfg.WeeklyLeaderboardEnabled, cfg.DailyEarnCapNIM, cfg.CoinNIMRate,
+		cfg.StreakRewardBaseNIM, cfg.StreakRewardExtraPerDayNIM, cfg.StreakRewardMaxNIM, cfg.MaxRewardAccountsPerIP)
 	writeJSON(ctx, 200, cfg)
 }
 
@@ -242,37 +264,24 @@ func (s *Server) handleAdminSetQuestTarget(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, map[string]any{"quests": s.Store.QuestPoolWithOverrides()})
 }
 
-// POST /backend/admin/update-mode — body: {"mode":"off"|"force"|"normal"}
-func (s *Server) handleAdminSetUpdateMode(ctx *fasthttp.RequestCtx) {
+// POST /backend/admin/update-active — body: {"active": true|false}
+// true = "activate" (block new games from starting, "locked"). false =
+// "deactivate" (resume normal play). Replaces the old 3-state update-mode
+// endpoint — see backend/game/appconfig.go's package doc comment for why.
+func (s *Server) handleAdminSetUpdateActive(ctx *fasthttp.RequestCtx) {
 	var req struct {
-		Mode string `json:"mode"`
+		Active bool `json:"active"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
 		return
 	}
-	switch req.Mode {
-	case game.UpdateModeOff, game.UpdateModeForce, game.UpdateModeNormal:
-	default:
-		writeErr(ctx, 400, "invalid_mode")
-		return
-	}
-	cfg, err := s.Store.SetUpdateMode(req.Mode)
+	cfg, err := s.Store.SetUpdateActive(req.Active)
 	if err != nil {
 		writeErr(ctx, 500, "save_error")
 		return
 	}
-	writeJSON(ctx, 200, cfg)
-}
-
-// POST /backend/admin/update-complete — resumes normal play.
-func (s *Server) handleAdminCompleteUpdate(ctx *fasthttp.RequestCtx) {
-	cfg, err := s.Store.CompleteUpdate()
-	if err != nil {
-		writeErr(ctx, 500, "save_error")
-		return
-	}
-	log.Printf("[ADMIN] update completed — game resumed")
+	log.Printf("[ADMIN] update lock set to active=%v", req.Active)
 	writeJSON(ctx, 200, cfg)
 }
 
@@ -342,17 +351,11 @@ func (s *Server) handleAdminReplayBinaryStatus(ctx *fasthttp.RequestCtx) {
 
 // POST /backend/admin/replay-binary — multipart/form-data upload, field
 // "file". Accepts a .zip (Linux build) or .exe (Windows/Godot export)
-// replay verifier binary.
-//
-// By default (no "stage" field, or "stage" != "1") it activates
-// immediately: saves into the live servergames dir, clears the cached
-// binary path, and restarts the persistent worker pool.
-//
-// With form field "stage=1", the upload is saved to a staging folder
-// instead and NOT activated — use this when you want to bundle the binary
-// swap into a scheduled deploy job (admin panel → Deploy tab) so it goes
-// live atomically together with the Cloudflare Pages deploy + replay
-// version bump, at whatever trigger you picked.
+// replay verifier binary. Always activates immediately: saves into the live
+// servergames dir, clears the cached binary path, and restarts the
+// persistent worker pool. (The old "stage=1, activate later via a
+// scheduled Deploy job" path was removed along with the Deploy tab — see
+// backend/game/appconfig.go's package doc comment.)
 func (s *Server) handleAdminReplayBinaryUpload(ctx *fasthttp.RequestCtx) {
 	fh, err := ctx.FormFile("file")
 	if err != nil {
@@ -372,12 +375,7 @@ func (s *Server) handleAdminReplayBinaryUpload(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	stage := string(ctx.FormValue("stage")) == "1"
-
 	dir := game.ServerGamesDir()
-	if stage {
-		dir = game.StagedReplayDir()
-	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Printf("[ADMIN] replay binary upload: mkdir failed: %v", err)
 		writeErr(ctx, 500, "mkdir_failed")
@@ -387,14 +385,6 @@ func (s *Server) handleAdminReplayBinaryUpload(ctx *fasthttp.RequestCtx) {
 	if err := fasthttp.SaveMultipartFile(fh, destPath); err != nil {
 		log.Printf("[ADMIN] replay binary upload: save failed: %v", err)
 		writeErr(ctx, 500, "save_failed")
-		return
-	}
-
-	if stage {
-		log.Printf("[ADMIN] replay binary staged: %s (%d bytes) — will activate on the next scheduled deploy job", target, fh.Size)
-		writeJSON(ctx, 200, map[string]any{
-			"ok": true, "file": target, "size": fh.Size, "dir": dir, "staged": true,
-		})
 		return
 	}
 
@@ -410,11 +400,10 @@ func (s *Server) handleAdminReplayBinaryUpload(ctx *fasthttp.RequestCtx) {
 	go game.RestartAllWorkers()
 
 	writeJSON(ctx, 200, map[string]any{
-		"ok":     true,
-		"file":   target,
-		"size":   fh.Size,
-		"dir":    dir,
-		"staged": false,
+		"ok":   true,
+		"file": target,
+		"size": fh.Size,
+		"dir":  dir,
 	})
 }
 

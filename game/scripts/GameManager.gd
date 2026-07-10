@@ -156,9 +156,15 @@ var _rle_run_rem      : int = 0   # PLAYING: ticks remaining in current run
 var _rle_run_val      : int = 0   # PLAYING: direction value of current run
 var _replay_tick      : int = 0
 var _replay_total_ticks : int = 0  # RLE decoded total tick count (correct total for seek bar)
-var _replay_seed      : int = 0       
-var _replay_char      : int = 0       
-var _replay_score     : int = 0       
+var _replay_seed      : int = 0
+var _replay_char      : int = 0
+# Per-match "was gyro tilt control active" flag — travels alongside seed/char
+# through submit → stored Session → server replay-verification worker,
+# exactly the same pipeline _replay_char already uses (see set_gyro_control_active()'s
+# doc comment on Player.gd for why this can't just be read live off the
+# current settings toggle at replay time).
+var _replay_gyro_active : bool = false
+var _replay_score     : int = 0
 var _replay_player_seed : int = 0     
 var _replay_speed     : float = 1.0
 var _replay_paused    : bool  = false
@@ -219,6 +225,25 @@ signal replay_tick_changed(tick: int, total: int)
 # During RECORDING store (pos, score) every tick; compare during PLAYING
 var _dbg_snapshots : Array = []   # [{pos, score, vel_y}]
 var _dbg_enabled   : bool  = OS.is_debug_build()  # production: off → zero alloc per tick
+
+# ── Always-on lightweight checkpoint log (client + server, RELEASE builds too) ──
+# _dbg_enabled (above) is debug-build-only AND only ever compares a client's own
+# RECORDING against its own local PLAYING pass — it never runs in production and
+# never touches what the SERVER actually computed, so a real client-vs-server
+# (WASM vs headless-native) desync leaves zero forensic trail: today the only
+# signal is ParseFlagReason's aggregate score-diff percentage, with no way to
+# tell which tick things first went sideways.
+# This is unconditional (works in release/production, both RECORDING on a real
+# client and PLAYING during server-side verification via seek_to_tick) and
+# intentionally NOT gated on _is_seeking — server verification always runs
+# through seek_to_tick()'s silent burst, so gating on that would mean the
+# server side of the comparison never gets recorded at all.
+# Cheap: one small dict every _CKPT_EVERY ticks (~60 entries for a 5-min run).
+# Sent by the client in the /submit payload as "ckpt" and written into the
+# server replay's --out JSON as "ckpt" — the backend can diff the two arrays
+# to pinpoint the first tick where position/score/rng state parted ways.
+var _ckpt_log        : Array = []
+const _CKPT_EVERY : int = 300  # ~5s at 60 ticks/sec
 
 var _powerup_hud_dirty : bool = true
 # Powerup HUD 20 FPS'te güncellenir (60 physics tick / 3 = 20).
@@ -553,7 +578,8 @@ func _run_one_tick() -> void:
 				_vs_live_flush_log(false)
 
 	# ── Divergence detector ──────────────────────────────────────────
-	if _dbg_enabled and player_ready:
+	# Also skipped during seek_to_tick()'s silent burst — see comment above.
+	if _dbg_enabled and not _is_seeking and player_ready:
 		var snap_pos   : Vector2 = player.global_position
 		var snap_score : int     = score
 		var snap_vel   : float   = player.velocity.y
@@ -572,6 +598,28 @@ func _run_one_tick() -> void:
 				if dp > 0.5 or ds > 0 or dv > 1.0:
 					print("[DIV] tick=%d  Δpos=%.2f  Δscore=%d  Δvel_y=%.2f  plats=%d(ref=%d)" \
 						% [t, dp, ds, dv, snap_plats, int(ref_snap.plats)])
+
+	# ── Checkpoint log (always on, release builds too — see field comment) ──
+	# Deliberately NOT gated on _is_seeking: server-side verification always
+	# runs through seek_to_tick()'s silent burst, so gating on that would mean
+	# the server side of the client-vs-server comparison never gets recorded.
+	if player_ready and _replay_mode != ReplayMode.OFF:
+		if _replay_tick_count == 1:
+			_ckpt_log.clear()  # new run — drop any stale entries from a previous game/replay
+		if _replay_tick_count % _CKPT_EVERY == 0:
+			_ckpt_log.append({
+				"t":  _replay_tick_count,
+				"s":  score,
+				# Position/velocity are already snapped to the 0.01 grid by
+				# Player.gd every tick — *100 + round gives a clean int so the
+				# JSON payload stays small and comparison is exact, not float.
+				"x":  int(round(player.global_position.x * 100.0)),
+				"y":  int(round(player.global_position.y * 100.0)),
+				"vy": int(round(player.velocity.y * 100.0)),
+				# _rng.state is a full 64-bit int — stringified so JSON (IEEE-754
+				# double under the hood) can't silently lose precision on it.
+				"rng": str(_rng.state),
+			})
 
 
 func _simulate_gm_tick() -> void:
@@ -605,9 +653,14 @@ func _simulate_gm_tick() -> void:
 				_rle_run_rem -= 1
 				_replay_tick_count += 1
 				_replay_tick = _replay_tick_count   # keep in sync — _replay_tick was never incremented before
-				if not _is_headless and _replay_tick_count % 6 == 0:
+				# Skip UI signal + debug print entirely while seek_to_tick() is
+				# doing its silent re-sim burst — the world is hidden and
+				# nothing reads these until the loop finishes, so emitting/
+				# printing on every 6th/100th tick of a multi-thousand-tick
+				# seek was pure wasted work slowing the "instant" jump down.
+				if not _is_headless and not _is_seeking and _replay_tick_count % 6 == 0:
 					replay_tick_changed.emit(_replay_tick_count, _replay_total_ticks)
-				if _dbg_enabled and _replay_tick_count % 100 == 0:
+				if _dbg_enabled and not _is_seeking and _replay_tick_count % 100 == 0:
 					print("[SNAP] tick=%d score=%d pos=(%.2f,%.2f) vel_y=%.2f rng=%d" % [_replay_tick_count, score, player.position.x, player.position.y, player.velocity.y, _rng.state])
 			else:
 				# Live-watching a match still in progress: running out of
@@ -2194,6 +2247,9 @@ func _on_player_died() -> void:
 		_replay_char  = 0
 		if is_instance_valid(main_node) and main_node.get("_char_index") != null:
 			_replay_char = int(main_node.get("_char_index"))
+		_replay_gyro_active = false
+		if is_instance_valid(main_node) and main_node.get("_control_mode") != null:
+			_replay_gyro_active = (str(main_node.get("_control_mode")) == "gyro")
 		_replay_mode = ReplayMode.OFF
 		print("[REPLAY] Recording complete. %d ticks (%d bytes), seed=%d" % [_replay_tick_count, _replay_log.size(), _replay_seed])
 
@@ -2395,6 +2451,12 @@ func _init_game_from_seed() -> void:
 		char_idx_now = int(main_node.get("_char_index"))
 	if player.has_method("set_char"):
 		player.call("set_char", char_idx_now)
+	# Live match start (RECORDING) — apply the CURRENT control-mode setting
+	# for the gyro-only movement ramp (see Player.gd's
+	# set_gyro_control_active doc comment). Safe to read live here since
+	# this only runs once, at the very start of the match.
+	if player.has_method("set_gyro_control_active") and is_instance_valid(main_node) and main_node.get("_control_mode") != null:
+		player.call("set_gyro_control_active", str(main_node.get("_control_mode")) == "gyro")
 	print("[GM] _init_game_from_seed char_idx=%d GRAVITY=%.2f JUMP=%.2f" % [char_idx_now, player.get("GRAVITY"), player.get("JUMP_SPEED")])
 	_sim_cam_y = VH * 0.72
 	_highest_plat_y = VH * 0.72
@@ -2509,7 +2571,9 @@ func start_replay() -> void:
 			camera.offset = Vector2.ZERO
 		if player.has_method("set_char"):
 			player.call("set_char", _replay_char)
-		
+		if player.has_method("set_gyro_control_active"):
+			player.call("set_gyro_control_active", _replay_gyro_active)
+
 	_biome_enemy_cache.clear()
 	_last_biome_score = -1
 	_active_biome     = ""
@@ -2619,6 +2683,7 @@ func seek_to_tick(target_tick: int) -> void:
 		player.velocity = Vector2.ZERO
 		if is_instance_valid(camera): camera.offset = Vector2.ZERO
 		if player.has_method("set_char"): player.call("set_char", _replay_char)
+		if player.has_method("set_gyro_control_active"): player.call("set_gyro_control_active", _replay_gyro_active)
 
 	_biome_enemy_cache.clear()
 	_last_biome_score = -1
@@ -2658,30 +2723,35 @@ func seek_to_tick(target_tick: int) -> void:
 		player.call("activate")
 
 	# Silently simulate up to target tick — suppress tweens during this loop
-	# Non-blocking: her 500 tick'te bir frame'e yield et → UI donmaz
+	#
+	# UI FIX: "seeking should jump straight there, not fast-forward through
+	# the whole thing" — the re-simulation loop below is unavoidable (there's
+	# no stored per-tick snapshot to jump to directly, the only way to reach
+	# an arbitrary tick deterministically is to replay every tick from 0).
+	# It used to yield a frame every 500 ticks so the UI thread never hung —
+	# but the world is now hidden for the whole duration (see visible=false
+	# below), so there's nothing left for those in-between frames to show:
+	# spreading the work across several frames just added wall-clock delay
+	# for no visual benefit ("100 tick 100 tick" stepping the user still felt
+	# even with the screen blanked). Since the world isn't drawn during this
+	# loop, run every tick back-to-back in one shot instead — the game only
+	# reappears once it's already sitting exactly on the target tick.
+	visible = false
 	_is_seeking = true
-	var seek_batch := 500 if not _is_headless else 999999
 	var _seek_prev_tick : int = -1
 	var _seek_stall     : int = 0
 	while _replay_tick_count < target_tick and not _game_over:
-		var batch_end := mini(_replay_tick_count + seek_batch, target_tick)
-		while _replay_tick_count < batch_end and not _game_over:
-			_run_one_tick()
-			# Safety: abort if tick counter stops advancing (prevents worker hang)
-			if _replay_tick_count == _seek_prev_tick:
-				_seek_stall += 1
-				if _seek_stall > 5000:
-					push_error("[SEEK_STALL] tick=%d target=%d seed=%d — forcing stop" % [_replay_tick_count, target_tick, _replay_seed])
-					_game_over = true
-					break
-			else:
-				_seek_stall = 0
-				_seek_prev_tick = _replay_tick_count
-		# Eğer hâlâ hedef tick'e ulaşmadıysak bir sonraki frame'i bekle
-		# Headless'ta await yok — tüm tick'ler senkron işlenir
-		if _replay_tick_count < target_tick and not _game_over:
-			if not _is_headless:
-				await get_tree().process_frame
+		_run_one_tick()
+		# Safety: abort if tick counter stops advancing (prevents worker hang)
+		if _replay_tick_count == _seek_prev_tick:
+			_seek_stall += 1
+			if _seek_stall > 5000:
+				push_error("[SEEK_STALL] tick=%d target=%d seed=%d — forcing stop" % [_replay_tick_count, target_tick, _replay_seed])
+				_game_over = true
+				break
+		else:
+			_seek_stall = 0
+			_seek_prev_tick = _replay_tick_count
 	# Always clear seeking flag — even if game_over fired mid-loop
 	_is_seeking = false
 
@@ -2689,6 +2759,10 @@ func seek_to_tick(target_tick: int) -> void:
 	for e in _enemies:
 		if is_instance_valid(e) and e.has_method("seek_reset"):
 			e.call("seek_reset")
+
+	# Reveal the world again now that everything is already snapped to the
+	# target tick — see the "visible = false" comment above.
+	visible = true
 
 	# Snap visual camera to sim camera instantly (no lerp artifact)
 	if is_instance_valid(camera):
@@ -2796,7 +2870,7 @@ func prep_worker_job() -> void:
 			player._idle_tween = null
 
 
-func start_replay_external(ext_seed: int, ext_log: PackedByteArray, ext_char: int, ext_nickname: String = "", ext_player_seed: int = 0) -> void:
+func start_replay_external(ext_seed: int, ext_log: PackedByteArray, ext_char: int, ext_nickname: String = "", ext_player_seed: int = 0, ext_gyro_active: bool = false) -> void:
 	if ext_log.is_empty() or ext_seed == 0:
 		push_warning("[REPLAY] External: invalid seed or log")
 		return
@@ -2805,6 +2879,7 @@ func start_replay_external(ext_seed: int, ext_log: PackedByteArray, ext_char: in
 	_replay_log         = ext_log
 	_replay_char        = ext_char
 	_replay_player_seed = ext_player_seed
+	_replay_gyro_active = ext_gyro_active   # gyro-only movement ramp — see set_gyro_control_active doc comment
 	_replay_nickname    = ext_nickname   # set before start_replay so it survives
 	start_replay()
 	_replay_nickname    = ext_nickname   # re-set after, start_replay() may clear it
@@ -3056,6 +3131,15 @@ func _submit_session() -> void:
 	if main_node_ref and main_node_ref.get("_char_index") != null:
 		char_idx = int(main_node_ref.get("_char_index"))
 
+	# Gyro-only movement ramp (see Player.gd's set_gyro_control_active doc
+	# comment) — recorded once per match here, same pattern as char_idx just
+	# above, so the server's replay verification knows whether to apply the
+	# ramp too. Read live off Main's current control-mode setting — safe
+	# because it can't change mid-match (no in-run UI for it).
+	var gyro_active : bool = false
+	if main_node_ref and main_node_ref.get("_control_mode") != null:
+		gyro_active = (str(main_node_ref.get("_control_mode")) == "gyro")
+
 	var replay_b64 := ""
 	# RLE'den gerçek tick sayısını decode et — _replay_tick_count ile değil bununla gönder.
 	# Web'de frame timing düzensiz olduğunda _replay_tick_count kayabilir ama RLE her zaman doğru.
@@ -3082,12 +3166,17 @@ func _submit_session() -> void:
 		"score":       score,
 		"ticks":       rle_ticks,  # RLE'den decode — server ile her zaman eşleşir
 		"char":        char_idx,
+		"gyro_active": gyro_active,
 		"player_id":   pid,
 		"nickname":    nickname,
 		"nonce":       Time.get_unix_time_from_system() * 1000,
 		"replay_log":  replay_b64,
 		"player_seed": str(_replay_player_seed),
 		"client_version": GameVersion.CLIENT_VERSION,
+		# Diagnostic-only, never trusted for scoring: lets the backend pinpoint
+		# the first tick where the server's re-simulation parted ways with what
+		# this client actually saw, instead of just an aggregate score-diff %.
+		"ckpt": _ckpt_log,
 	}
 	if vs_room_id != "":
 		payload["vs_room_id"] = vs_room_id
@@ -3149,13 +3238,6 @@ func _send_submit_with_retry(sid: String, body: String) -> void:
 			print("[GM] submit 401 — no auth, keeping in queue until signed in")
 			_notify_auth_expired()
 			_ensure_retry_timer()
-		elif code == 409 and _b != null and _b.get_string_from_utf8().find("version_mismatch") != -1:
-			# Server rejected this replay because our client build is out of
-			# date compared to the server's configured replay version.
-			print("[GM] submit 409 version_mismatch — dropping sid=%s" % sid.left(8))
-			_pending_remove(sid)
-			Toast.get_instance().show_toast(
-				"Your game version is out of date. Please refresh the page to update.", Toast.Kind.WARN)
 		elif code >= 400 and code < 500:
 			# 400/403/409 etc. — permanent rejection, drop
 			print("[GM] submit %d — permanent rejection, dropping sid=%s" % [code, sid.left(8)])

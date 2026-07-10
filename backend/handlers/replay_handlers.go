@@ -47,6 +47,7 @@ func (s *Server) handleReplay(ctx *fasthttp.RequestCtx) {
 		"session_id":   sess.SessionID,
 		"seed":         strconv.FormatInt(sess.Seed, 10),
 		"char":         sess.Char,
+		"gyro_active":  sess.GyroActive,
 		"server_score": sess.ServerScore,
 		"client_score": sess.ClientScore,
 		"ticks":        sess.Ticks,
@@ -293,6 +294,7 @@ func (s *Server) handleAdminSessions(ctx *fasthttp.RequestCtx) {
 		ServerScore int    `json:"server_score"`
 		Ticks       int    `json:"ticks"`
 		Char        int    `json:"char"`
+		GyroActive  bool   `json:"gyro_active"`
 		Flagged     bool   `json:"flagged"`
 		Reason      string `json:"reason,omitempty"`
 		HasLog      bool   `json:"has_log"`
@@ -347,6 +349,7 @@ func (s *Server) handleAdminSessions(ctx *fasthttp.RequestCtx) {
 			ServerScore: sess.ServerScore,
 			Ticks:       sess.Ticks,
 			Char:        sess.Char,
+			GyroActive:  sess.GyroActive,
 			Flagged:     sess.Flagged,
 			Reason:      sess.Reason,
 			HasLog:      sess.Log != "",
@@ -380,7 +383,7 @@ func (s *Server) handleAdminTestReplay(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	log.Printf("[ADMIN_REPLAY] session=%s raw_bytes=%d", sess.SessionID[:8], len(raw))
-	result, simErr := game.SimulateReplay(sess.Log, sess.Seed, sess.Char, 120, sess.PlayerSeed)
+	result, simErr := game.SimulateReplay(sess.Log, sess.Seed, sess.Char, sess.GyroActive, 120, sess.PlayerSeed)
 	if simErr != nil {
 		writeErr(ctx, 500, "sim_error: "+simErr.Error())
 		return
@@ -453,7 +456,7 @@ func (s *Server) handleAdminReplayRetry(ctx *fasthttp.RequestCtx) {
 
 	log.Printf("[REPLAY_RETRY] admin manual retry session=%s", sessionID[:8])
 
-	result, simErr := game.SimulateReplayFast(sess.Log, sess.Seed, sess.Char, game.ReplayTimeoutSec(sess.Ticks), sess.PlayerSeed)
+	result, simErr := game.SimulateReplayFast(sess.Log, sess.Seed, sess.Char, sess.GyroActive, game.ReplayTimeoutSec(sess.Ticks), sess.PlayerSeed)
 	if simErr != nil {
 		log.Printf("[REPLAY_RETRY] failed session=%s err=%v", sessionID[:8], simErr)
 		sess.ReplayError = simErr.Error()

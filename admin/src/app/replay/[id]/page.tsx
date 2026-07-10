@@ -137,8 +137,8 @@ export default function ReplayPage({ params }: { params: Promise<{ id: string }>
   }, [id]);
 
   const replay = useMemo<ReplayData | null>(() => {
-    if (!session?.log) return null;
-    try { return decodeRLE(b64ToBytes(session.log)); } catch { return null; }
+    if (!session?.replay_log) return null;
+    try { return decodeRLE(b64ToBytes(session.replay_log)); } catch { return null; }
   }, [session]);
 
   if (loading) return <main style={{ padding: 64, textAlign: "center", color: "var(--text-muted)" }}>Loading…</main>;
@@ -227,6 +227,7 @@ export default function ReplayPage({ params }: { params: Promise<{ id: string }>
             <span>🎮 Live replay — game running in iframe</span>
             <span>Seed: <b style={{ fontFamily: "monospace" }}>{session.seed}</b></span>
             <span>Char: <b>#{(session.char ?? 0) + 1}</b></span>
+            <span>Control: <b>{session.gyro_active ? "🎯 Gyro" : "👆 Tap"}</b></span>
             <a href={gameReplayUrl} target="_blank" rel="noopener noreferrer"
               style={{ marginLeft: "auto", color: "var(--blue)", fontSize: 11 }}>
               Full screen ↗
@@ -339,9 +340,10 @@ export default function ReplayPage({ params }: { params: Promise<{ id: string }>
             <Row label="Nickname"  value={session.nickname || "—"} />
             <Row label="Seed"      value={<span style={{ fontFamily: "monospace", fontSize: 11 }}>{session.seed}</span>} />
             <Row label="Character" value={`#${(session.char ?? 0) + 1}`} />
+            <Row label="Control"   value={session.gyro_active ? "🎯 Gyro" : "👆 Tap"} />
             <Row label="Ticks"     value={session.ticks.toLocaleString()} />
             <Row label="Duration"  value={`${durationSec}s`} sub={`(${(session.ticks / 60 / 60).toFixed(2)}min)`} />
-            {replay && <Row label="Log bytes" value={Math.ceil(atob(session.log!).length)} sub="bytes" />}
+            {replay && <Row label="Log bytes" value={Math.ceil(atob(session.replay_log!).length)} sub="bytes" />}
           </div>
 
           {replay && (

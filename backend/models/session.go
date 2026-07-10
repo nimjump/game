@@ -27,6 +27,12 @@ type Session struct {
 	ServerScore    int
 	Ticks          int
 	Char           int
+	// GyroActive — was gyro tilt control active during this match. Drives the
+	// gyro-only movement ramp (see game/scripts/Player.gd's
+	// set_gyro_control_active doc comment) so server-side replay verification
+	// applies the same ramp the client did when recording. Threaded through
+	// exactly the same pipeline as Char.
+	GyroActive     bool
 	PlayerSeed     int64
 	Log            string
 	Flagged        bool
@@ -53,6 +59,7 @@ type sessionJSON struct {
 	ServerScore    int          `json:"server_score"`
 	Ticks          int          `json:"ticks"`
 	Char           int          `json:"char"`
+	GyroActive     bool         `json:"gyro_active,omitempty"`
 	PlayerSeed     string       `json:"player_seed,omitempty"`
 	Log            string       `json:"log,omitempty"`
 	Flagged        bool         `json:"flagged"`
@@ -83,6 +90,7 @@ type sessionLegacyJSON struct {
 	ServerScore int          `json:"server_score"`
 	Ticks       int          `json:"ticks"`
 	Char        int          `json:"char"`
+	GyroActive  bool         `json:"gyro_active,omitempty"`
 	Log         string       `json:"log,omitempty"`
 	Flagged     bool         `json:"flagged"`
 	Reason      string       `json:"reason,omitempty"`
@@ -105,6 +113,7 @@ func (s Session) MarshalJSON() ([]byte, error) {
 		ServerScore:    s.ServerScore,
 		Ticks:          s.Ticks,
 		Char:           s.Char,
+		GyroActive:     s.GyroActive,
 		PlayerSeed:     playerSeedStr,
 		Log:            s.Log,
 		Flagged:        s.Flagged,
@@ -140,6 +149,7 @@ func (s *Session) UnmarshalJSON(data []byte) error {
 			s.ServerScore    = j.ServerScore
 			s.Ticks          = j.Ticks
 			s.Char           = j.Char
+			s.GyroActive     = j.GyroActive
 			s.PlayerSeed     = playerSeed
 			s.Log            = j.Log
 			s.Flagged        = j.Flagged

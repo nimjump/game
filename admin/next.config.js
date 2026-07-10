@@ -9,7 +9,14 @@ module.exports = {
   // the backend reverse-proxies it (see backend/handlers/admin_proxy.go).
   // Must match ADMIN_BASE_PATH in backend/.env.
   basePath: process.env.ADMIN_BASE_PATH || "/admin",
-  allowedDevOrigins: ['n3zydebg87.loclx.io'],
+  // Dev-only HMR/websocket origin allowlist. devtools proxies this app
+  // through a fresh, randomly-named Cloudflare Quick Tunnel on every run
+  // (see start-dev-tunnels.js) — e.g. gui-contents-covers-plug.trycloudflare.com
+  // — so a single hardcoded hostname (leftover from an old localtunnel/
+  // loclx.io setup) goes stale the moment the tunnel restarts. Wildcarding
+  // the fixed *.trycloudflare.com suffix covers every future tunnel run
+  // without needing to hardcode or regenerate this on each launch.
+  allowedDevOrigins: ['*.trycloudflare.com', 'localhost', '127.0.0.1'],
 
 
   async headers() {

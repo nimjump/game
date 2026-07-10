@@ -8,15 +8,100 @@
   <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, viewport-fit=cover">
   <title>$GODOT_PROJECT_NAME</title>
   <style>
-    html, body { margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden; }
-    #canvas { display:block; width:100%; height:100%; outline:none; touch-action:none; image-rendering:pixelated; }
-    #status, #status-splash, #status-progress { position:absolute; left:0; right:0; }
-    #status, #status-splash { top:0; bottom:0; }
+    html, body {
+      margin:0; padding:0; width:100%; height:100%; background:#000; overflow:hidden;
+      /* Mobile polish — none of this changes layout, only removes native
+         browser chrome/gestures that fight a swipe-controlled game:
+         - overscroll-behavior:none stops iOS/Android's rubber-band bounce
+           and pull-to-refresh from firing when a swipe starts near the top
+           or bottom edge (a real risk here — the whole game is swipe-driven,
+           and Chrome's pull-to-refresh gesture starts from the exact same
+           edge-drag a player uses to move).
+         - -webkit-touch-callout:none stops iOS's long-press "callout" menu
+           (copy/save-image popup) from interrupting a held touch mid-swipe.
+         - -webkit-user-select/user-select:none stops the OS text-selection
+           handles from appearing on a long-press anywhere in the canvas.
+         - -webkit-tap-highlight-color:transparent removes the default gray
+           flash Android/older iOS draws on every tap — with a custom themed
+           UI (UITheme.gd) that flash reads as an unstyled/broken tap state
+           rather than the game's own press feedback. */
+      overscroll-behavior:none;
+      -webkit-touch-callout:none;
+      -webkit-user-select:none; user-select:none;
+      -webkit-tap-highlight-color:transparent;
+    }
+    /* ── SAFE AREA (notch / Dynamic Island / home-indicator) ────────────────
+       viewport-fit=cover above tells the browser to let the page extend
+       full-bleed under the notch/home-indicator instead of auto-letterboxing
+       — without this, the actual play surface (canvas) would draw its own
+       UI edge-to-edge and iPhone's notch/Dynamic Island or the home-indicator
+       bar could sit right on top of real, tappable content (bottom nav bar,
+       PLAY button, top HUD). Fix: inset the canvas AND the loading/splash
+       overlay by env(safe-area-inset-*) so Godot's own viewport only ever
+       spans the actual safe rectangle — nothing GDScript-side needs to know
+       about this, every existing anchor/margin in the game continues to be
+       relative to "the whole screen" because that's still what Godot sees.
+       env(..., 0px) fallback makes this a no-op on any browser that doesn't
+       support the safe-area env() variables at all (plain desktop, older
+       Android) — html/body's #000 background fills the resulting margin on
+       devices that DO have a notch/home-indicator, same color as the splash
+       screen so it reads as intentional letterboxing, not a layout bug. */
+    #canvas {
+      /* BUG FIX: this used to be top/bottom/left/right all set + width:auto/
+         height:auto. That looked right on paper (a position:fixed box with
+         all four offsets pinned, "auto" filling the gap) but <canvas> is a
+         REPLACED element (like <img>/<video>) — per the CSS spec, a
+         replaced element's 'auto' width/height in this configuration
+         resolves to its INTRINSIC size (canvas defaults to 300x150 CSS px
+         with no width/height attribute) instead of stretching to fill the
+         left/right or top/bottom gap the way a plain <div> would. That's
+         exactly "small canvas stuck in the corner, doesn't fill the
+         screen" — the report this fixes. Explicit calc() width/height
+         removes the ambiguity entirely: no reliance on replaced-element
+         auto-sizing behavior at all, just an exact number every browser
+         computes the same way. top/left position it, width/height size it,
+         'right'/'bottom' aren't needed (and would over-constrain the box
+         if combined with an explicit width/height anyway). */
+      position:fixed;
+      top:    env(safe-area-inset-top, 0px);
+      left:   env(safe-area-inset-left, 0px);
+      width:  calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+      height: calc(100% - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+      outline:none; touch-action:none; image-rendering:pixelated;
+    }
+    #status, #status-splash, #status-progress { position:fixed; }
+    #status {
+      top:    env(safe-area-inset-top, 0px);
+      left:   env(safe-area-inset-left, 0px);
+      width:  calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
+      height: calc(100% - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    }
     #status {
       background-color: $GODOT_SPLASH_COLOR;
       display:flex; flex-direction:column; justify-content:center; align-items:center;
       visibility:hidden;
     }
+    /* #status-splash (the splash <img>) needs its own explicit inset:0 —
+       it's position:fixed (see the shared selector above) with NO offsets
+       of its own, this used to be full-viewport (top:0/left:0/right:0/
+       bottom:0) matching the original pre-safe-area-fix code; that's what
+       lets its own max-width/max-height:100% + margin:auto below actually
+       center it (position:fixed/absolute + all-sides-0 + margin:auto on a
+       sized box is a real, classic centering technique — but it only works
+       if all four offsets are actually 0, not left unset/auto). Kept
+       viewport-relative (not safe-area-inset-relative like #status/#canvas
+       above) — same as it always was; the splash is shown for such a short
+       window before the engine takes over that this was never worth
+       revisiting on its own. */
+    #status-splash { top:0; left:0; right:0; bottom:0; }
+
+    /* NOTE: a desktop "letterbox" variant (capping #canvas to the portrait
+       aspect ratio + centering it, black bars either side) was tried here
+       and reverted on request — the game fills the whole browser window on
+       desktop now, same as before, full-bleed. The portrait-only UI (e.g.
+       the onboarding overlay's anchor_left=0.08/anchor_right=0.92) can still
+       look stretched/wide on a very wide desktop window as a result — that
+       tradeoff was chosen deliberately over black bars, not missed. */
     #status-splash { max-height:100%; max-width:100%; margin:auto; }
     #status-splash.show-image--false { display:none; }
     #status-splash.fullsize--true { height:100%; width:100%; object-fit:contain; }
@@ -214,7 +299,11 @@
       a.addEventListener('error', function(){ if(window._DEV) console.warn('[Audio] load failed: '+name); });
       _sounds[name] = { audio:a, bus:bus };
     }
-    _reg('bgm',    'assets/audio/bgm.wav',    'BGM',      true);
+    // bgm switched from .wav (13.6MB, uncompressed 44.1kHz/16-bit) to .ogg
+    // (Vorbis q4, ~1.2MB) — same track, ~11x smaller download on first load.
+    // Native <audio> plays OGG Vorbis fine on every browser this game
+    // targets (Chrome/Safari/Firefox, desktop+mobile); no fallback needed.
+    _reg('bgm',    'assets/audio/bgm.ogg',    'BGM',      true);
     _reg('jump',   'assets/audio/jump.wav',   'SFX_Jump', false);
     _reg('damage', 'assets/audio/damage.wav', 'SFX_Damage', false);
 
@@ -297,6 +386,66 @@
       return !!window._nimiqProviderMissing;
     }
 
+    // ── "Get Nimiq Pay" store link + fallback popup ─────────────────────────
+    // BUG FIX: the "Open ↗" button just fired the nimiqpay:// custom-scheme
+    // deep link and stopped there — if Nimiq Pay isn't actually installed
+    // (the common case for someone hitting the game link from a tweet/share/
+    // search result), a custom scheme the OS doesn't recognize does NOTHING
+    // visible at all: no error, no fallback, button just looks broken. Same
+    // gap existed for "Connect Wallet" inside the game (StatsPanel/QuestPanel/
+    // LeaderboardPanel) when there's no provider to connect to — it silently
+    // no-ops instead of telling the player what to do. Both now go through
+    // this one popup: real per-platform store link (iOS App Store / Android
+    // Play Store ids below are Nimiq Pay's actual listing, confirmed live),
+    // desktop falls back to the informational nimiq.com/nimiq-pay/ page since
+    // there's no store link that makes sense there.
+    var STORE_URL_IOS     = 'https://apps.apple.com/us/app/nimiq-pay/id6471844738';
+    var STORE_URL_ANDROID = 'https://play.google.com/store/apps/details?id=com.nimiq.pay';
+    var STORE_URL_DESKTOP = 'https://www.nimiq.com/nimiq-pay/';
+
+    function getNimiqStoreUrl() {
+      var ua = navigator.userAgent || '';
+      var isIOS = /iPad|iPhone|iPod/.test(ua) ||
+        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1); // iPadOS 13+ UA quirk
+      if (isIOS) return STORE_URL_IOS;
+      if (/Android/i.test(ua)) return STORE_URL_ANDROID;
+      return STORE_URL_DESKTOP;
+    }
+
+    function showInstallPopup() {
+      if (document.getElementById('nq-install-popup')) return; // don't stack duplicates
+      var overlay = document.createElement('div');
+      overlay.id = 'nq-install-popup';
+      overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.6);' +
+        'display:flex;align-items:center;justify-content:center;font-family:sans-serif;padding:24px;box-sizing:border-box';
+      var card = document.createElement('div');
+      card.style.cssText = 'background:#1a1a2e;color:#fff;border-radius:16px;padding:24px;max-width:340px;' +
+        'width:100%;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.5)';
+      var title = document.createElement('div');
+      title.textContent = 'Get Nimiq Pay';
+      title.style.cssText = 'font-size:18px;font-weight:bold;margin-bottom:10px';
+      var body = document.createElement('div');
+      body.textContent = "Looks like you don't have Nimiq Pay installed yet — install it to connect your wallet and earn real NIM.";
+      body.style.cssText = 'font-size:14px;line-height:1.4;color:#cfd0e0;margin-bottom:18px';
+      var getBtn = document.createElement('button');
+      getBtn.textContent = 'Get Nimiq Pay ↗';
+      getBtn.style.cssText = 'background:#f6b221;color:#1a1a2e;border:none;border-radius:10px;' +
+        'padding:12px 20px;font-weight:bold;font-size:15px;cursor:pointer;width:100%;margin-bottom:10px';
+      getBtn.onclick = function(){ window.open(getNimiqStoreUrl(), '_blank'); };
+      var closeBtn = document.createElement('button');
+      closeBtn.textContent = 'Not now';
+      closeBtn.style.cssText = 'background:transparent;color:#9a9ab0;border:none;font-size:14px;cursor:pointer;padding:6px';
+      closeBtn.onclick = function(){ overlay.remove(); };
+      card.appendChild(title); card.appendChild(body); card.appendChild(getBtn); card.appendChild(closeBtn);
+      overlay.appendChild(card);
+      overlay.addEventListener('click', function(e){ if (e.target === overlay) overlay.remove(); });
+      document.body.appendChild(overlay);
+    }
+    // Exposed so GDScript (Main.gd's Connect Wallet handlers) can trigger the
+    // exact same popup via JavaScriptBridge.eval when there's no provider —
+    // one popup, one set of store links, instead of duplicating this in Godot.
+    window._showNimiqInstallPopup = showInstallPopup;
+
     function showBanner() {
       if (insideNimiqPay()) return;
       var banner=document.createElement('div');
@@ -308,7 +457,18 @@
       var open=document.createElement('button');
       open.textContent='Open ↗';
       open.style.cssText='background:#f6b221;color:#1a1a2e;border:none;border-radius:8px;padding:7px 14px;font-weight:bold;font-size:13px;cursor:pointer;white-space:nowrap;flex-shrink:0';
-      open.onclick=function(){ if (DEEP_LINK) window.location.href=DEEP_LINK; };
+      // Deferred-deep-link pattern: fire the custom-scheme link, then check
+      // back in shortly — if the tab is still visible/foregrounded, the OS
+      // had no handler for nimiqpay:// (app not installed) and nothing
+      // happened, so show the install popup instead of leaving the button
+      // looking like it did nothing at all.
+      open.onclick=function(){
+        if (!DEEP_LINK) { showInstallPopup(); return; }
+        window.location.href = DEEP_LINK;
+        setTimeout(function(){
+          if (document.visibilityState === 'visible') showInstallPopup();
+        }, 1200);
+      };
       var cls=document.createElement('button');
       cls.textContent='✕';
       cls.style.cssText='background:transparent;color:#aaa;border:none;font-size:18px;cursor:pointer;margin-left:8px;padding:0 4px;flex-shrink:0';
@@ -450,10 +610,26 @@
   // ApiConfig.gd's PROD_BASE) — there is no reverse-proxy making
   // nimjump.zetashare.com/backend/* reach the backend, so every request
   // 404'd against the game's own static host. Fix: resolve the same base URL
-  // ApiConfig.gd uses (query param ?api= > localStorage nj_api_base > the
-  // hardcoded prod backend), so this always hits the real backend regardless
-  // of which domain served the page.
+  // ApiConfig.gd uses (window.NJ_API_BASE > query param ?api= > localStorage
+  // nj_api_base > the hardcoded prod backend), so this always hits the real
+  // backend regardless of which domain served the page.
+  //
+  // BUG FIX #2: devtools (start-dev-tunnels.js) overrides ApiConfig.gd's
+  // PROD_BASE for every Godot-side network call, but this block runs in
+  // plain JS before/alongside the engine and never shared that override —
+  // it only ever checked ?api=/localStorage, which nothing actually sets, so
+  // every /backend/client-log POST during a devtools tunnel test kept going
+  // to the hardcoded prod fallback below and got CORS-rejected (prod's
+  // allowlist doesn't know the tunnel origin). window.NJ_API_BASE closes
+  // that gap: devtools' frontend static server now injects it directly into
+  // this served index.html with the current backend tunnel URL (see
+  // injectApiBase() in start-dev-tunnels.js) — checked first, before the
+  // query param / localStorage fallbacks, which remain for the case of
+  // manually testing against a non-default backend without devtools.
   var _API_BASE = (function(){
+    try {
+      if (window.NJ_API_BASE) return String(window.NJ_API_BASE).replace(/\/+$/, '');
+    } catch(e) {}
     try {
       var q = new URLSearchParams(window.location.search).get('api');
       if (q) return q.replace(/\/+$/, '');
@@ -482,8 +658,21 @@
     var headers = { 'Content-Type': 'application/json' };
     var tok = window._nimiqAuthToken || '';
     if (tok) headers['Authorization'] = 'Bearer '+tok;
-    fetch(_BACKEND, { method:'POST', headers:headers, body:JSON.stringify(payload), keepalive:true })
-      .catch(function(){});
+    var body = JSON.stringify(payload);
+    // BUG FIX: this used to silently swallow every failure with no retry.
+    // In devtools tunnel testing, the very first POST here (this fires
+    // before Godot/wasm even loads) can land on Cloudflare's edge before a
+    // freshly-created Quick Tunnel has fully settled, getting a 502 with no
+    // CORS headers — a transient infra blip, not a real failure. One quiet
+    // retry after a short delay avoids losing that entry outright; still a
+    // no-op fire-and-forget after that (this is a write-only diagnostic
+    // sink, never worth bothering the player about).
+    fetch(_BACKEND, { method:'POST', headers:headers, body:body, keepalive:true })
+      .catch(function(){
+        setTimeout(function(){
+          fetch(_BACKEND, { method:'POST', headers:headers, body:body, keepalive:true }).catch(function(){});
+        }, 800);
+      });
   }
 
   function _enqueue(level, msg) {
@@ -746,20 +935,41 @@ function initGodotGame() {
   }
 
   // Better WebGL context for WebView
-  // NOTE: desynchronized:true is disabled on Firefox/Gecko. It skips
-  // compositor vsync to reduce input latency, but on Gecko (and some
-  // WebKit-based system webviews) this has been the trigger for a GPU
-  // process crash right at first-frame/framebuffer allocation, which
-  // Firefox then "recovers" from by silently reloading the page — no JS
-  // error, no time to flush logs. Chrome/Blink tolerates it fine, hence
-  // the Chrome-works/Firefox-crashes split. Disabling it only costs a
-  // tiny bit of input latency, not real rendering performance.
-  var _isGecko = /Firefox/i.test(navigator.userAgent) && !/Seamonkey/i.test(navigator.userAgent);
+  // NOTE: desynchronized:true is disabled on Firefox/Gecko AND on WebKit
+  // (Safari engine). It skips compositor vsync to reduce input latency, but
+  // on Gecko and on WebKit-based system webviews this has been the trigger
+  // for a GPU process crash right at first-frame/framebuffer allocation,
+  // which the browser then "recovers" from by silently reloading the page —
+  // no JS error, no time to flush logs, just "loads to 100% then reloads
+  // itself". Chrome/Blink tolerates it fine, hence the Chrome-works /
+  // Firefox+Safari-crash split.
+  //
+  // BUG FIX: the previous check only matched literal Firefox
+  // (/Firefox/i.test(ua)), which misses the actual majority of affected
+  // sessions — on iOS, EVERY browser (Safari, Chrome-iOS/"CriOS",
+  // Firefox-iOS/"FxiOS", and any in-app WKWebView such as Nimiq Pay's
+  // mini-app host) runs on the WebKit engine under the hood, Apple requires
+  // it platform-wide. So the old check left desynchronized:true ON for all
+  // of those, and the GPU-crash-reload kept firing there — no UA string
+  // ever contains "Firefox" but the browser itself is still WebKit.
+  // Detect "is this WebKit" instead of "is this literally Firefox", plus
+  // keep the standalone Gecko check for desktop/Android Firefox.
+  var _ua = navigator.userAgent;
+  var _isGecko = /Firefox/i.test(_ua) && !/Seamonkey/i.test(_ua);
+  // Any Apple touch device (iPhone/iPad/iPod, plus iPadOS 13+ which reports
+  // as "MacIntel" but exposes touch points) is WebKit-only at the engine
+  // level regardless of what the UA's browser name claims.
+  var _isAppleTouch = /iPad|iPhone|iPod/.test(_ua) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  // Desktop Safari itself (not Chrome/Firefox spoofing as Safari — those
+  // still include their own token even on Mac).
+  var _isDesktopSafari = /^((?!chrome|android|crios|fxios|edg).)*safari/i.test(_ua);
+  var _isWebKitCrashRisk = _isGecko || _isAppleTouch || _isDesktopSafari;
   var _origCtx=HTMLCanvasElement.prototype.getContext;
   HTMLCanvasElement.prototype.getContext=function(type,attrs){
     if(type==='webgl2'||type==='webgl'||type==='webgl-experimental'){
       attrs=Object.assign({
-        powerPreference:'high-performance', desynchronized: !_isGecko,
+        powerPreference:'high-performance', desynchronized: !_isWebKitCrashRisk,
         preserveDrawingBuffer:false, antialias:false,
         depth:true, stencil:false, alpha:false,
       },attrs||{});
@@ -845,6 +1055,39 @@ function initGodotGame() {
   var _coiMsg = 'COI crossOriginIsolated=' + _coi + ' SharedArrayBuffer=' + _sab;
   if (DEV) window._earlyLog(_coiMsg, '#0ff');
   if (window._enqueueLog) window._enqueueLog('info', _coiMsg);
+
+  // ── Safe-area verification ────────────────────────────────────────────
+  // The CSS env(safe-area-inset-*) fix on #canvas/#status (see <style>
+  // above) can't be confirmed from here without an actual notched/home-
+  // indicator device — logging the REAL computed inset values (in px) for
+  // every session means the very first player who opens this on an iPhone
+  // with a notch/Dynamic Island shows up in the admin Logs tab with actual
+  // non-zero numbers, which is the only real proof the fix is doing
+  // anything in production. All-zero on every session just means nobody
+  // with a notch/home-indicator has opened it yet (or a device where the
+  // safe area truly is zero, e.g. most Android phones) — not that the fix
+  // is broken. Read via a throwaway element instead of trusting env()
+  // support detection, since that's the only way to get the resolved px
+  // value out of CSS into JS at all.
+  function _probeSafeArea() {
+    try {
+      var probe = document.createElement('div');
+      probe.style.cssText = 'position:fixed;top:0;left:0;visibility:hidden;pointer-events:none;' +
+        'padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);' +
+        'padding-left:env(safe-area-inset-left,0px);padding-right:env(safe-area-inset-right,0px);';
+      document.body.appendChild(probe);
+      var cs = getComputedStyle(probe);
+      var vals = { top: cs.paddingTop, bottom: cs.paddingBottom, left: cs.paddingLeft, right: cs.paddingRight };
+      document.body.removeChild(probe);
+      return vals;
+    } catch (e) { return null; }
+  }
+  var _safeArea = _probeSafeArea();
+  var _safeAreaMsg = _safeArea
+    ? ('SAFE_AREA top=' + _safeArea.top + ' bottom=' + _safeArea.bottom + ' left=' + _safeArea.left + ' right=' + _safeArea.right)
+    : 'SAFE_AREA probe-failed';
+  if (DEV) window._earlyLog(_safeAreaMsg, '#0ff');
+  if (window._enqueueLog) window._enqueueLog('info', _safeAreaMsg);
 
   var missing=Engine.getMissingFeatures({threads:false});
   if(DEV) window._earlyLog('missing: ['+missing.join(',')+']');

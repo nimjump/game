@@ -4,7 +4,8 @@ import { deleteClientLogs, type ClientLogEntry } from "@/lib/api";
 
 function fmt(ts: number) {
   if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString("en-GB");
+  // Pinned to UTC+3 — see AnalyticsTab.tsx's fmt() for why.
+  return new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Istanbul" });
 }
 
 interface Props {

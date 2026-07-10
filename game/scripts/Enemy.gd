@@ -961,11 +961,13 @@ func _special_hit(body: Node, stomped: bool, powered: bool) -> bool:
 			return true
 
 		EnemyType.CLOUD:
+			# user request: touching the cloud's body itself is harmless —
+			# only its rain drop (_cloud_spawn_rain -> "rain_damage"
+			# interactable) should hurt the player. Stomping the top still
+			# kills it, same as before.
 			if stomped:
 				body.velocity.y = -_vh * 0.50
 				_die()
-			elif not powered:
-				body.hit_enemy()
 			return true
 
 		EnemyType.FROG, EnemyType.MOUSE:

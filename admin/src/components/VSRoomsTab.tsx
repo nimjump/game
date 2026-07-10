@@ -5,7 +5,8 @@ import { fetchVSRooms, sweepVSRooms, reconcileVSPayments, cancelVSRoomAdmin, typ
 function nim(n?: number) { return (n ?? 0).toFixed(4); }
 function fmt(ts?: number) {
   if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString("en-GB");
+  // Pinned to UTC+3 — see AnalyticsTab.tsx's fmt() for why.
+  return new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Istanbul" });
 }
 function timeLeft(expiresAt: number, status: string) {
   if (["completed", "expired_payout", "expired_refunded", "cancelled"].includes(status)) return "—";

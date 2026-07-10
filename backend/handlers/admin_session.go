@@ -30,7 +30,56 @@ func adminCookieSecure(ctx *fasthttp.RequestCtx) bool {
 		return true
 	}
 	proto := string(ctx.Request.Header.Peek("X-Forwarded-Proto"))
-	return strings.EqualFold(proto, "https")
+	if strings.EqualFold(proto, "https") {
+		return true
+	}
+	// BUG FIX: the X-Forwarded-Proto check above never fired behind a
+	// Cloudflare Quick Tunnel (devtools' setup — see realClientIP's own bug
+	// fix comment in clientip.go for the same underlying fact) because
+	// `cloudflared tunnel --url http://localhost:PORT` doesn't add that
+	// header when forwarding to a plain-HTTP local origin. So this always
+	// evaluated to false during tunnel testing, which meant Secure was
+	// never set on the cookie, which meant the SameSite=None fix in
+	// adminCookieSameSite below could never actually engage either (a
+	// SameSite=None cookie without Secure is rejected outright by the
+	// browser, so the fallback silently stayed on Lax — the exact
+	// cross-site "login bounces back to /login" bug persisted even after
+	// that fix). CF-Connecting-IP is Cloudflare's own header, present on
+	// every request that came through Cloudflare's edge (which, same as
+	// realClientIP's reasoning, is TLS/HTTPS by definition on the public
+	// side — Cloudflare tunnels don't serve plain HTTP publicly) — its
+	// mere presence is a reliable "this arrived over HTTPS" signal even
+	// when the hop to this local process itself is plain HTTP.
+	if string(ctx.Request.Header.Peek("CF-Connecting-IP")) != "" {
+		return true
+	}
+	return false
+}
+
+// adminCookieSameSite — Lax normally, but None when the request is over
+// HTTPS (adminCookieSecure). BUG THIS FIXES: in the devtools/tunnel dev
+// setup, the admin Next.js app and the Go backend are deliberately served
+// from two DIFFERENT Cloudflare Quick Tunnel hostnames (see
+// devtools/start-dev-tunnels.js's comment on why admin is run directly
+// instead of proxied) — so every admin-panel fetch() to the backend
+// (adminLogin, adminMe, and every other call in lib/api.ts, all sent with
+// credentials:"include") is a genuinely cross-SITE request. A SameSite=Lax
+// cookie is NEVER attached to cross-site fetch/XHR requests (Lax only
+// covers top-level cross-site navigations) — so login would succeed and
+// set the cookie fine, but the very next adminMe() cross-site check would
+// see no cookie at all, look logged-out, and bounce straight back to
+// /login. Looked exactly like "I type the right password, it just
+// reloads." SameSite=None fixes that; it requires Secure (browsers reject
+// None cookies without it), which adminCookieSecure(ctx) already
+// guarantees is only claimed true over real HTTPS (the tunnel case) — over
+// plain HTTP local dev (same-origin, no tunnel) this still returns Lax,
+// which works fine there and avoids the browser rejecting the cookie
+// outright for lacking Secure.
+func adminCookieSameSite(ctx *fasthttp.RequestCtx) fasthttp.CookieSameSite {
+	if adminCookieSecure(ctx) {
+		return fasthttp.CookieSameSiteNoneMode
+	}
+	return fasthttp.CookieSameSiteLaxMode
 }
 
 func setAdminCookie(ctx *fasthttp.RequestCtx, token string) {
@@ -41,7 +90,7 @@ func setAdminCookie(ctx *fasthttp.RequestCtx, token string) {
 	c.SetPath("/")
 	c.SetHTTPOnly(true)
 	c.SetSecure(adminCookieSecure(ctx))
-	c.SetSameSite(fasthttp.CookieSameSiteLaxMode)
+	c.SetSameSite(adminCookieSameSite(ctx))
 	c.SetMaxAge(7 * 24 * 60 * 60)
 	ctx.Response.Header.SetCookie(c)
 }
@@ -54,7 +103,7 @@ func clearAdminCookie(ctx *fasthttp.RequestCtx) {
 	c.SetPath("/")
 	c.SetHTTPOnly(true)
 	c.SetSecure(adminCookieSecure(ctx))
-	c.SetSameSite(fasthttp.CookieSameSiteLaxMode)
+	c.SetSameSite(adminCookieSameSite(ctx))
 	c.SetMaxAge(-1)
 	ctx.Response.Header.SetCookie(c)
 }

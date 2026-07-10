@@ -15,7 +15,7 @@ extends CanvasLayer
 
 signal closed
 signal play_requested(room_id: String, role: String, seed: String)
-signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int)
+signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int, address: String, gyro_active: bool)
 signal watch_requested(room_id: String)
 
 var BACKEND_URL : String = ApiConfig.base_url()
@@ -128,15 +128,16 @@ func show_panel() -> void:
 
 func hide_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
-	if is_instance_valid(_panel_ctrl):
-		_anim_tween = create_tween()
-		if _anim_tween:
-			_anim_tween.set_parallel(true)
-			_anim_tween.tween_property(_panel_ctrl, "modulate:a", 0.0,                 0.15).set_trans(Tween.TRANS_QUAD)
-			_anim_tween.tween_property(_panel_ctrl, "scale",      Vector2(0.92, 0.92), 0.15).set_trans(Tween.TRANS_QUAD)
-			_anim_tween.chain().tween_callback(func(): hide())
-			return
+	# BUG FIX: hide() used to only run inside a tween.chain().tween_callback()
+	# fired after the fade-out finished. If hide_panel() got called again
+	# before that fired, .kill() above stops the tween WITHOUT running its
+	# chained callback, so hide() never ran — this CanvasLayer (with its
+	# full-rect, input-blocking dim layer) stayed stuck on top of the lobby.
+	# Fix: hide immediately/synchronously, treat the fade as pure decoration.
 	hide()
+	if is_instance_valid(_panel_ctrl):
+		_panel_ctrl.modulate.a = 1.0
+		_panel_ctrl.scale      = Vector2.ONE
 
 
 # ── UI shell ─────────────────────────────────────────────────────────────────
@@ -1657,12 +1658,14 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 		var seed     : int    = int(seed_str)
 		var log_b64  : String = str(d.get("replay_log", ""))
 		var char_idx : int    = int(d.get("char", 0))
+		var gyro_active : bool = bool(d.get("gyro_active", false))
 		var nickname : String = str(d.get("nickname", ""))
 		var player_seed : int = int(str(d.get("player_seed", "0")))
+		var address  : String = str(d.get("player_id", ""))
 		if log_b64 == "" or seed == 0: return
 		var log_bytes := Marshalls.base64_to_raw(log_b64)
 		if log_bytes.is_empty(): return
-		replay_requested.emit(seed, log_bytes, char_idx, nickname, player_seed)
+		replay_requested.emit(seed, log_bytes, char_idx, nickname, player_seed, address, gyro_active)
 		hide_panel.call_deferred()
 		closed.emit.call_deferred()
 	)

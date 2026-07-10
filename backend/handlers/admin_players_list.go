@@ -172,6 +172,7 @@ func (s *Server) handleAdminPlayersList(ctx *fasthttp.RequestCtx) {
 		WeeklyRank      int                `json:"weekly_rank"` // 0 = not ranked this period
 		DailyCap        game.DailyCapStats `json:"daily_cap"`
 		TotalNIMReceived float64           `json:"total_nim_received"`
+		Streak          int                `json:"streak"`
 	}
 
 	out := make([]playerOut, 0, len(pageBasics))
@@ -210,6 +211,7 @@ func (s *Server) handleAdminPlayersList(ctx *fasthttp.RequestCtx) {
 			WeeklyRank:      weeklyRanks[b.playerID],
 			DailyCap:        s.Store.GetDailyCapStats(b.playerID),
 			TotalNIMReceived: nimReceived[b.playerID],
+			Streak:          s.Store.GetStreak(b.playerID).Count,
 		})
 	}
 

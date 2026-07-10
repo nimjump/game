@@ -24,7 +24,16 @@ func (s *Server) handleQuests(ctx *fasthttp.RequestCtx) {
 		writeErr(ctx, 500, "failed to load quests")
 		return
 	}
-	day := time.Now().In(game.UTC3).Format("2006-01-02")
+	now := time.Now().In(game.UTC3)
+	day := now.Format("2006-01-02")
+	// resetAt — unix timestamp of the next UTC+3 midnight, i.e. exactly when
+	// `day` above rolls over server-side. Sent to the client so its "Reset:
+	// HH:MM:SS" countdown label can count down to the REAL reset instant
+	// (an absolute unix timestamp, timezone-agnostic) instead of guessing
+	// from the player's own device clock/timezone — a player whose phone is
+	// not on UTC+3 would otherwise see a countdown that hits zero at the
+	// wrong time relative to when quests actually reset.
+	resetAt := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, game.UTC3).Unix()
 	progresses := s.Store.AllProgress(playerID, day)
 
 	progMap := map[string]models.PlayerQuestProgress{}
@@ -52,7 +61,7 @@ func (s *Server) handleQuests(ctx *fasthttp.RequestCtx) {
 	}
 
 	log.Printf("[QUESTS] player=%s day=%s quests=%d", playerID[:min8(playerID)], day, len(result))
-	writeJSON(ctx, 200, map[string]any{"quests": result, "day": day})
+	writeJSON(ctx, 200, map[string]any{"quests": result, "day": day, "reset_at": resetAt})
 }
 
 // POST /bj/quests/progress
@@ -236,6 +245,21 @@ func (s *Server) handleQuestClaim(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// Same shared per-IP anti-multi-accounting guard as streak claims (see
+	// game/ip_reward_guard.go) — checked BEFORE marking the quest claimed,
+	// so a blocked claim stays unclaimed/retryable rather than burning the
+	// player's quest for nothing. Deliberately still counts as "using up"
+	// one of the IP's daily account slots even for a 0-reward quest (rare
+	// in practice, and simpler than special-casing it).
+	ip := realClientIP(ctx)
+	if okIP, ierr := s.Store.CheckAndRecordIPRewardEligibility(ip, playerID); ierr != nil {
+		log.Printf("[QUEST_CLAIM] ip guard error player=%s quest=%s err=%v", playerID[:min8(playerID)], questID, ierr)
+	} else if !okIP {
+		log.Printf("[QUEST_CLAIM] BLOCKED (ip limit) player=%s ip=%s quest=%s", playerID[:min8(playerID)], ip, questID)
+		writeJSON(ctx, 429, map[string]any{"ok": false, "error": "ip_account_limit", "quest_id": questID})
+		return
+	}
+
 	prog.ClaimedAt = time.Now().Unix()
 	if err := s.Store.SaveProgress(prog); err != nil {
 		writeErr(ctx, 500, "save_error")
@@ -297,6 +321,7 @@ func (s *Server) handleQuestClaimAll(ctx *fasthttp.RequestCtx) {
 		Error     string  `json:"error,omitempty"`
 	}
 
+	ip := realClientIP(ctx)
 	results := make([]claimResult, 0, len(req.QuestIDs))
 	for _, questID := range req.QuestIDs {
 		// Same double-claim guard as handleQuestClaim — see TryClaimQuestLock.
@@ -319,6 +344,14 @@ func (s *Server) handleQuestClaimAll(ctx *fasthttp.RequestCtx) {
 		}
 		if prog.ClaimedAt != 0 {
 			results = append(results, claimResult{QuestID: questID, Error: "already_claimed"})
+			release()
+			continue
+		}
+		// Same guard as handleQuestClaim — see the comment there.
+		if okIP, ierr := s.Store.CheckAndRecordIPRewardEligibility(ip, req.PlayerID); ierr != nil {
+			log.Printf("[QUEST_CLAIM_ALL] ip guard error player=%s quest=%s err=%v", req.PlayerID[:min8(req.PlayerID)], questID, ierr)
+		} else if !okIP {
+			results = append(results, claimResult{QuestID: questID, Error: "ip_account_limit"})
 			release()
 			continue
 		}

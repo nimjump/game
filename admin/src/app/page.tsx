@@ -12,18 +12,18 @@ import SessionsTab      from "@/components/SessionsTab";
 import FailedReplaysTab from "@/components/FailedReplaysTab";
 import ClientLogsTab    from "@/components/ClientLogsTab";
 import PlayersListTab   from "@/components/PlayersListTab";
+import StreakTab        from "@/components/StreakTab";
 import LeaderboardTab   from "@/components/LeaderboardTab";
 import AnalyticsTab     from "@/components/AnalyticsTab";
 import SystemTab        from "@/components/SystemTab";
 import DatabaseTab      from "@/components/DatabaseTab";
-import DeployTab        from "@/components/DeployTab";
 import VSRoomsTab       from "@/components/VSRoomsTab";
 import ErrorBoundary    from "@/components/ErrorBoundary";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 export type Tab =
   | "overview" | "completed" | "flagged" | "all"
-  | "failed_replays" | "logs" | "players" | "leaderboard" | "analytics" | "vsrooms" | "system" | "database" | "deploy";
+  | "failed_replays" | "logs" | "players" | "streaks" | "leaderboard" | "analytics" | "vsrooms" | "system" | "database";
 
 const TAB_LABELS: [Tab, string][] = [
   ["overview",        "Overview"],
@@ -35,10 +35,10 @@ const TAB_LABELS: [Tab, string][] = [
   ["leaderboard",     "Leaderboard"],
   ["vsrooms",         "VS Rooms"],
   ["players",         "Players"],
+  ["streaks",         "Streaks"],
   ["logs",            "Logs"],
   ["system",          "System"],
   ["database",        "Database"],
-  ["deploy",          "Deploy"],
 ];
 
 function fmtDur(sec: number) {
@@ -46,7 +46,7 @@ function fmtDur(sec: number) {
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
 }
 
-const SELF_CONTAINED_TABS: Tab[] = ["players", "leaderboard", "analytics", "vsrooms", "system", "database", "deploy"];
+const SELF_CONTAINED_TABS: Tab[] = ["players", "streaks", "leaderboard", "analytics", "vsrooms", "system", "database"];
 
 // ── Page ───────────────────────────────────────────────────────────────────────
 export default function AdminPage() {
@@ -223,6 +223,10 @@ export default function AdminPage() {
             <PlayersListTab />
           )}
 
+          {tab === "streaks" && (
+            <StreakTab />
+          )}
+
           {tab === "leaderboard" && (
             <LeaderboardTab />
           )}
@@ -241,10 +245,6 @@ export default function AdminPage() {
 
           {tab === "database" && (
             <DatabaseTab />
-          )}
-
-          {tab === "deploy" && (
-            <DeployTab />
           )}
 
           {isSessions && (

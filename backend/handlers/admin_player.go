@@ -207,11 +207,42 @@ func (s *Server) handleAdminPlayer(ctx *fasthttp.RequestCtx) {
 	// ── Device (last known, captured at wallet-auth verify) ────────────────────
 	device, _ := s.Store.GetPlayerDevice(playerID)
 
+	// ── Daily login streak ──────────────────────────────────────────────────
+	streak := s.Store.GetStreak(playerID)
+
+	// ── Cosmetics (character customization) ──────────────────────────────────
+	cosmetics := s.Store.GetCosmetics(playerID)
+
+	// ── Connection IP history (country-resolved, most recent first) ────────────
+	// Geo lookup is lazy/cached (see game.GetIPGeo) — only ever hits the
+	// external API once per distinct IP across the whole server, not once
+	// per admin page view.
+	type ipOut struct {
+		IP          string `json:"ip"`
+		CountryCode string `json:"country_code"`
+		CountryName string `json:"country_name"`
+		FirstSeen   int64  `json:"first_seen"`
+		LastSeen    int64  `json:"last_seen"`
+		Count       int    `json:"count"`
+	}
+	ipRecords := s.Store.ListPlayerIPs(playerID)
+	ips := make([]ipOut, 0, len(ipRecords))
+	for _, rec := range ipRecords {
+		geo := s.Store.GetIPGeo(rec.IP)
+		ips = append(ips, ipOut{
+			IP: rec.IP, CountryCode: geo.CountryCode, CountryName: geo.CountryName,
+			FirstSeen: rec.FirstSeen, LastSeen: rec.LastSeen, Count: rec.Count,
+		})
+	}
+
 	writeJSON(ctx, 200, map[string]any{
 		"player_id":    playerID,
 		"nickname":     nickname,
 		"cooldown_end": cooldownEnd,
 		"device":       device,
+		"streak":       streak,
+		"cosmetics":    cosmetics,
+		"ips":          ips,
 		"stats": map[string]any{
 			"best_score":      bestScore,
 			"total_games":     totalGames,
@@ -280,7 +311,7 @@ func (s *Server) handleAdminSessionPatch(ctx *fasthttp.RequestCtx) {
 		// Trust client score: set server_score = client_score, mark clean
 		// If replay log exists, run sim first
 		if sess.Log != "" {
-			result, simErr := game.SimulateReplayFast(sess.Log, sess.Seed, sess.Char, 90, sess.PlayerSeed)
+			result, simErr := game.SimulateReplayFast(sess.Log, sess.Seed, sess.Char, sess.GyroActive, 90, sess.PlayerSeed)
 			if simErr == nil && result != nil {
 				sess.ServerScore    = result.ServerScore
 				sess.TotalKills     = result.QuestKills
@@ -327,7 +358,7 @@ func (s *Server) handleAdminSessionPatch(ctx *fasthttp.RequestCtx) {
 		if sess.Log == "" {
 			writeErr(ctx, 400, "no_replay_log"); return
 		}
-		result, simErr := game.SimulateReplayFast(sess.Log, sess.Seed, sess.Char, 90, sess.PlayerSeed)
+		result, simErr := game.SimulateReplayFast(sess.Log, sess.Seed, sess.Char, sess.GyroActive, 90, sess.PlayerSeed)
 		if simErr != nil {
 			sess.ReplayError = simErr.Error()
 			sess.State       = models.StateReplayFailed

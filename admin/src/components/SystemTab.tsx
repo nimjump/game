@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState } from "react";
 import {
-  fetchAppConfig, saveAppConfig, setUpdateMode, completeUpdate, clearAllReplays,
+  fetchAppConfig, saveAppConfig, setUpdateActive, clearAllReplays,
   fetchReplayBinaryStatus, uploadReplayBinary, deleteReplayBinaryFile,
   fetchGoldenReplays, deleteGoldenReplay, runGoldenSelfTest, fetchDeterminismLint,
   fetchQuestPool, setQuestReward, setQuestTarget,
@@ -17,7 +17,8 @@ function fmtBytes(n: number) {
 
 function fmtDate(ts: number) {
   if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString("en-GB");
+  // Pinned to UTC+3 — see AnalyticsTab.tsx's fmt() for why.
+  return new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Istanbul" });
 }
 
 export default function SystemTab() {
@@ -29,7 +30,6 @@ export default function SystemTab() {
   const [uploading,setUploading]= useState(false);
   const [deletingFile, setDeletingFile] = useState<string | null>(null);
   const [clearing, setClearing] = useState(false);
-  const [versionInput, setVersionInput] = useState("1");
   const [capInput, setCapInput] = useState("100");
   const [coinRateInput, setCoinRateInput] = useState("1");
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -190,7 +190,6 @@ export default function SystemTab() {
     try {
       const [c, b] = await Promise.all([fetchAppConfig(), fetchReplayBinaryStatus()]);
       setCfg(c);
-      setVersionInput(String(c.replay_version));
       setCapInput(String(c.daily_earn_cap_nim && c.daily_earn_cap_nim > 0 ? c.daily_earn_cap_nim : 100));
       setCoinRateInput(String(c.coin_nim_rate && c.coin_nim_rate > 0 ? c.coin_nim_rate : 1));
       setBinary(b);
@@ -248,12 +247,11 @@ export default function SystemTab() {
     }
   }
 
-  async function saveVersion() {
-    const n = parseInt(versionInput, 10);
-    if (!Number.isFinite(n) || n <= 0) { alert("Version must be a positive number."); return; }
+  async function doActivate() {
+    if (!confirm("Activate: new games are blocked immediately for everyone. Continue?")) return;
     setSaving(true);
     try {
-      const updated = await saveAppConfig({ replay_version: n });
+      const updated = await setUpdateActive(true);
       setCfg(updated);
     } catch (e) {
       alert("Error: " + String(e));
@@ -262,29 +260,11 @@ export default function SystemTab() {
     }
   }
 
-  async function doSetMode(mode: "off" | "force" | "normal") {
-    if (mode === "force" && !confirm(
-      "Force update: new games are blocked immediately for everyone. Continue?"
-    )) return;
-    if (mode === "normal" && !confirm(
-      "Normal update: new games stay open until the current weekly leaderboard period ends, then block automatically. Continue?"
-    )) return;
+  async function doDeactivate() {
+    if (!confirm("Deactivate and resume play for everyone?")) return;
     setSaving(true);
     try {
-      const updated = await setUpdateMode(mode);
-      setCfg(updated);
-    } catch (e) {
-      alert("Error: " + String(e));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function doComplete() {
-    if (!confirm("Complete update and resume play for everyone?")) return;
-    setSaving(true);
-    try {
-      const updated = await completeUpdate();
+      const updated = await setUpdateActive(false);
       setCfg(updated);
     } catch (e) {
       alert("Error: " + String(e));
@@ -347,38 +327,30 @@ export default function SystemTab() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
 
-      {/* ── Update mode ── */}
+      {/* ── Game update lock ── */}
       <div className="card" style={{ padding: 16 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 12 }}>
-          <span style={{ fontWeight: 600, fontSize: 13 }}>Game Update Mode</span>
+          <span style={{ fontWeight: 600, fontSize: 13 }}>Game Update Lock</span>
           {cfg.update_active ? (
-            <span className="badge badge-red">⚠ ACTIVE — new games blocked</span>
-          ) : cfg.update_mode === "normal" ? (
-            <span className="badge badge-yellow">⏳ Scheduled — blocks when week {cfg.update_scheduled_week} ends</span>
+            <span className="badge badge-red">⚠ Active — new games locked</span>
           ) : (
-            <span className="badge badge-green">✓ Off — play as normal</span>
+            <span className="badge badge-green">✓ Deactivated — new games open</span>
           )}
         </div>
         <div style={{ fontSize: 12, color: "var(--text-muted)", marginBottom: 12, lineHeight: 1.6 }}>
-          <b>Force</b>: blocks starting new games immediately, for everyone.<br/>
-          <b>Normal</b>: keeps the game open until the current weekly leaderboard period ends, then
-          blocks automatically — use this for a clean push at week boundary.<br/>
-          While blocked, players see a &quot;Game updating&quot; toast instead of starting a new game.
-          Click <b>Complete Update</b> once the new client + replay binary are live to resume play.
+          While active, players see a &quot;Game updating&quot; toast instead of starting a new game —
+          anyone already mid-run is left alone, this only blocks new starts. Use this while pushing
+          a new client build; click Deactivate once it&apos;s live to resume play.
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button className="btn" disabled={saving} onClick={() => doSetMode("force")}>Force Update</button>
-          <button className="btn" disabled={saving} onClick={() => doSetMode("normal")}>Normal Update (end of week)</button>
-          <button className="btn" disabled={saving || cfg.update_mode === "off"} onClick={() => doSetMode("off")}>Cancel Scheduled Update</button>
-          <button className="btn btn-active" disabled={saving || (!cfg.update_active && cfg.update_mode === "off")} onClick={doComplete}>
-            ✓ Complete Update (resume play)
-          </button>
+          <button className="btn" disabled={saving || cfg.update_active} onClick={doActivate}>Activate</button>
+          <button className="btn btn-active" disabled={saving || !cfg.update_active} onClick={doDeactivate}>Deactivate</button>
         </div>
       </div>
 
-      {/* ── Leaderboards + replay version ── */}
+      {/* ── Leaderboards ── */}
       <div className="card" style={{ padding: 16 }}>
-        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 12 }}>Leaderboards &amp; Versioning</div>
+        <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 12 }}>Leaderboards</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, cursor: "pointer" }}>
             <input type="checkbox" checked={cfg.daily_leaderboard_enabled} disabled={saving}
@@ -390,20 +362,6 @@ export default function SystemTab() {
               onChange={() => toggleLeaderboard("weekly_leaderboard_enabled")} />
             Weekly leaderboard enabled
           </label>
-
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
-            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Replay version:</span>
-            <input type="number" min={1} value={versionInput}
-              onChange={e => setVersionInput(e.target.value)}
-              style={{ width: 80, padding: "4px 8px", fontSize: 13 }} />
-            <button className="btn" disabled={saving || versionInput === String(cfg.replay_version)} onClick={saveVersion}>
-              Save
-            </button>
-            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
-              Bump this whenever you push a new client build + replay binary together —
-              submits from an old client (mismatched version) are rejected and never saved.
-            </span>
-          </div>
 
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
             <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Daily earn cap (NIM):</span>

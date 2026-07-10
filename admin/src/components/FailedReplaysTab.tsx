@@ -5,7 +5,8 @@ import { retryReplay, adminSessionAction, type FailedReplay } from "@/lib/api";
 
 function fmt(ts: number) {
   if (!ts) return "—";
-  return new Date(ts * 1000).toLocaleString("en-GB");
+  // Pinned to UTC+3 — see AnalyticsTab.tsx's fmt() for why.
+  return new Date(ts * 1000).toLocaleString("en-GB", { timeZone: "Europe/Istanbul" });
 }
 function shortId(id: string) { return id ? id.slice(0, 10) + "…" : "—"; }
 

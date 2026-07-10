@@ -16,6 +16,11 @@ var _reset_lbl   : Label
 var _timer       : Timer
 var _quest_data  : Array = []
 var _anim_tween  : Tween = null
+# Unix timestamp of the next UTC+3 midnight, from the backend's /quests
+# response ("reset_at") — quests actually reset server-side at UTC+3
+# midnight (see handlers/quest.go), NOT at the player's own device midnight.
+# 0 until the first successful fetch.
+var _reset_at_unix : int = 0
 
 
 func setup(player_id: String) -> void:
@@ -26,7 +31,26 @@ func setup(player_id: String) -> void:
 
 
 func set_auth_token(token: String) -> void:
+	# BUG FIX: "Failed to connect to server" toast (network_error
+	# ctx=quests_fetch code=401) seen on some first launches only. Root
+	# cause: Main.gd's _sync_panels() calls set_player_id() the INSTANT the
+	# wallet address is known (_on_nimiq_ready — fires from
+	# NimiqBridge.poll(), independently of and often well BEFORE the async
+	# session-restore/sign flow actually resolves a token), and
+	# set_player_id() used to auto-_refresh() on every pid change
+	# regardless of whether _auth_token was populated yet. That fired an
+	# authenticated-quests fetch with NO Authorization header at all — a
+	# guaranteed 401 — only on the unlucky run where address-detection
+	# outraces auth resolving (later launches just happen to resolve auth
+	# fast enough not to hit it — same timing race, not deterministic).
+	# Fix: pid changes alone no longer trigger a fetch when there's still
+	# no token (see set_player_id below); this function instead fires the
+	# (now correctly-authed) refresh the moment a real token first shows
+	# up, mirroring the old pid-change trigger.
+	var had_token := _auth_token != ""
 	_auth_token = token
+	if not had_token and token != "" and _player_id != "":
+		_refresh()
 
 func set_auth_attempted(v: bool) -> void:
 	_auth_attempted = v
@@ -39,7 +63,13 @@ func set_player_id(player_id: String) -> void:
 	if _player_id == player_id:
 		return
 	_player_id = player_id
-	_refresh()
+	# See set_auth_token()'s comment — only auto-refresh here if we ALREADY
+	# have a real token (e.g. player_id changed mid-session, account
+	# switch, etc.); the common startup case (token not ready yet) is
+	# instead covered by set_auth_token() firing its own refresh once the
+	# token actually arrives, instead of racing an unauthenticated fetch.
+	if _auth_token != "":
+		_refresh()
 
 
 # ── Panel Open / Close ───────────────────────────────────────────
@@ -59,15 +89,16 @@ func show_panel() -> void:
 
 func hide_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
-	if is_instance_valid(_panel_ctrl):
-		_anim_tween = create_tween()
-		if _anim_tween:
-			_anim_tween.set_parallel(true)
-			_anim_tween.tween_property(_panel_ctrl, "modulate:a", 0.0,                 0.15).set_trans(Tween.TRANS_QUAD)
-			_anim_tween.tween_property(_panel_ctrl, "scale",      Vector2(0.92, 0.92), 0.15).set_trans(Tween.TRANS_QUAD)
-			_anim_tween.chain().tween_callback(func(): hide())
-			return
+	# BUG FIX: hide() used to only run inside a tween.chain().tween_callback()
+	# fired after the fade-out finished. If hide_panel() got called again
+	# before that fired, .kill() above stops the tween WITHOUT running its
+	# chained callback, so hide() never ran — this CanvasLayer (with its
+	# full-rect, input-blocking dim layer) stayed stuck on top of the lobby.
+	# Fix: hide immediately/synchronously, treat the fade as pure decoration.
 	hide()
+	if is_instance_valid(_panel_ctrl):
+		_panel_ctrl.modulate.a = 1.0
+		_panel_ctrl.scale      = Vector2.ONE
 
 
 # ── Countdown ────────────────────────────────────────────────────
@@ -81,9 +112,19 @@ func _start_countdown_timer() -> void:
 
 func _update_countdown() -> void:
 	if not is_instance_valid(_reset_lbl): return
-	var t          := Time.get_datetime_dict_from_system()
-	var secs_today := int(t["hour"]) * 3600 + int(t["minute"]) * 60 + int(t["second"])
-	var remaining  := maxi(86400 - secs_today, 0)
+	# BUG FIX: this used to compute "seconds until MY device's local midnight"
+	# via Time.get_datetime_dict_from_system() — but quests actually reset at
+	# UTC+3 midnight server-side (handlers/quest.go), not local midnight. Any
+	# player not on UTC+3 saw this hit "00:00:00" at the wrong real-world
+	# moment (too early or too late depending on their timezone), even though
+	# the actual reset/re-fetch always happened correctly server-side. Fixed
+	# by counting down to the server-provided _reset_at_unix (an absolute,
+	# timezone-agnostic unix timestamp) instead — same pattern StatsPanel.gd
+	# already uses for its daily-cap reset label.
+	if _reset_at_unix <= 0:
+		_reset_lbl.text = "Reset: --:--:--"
+		return
+	var remaining : int = maxi(_reset_at_unix - int(Time.get_unix_time_from_system()), 0)
 	_reset_lbl.text = "Reset: %02d:%02d:%02d" % [remaining / 3600, (remaining % 3600) / 60, remaining % 60]
 
 
@@ -233,7 +274,9 @@ func _fetch_quests() -> void:
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
-				_quest_data = j.get_data().get("quests", [])
+				var resp : Dictionary = j.get_data()
+				_quest_data = resp.get("quests", [])
+				_reset_at_unix = int(resp.get("reset_at", 0))
 				_build_quest_list()
 				return
 		_show_error("Could not connect to server. Code: %d" % code)
@@ -268,6 +311,33 @@ func _claim_quest(quest_id: String, claim_btn: Button) -> void:
 	http.request_completed.connect(func(result, code, _h, body):
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
+			# BUG FIX: this used to treat any 200 as "all claimed, done" and
+			# just re-fetch — but /quests/claim_all responds 200 with a
+			# per-item results[] array even when SOME items were blocked
+			# (e.g. "ip_account_limit"), the top-level status alone never
+			# reflected that. Surface the first blocked item's reason as a
+			# toast instead of silently pretending everything succeeded.
+			var j := JSON.new()
+			if j.parse(body.get_string_from_utf8()) == OK:
+				var d : Dictionary = j.get_data()
+				var results : Array = d.get("results", [])
+				for r in results:
+					var err_code : String = str(r.get("error", ""))
+					if err_code == "ip_account_limit":
+						Toast.get_instance().show_toast(
+							"Too many accounts have claimed from this connection today.", Toast.Kind.WARN)
+						break
+					elif err_code == "claim_in_progress":
+						Toast.get_instance().show_toast("A claim for this quest is already in progress.", Toast.Kind.WARN)
+						break
+					elif err_code == "not_completed":
+						Toast.get_instance().show_toast("That quest isn't completed yet.", Toast.Kind.WARN)
+						break
+					elif err_code != "" and err_code != "already_claimed":
+						# Unrecognized backend error code — still readable
+						# (not a raw snake_case string) rather than silent.
+						Toast.get_instance().show_toast("Could not claim: %s" % err_code, Toast.Kind.WARN)
+						break
 			_fetch_quests()
 		else:
 			claim_btn.text = "Claim Reward"
@@ -275,10 +345,10 @@ func _claim_quest(quest_id: String, claim_btn: Button) -> void:
 			if result != HTTPRequest.RESULT_SUCCESS:
 				Toast.network_error("quests_claim result=%d" % result)
 			else:
-				var j := JSON.new()
+				var j2 := JSON.new()
 				var err_msg: String = "Error (%d)" % code
-				if j.parse(body.get_string_from_utf8()) == OK:
-					err_msg = str(j.get_data().get("error", err_msg))
+				if j2.parse(body.get_string_from_utf8()) == OK:
+					err_msg = str(j2.get_data().get("error", err_msg))
 				Toast.get_instance().show_toast(err_msg, Toast.Kind.ERROR)
 	)
 	var headers : PackedStringArray = ["Content-Type: application/json"]
@@ -574,19 +644,25 @@ func _clear_list() -> void:
 
 static func _warm_btn(btn: Button, r: float = 8.0) -> void:
 	var ri := int(r)
-	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new()
-	for s in [sn, sh, sp]:
+	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new(); var sd := StyleBoxFlat.new()
+	for s in [sn, sh, sp, sd]:
 		s.corner_radius_top_left = ri; s.corner_radius_top_right = ri
 		s.corner_radius_bottom_left = ri; s.corner_radius_bottom_right = ri
 	sn.bg_color = Color(0.780, 0.380, 0.120)
 	sh.bg_color = Color(0.820, 0.450, 0.160)
 	sp.bg_color = Color(0.640, 0.300, 0.080)
-	btn.add_theme_stylebox_override("normal",  sn)
-	btn.add_theme_stylebox_override("hover",   sh)
-	btn.add_theme_stylebox_override("pressed", sp)
+	# BUG FIX: no "disabled" stylebox was set — a disabled button (e.g. an
+	# already-claimed quest) fell back to Godot's raw default grey panel,
+	# clashing with the warm bej/orange theme everywhere else.
+	sd.bg_color = Color(0.720, 0.660, 0.580)
+	btn.add_theme_stylebox_override("normal",   sn)
+	btn.add_theme_stylebox_override("hover",    sh)
+	btn.add_theme_stylebox_override("pressed",  sp)
+	btn.add_theme_stylebox_override("disabled", sd)
 	btn.add_theme_color_override("font_color",         Color(0.957, 0.898, 0.800))
 	btn.add_theme_color_override("font_hover_color",   Color(1.0, 1.0, 1.0))
 	btn.add_theme_color_override("font_pressed_color", Color(0.957, 0.898, 0.800))
+	btn.add_theme_color_override("font_disabled_color", Color(0.480, 0.420, 0.360))
 
 
 func _mpad(h: int, v: int) -> MarginContainer:

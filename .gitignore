@@ -30,11 +30,13 @@ yarn-error.log*
 .npm/
 
 # --- Go (backend/) ---
-backend/replay-verifier/*.exe
-backend/replay-verifier/*.zip
 backend/tmp/
 backend/data/
 backend/logs/
+
+# --- Build artifacts / archives (repo-wide, no exceptions) ---
+*.exe
+*.zip
 
 # --- OS / editor junk ---
 .DS_Store

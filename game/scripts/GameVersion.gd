@@ -1,17 +1,14 @@
-## GameVersion.gd — single source of truth for the client build version.
+## GameVersion.gd — client build version constant.
 ##
-## Sent with every replay submit ("client_version" field). The backend
-## compares it against its own configured replay_version (admin panel →
-## System tab). If they don't match, the submit is rejected and never
-## saved — old client builds can't send replays a newer/older replay
-## verifier binary wasn't built to check, and vice versa.
-##
-## Bump this number every time you cut a new client build that goes out
-## together with a new replay verifier binary (backend/replay-verifier),
-## then bump the matching "Replay version" field in the admin panel to
-## the SAME number once both are live. Until you do, existing clients
-## keep working — this all only exists to catch client/server version
-## drift, not to force people to be on a specific number.
+## REMOVED (on request): the backend used to reject a submit if this
+## didn't match an admin-configured "replay version" (409 version_mismatch,
+## see backend/game/appconfig.go's package doc comment for the full
+## removal). The server no longer checks this at all — GameManager.gd
+## still sends it as "client_version" on every submit (harmless, simply
+## ignored server-side now) so this constant is effectively unused, kept
+## only so that field isn't just deleted from the wire payload out of an
+## abundance of caution. Safe to remove entirely in a future pass if you
+## want to drop the field from the submit body too.
 class_name GameVersion
 extends RefCounted
 

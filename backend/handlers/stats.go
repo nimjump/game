@@ -172,7 +172,11 @@ func (s *Server) handleStats(ctx *fasthttp.RequestCtx) {
 		gameURL = "https://nimjump.io"
 	}
 
+	// ── Daily login streak ──────────────────────────────────────────────────
+	streak := s.Store.GetStreak(playerID)
+
 	writeJSON(ctx, 200, map[string]any{
+		"streak": streak.Count,
 		"player_id":       playerID,
 		"nickname":        nick,
 		"best_score":      bestScore,

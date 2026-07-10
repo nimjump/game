@@ -22,6 +22,11 @@ var auth_verified  := false
 var _restore_network_failed := false  # true = offline restore, don't trigger re-sign
 var auth_attempted := false
 var auth_expires_at : int = 0   # unix timestamp
+var streak : int = 0   # consecutive daily-login days including today — see backend/game/streak.go
+# NOTE: no auto-paid streak_reward field anymore — the NIM reward is
+# claim-based (player taps the lobby badge), see Main.gd's
+# _fetch_streak_status()/_claim_streak_reward() and
+# backend/handlers/streak.go.
 
 # _do_sign_auth() can be triggered from several independent places at once —
 # the PLAY button, the Settings "Connect" button, VS round start, AND
@@ -39,6 +44,28 @@ var auth_expires_at : int = 0   # unix timestamp
 # _do_sign_auth() a no-op while a sign attempt is already in progress,
 # instead of letting them race.
 var _signing_in_progress := false
+
+# BUG FIX: "Failed to connect to server" toast on literally every first
+# launch, before the player has touched anything. Root cause: poll()'s own
+# background auto-sign flow (_wait_for_safe_moment_then_sign(), fires the
+# instant the player is idle in the lobby — which is true immediately on
+# first load) calls _do_sign_auth() completely silently, with no user
+# gesture behind it at all. If that passive attempt's challenge-fetch or
+# verify HTTP call fails for ANY reason — a cold backend still warming up,
+# a transient blip, the wallet JS bridge not being fully ready yet — it hit
+# the same Toast.network_error(...) calls used for a real, user-initiated
+# sign attempt, scaring the player with a "connection failed" message for
+# something they never asked to happen. This flag lets _do_sign_auth()
+# distinguish "the player is actively trying to sign in" (show real errors)
+# from "this is our own passive background attempt" (fail quietly — poll()
+# / the player pressing Play later will just try again for real).
+var _silent_sign_attempt := false
+
+# Counts consecutive automatic retries triggered by a 401 from /backend/auth/
+# verify (see _verify_with_backend) — capped at 1 so a structural failure
+# can't silently re-prompt the wallet's native sign dialog over and over.
+# Reset to 0 on any successful verify or once the retry budget is exhausted.
+var _verify_401_retries := 0
 
 # BUG FIX: NimiqBridge is a plain child node created fresh every time Main.gd
 # runs (see Main._ready(), and "Play Again" -> get_tree().reload_current_scene()
@@ -123,15 +150,32 @@ func _poll() -> void:
 	is_ready = true
 
 	# _try_restore_session() is async HTTP — may not finish before poll starts.
-	# If token is in localStorage, wait up to 3s for restore to finish.
+	# If token is in localStorage, wait for restore to finish.
+	#
+	# BUG FIX: "asks me to sign in again every launch even though I'm
+	# already signed in" — this used to be a FIXED 5s wait (20 * 0.25s),
+	# after which poll() gave up and fell through to
+	# _wait_for_safe_moment_then_sign() regardless of whether the restore
+	# call was still genuinely in flight. On a slow connection (cold start,
+	# mobile data, first request warming up a sleeping backend) the actual
+	# /backend/auth/me round trip can easily take longer than 5s — poll()
+	# would stop waiting and pop a REAL wallet sign prompt for a session
+	# that was about to restore successfully a moment later anyway. Now
+	# waits on _restoring_session (the actual live state of that HTTP call,
+	# set by _try_restore_session() itself) instead of a guessed fixed
+	# duration — this can never wait forever, since that HTTP request has
+	# its own 5s timeout (see _try_restore_session()'s http.timeout) which
+	# always resolves _restoring_session back to false one way or another.
 	if not auth_verified:
 		var has_token = JavaScriptBridge.eval("!!localStorage.getItem('nj_auth_token')", true)
 		if has_token:
 			print("[NimiqBridge] waiting for session restore...")
-			for _sr in 20:
+			# _restoring_session may not have flipped true yet if this runs
+			# before _try_restore_session()'s own request() call lands —
+			# give it one frame's grace before trusting "false" as final.
+			await get_tree().create_timer(0.1).timeout
+			while _restoring_session and not auth_verified:
 				await get_tree().create_timer(0.25).timeout
-				if auth_verified:
-					break
 
 	# If token is valid but address differs (account changed) — re-sign
 	if auth_verified and auth_player_id != "" and nimiq_address != "" and \
@@ -174,11 +218,17 @@ func _is_mid_gameplay() -> bool:
 
 
 func _wait_for_safe_moment_then_sign() -> void:
-	while _is_mid_gameplay():
+	# Defense-in-depth alongside poll()'s own _restoring_session wait above —
+	# if a restore call is STILL in flight for any reason by the time this
+	# runs, wait for it too rather than popping a real sign prompt for a
+	# session that might resolve itself in the next moment.
+	while _is_mid_gameplay() or _restoring_session:
 		await get_tree().create_timer(1.0).timeout
 	if auth_verified: return  # got signed in some other way while waiting
-	print("[NimiqBridge] safe moment reached — starting sign auth now")
-	_do_sign_auth()
+	print("[NimiqBridge] safe moment reached — starting sign auth now (silent)")
+	# silent=true: this is our own passive background attempt, not something
+	# the player asked for — see _silent_sign_attempt's declaration comment.
+	_do_sign_auth(true)
 
 
 ## Check token in localStorage — emit auth_success if valid
@@ -192,9 +242,26 @@ func _try_restore_session() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 5.0
 	add_child(http)
+	# BUG FIX: "ERROR: Lambda capture at index 0 was freed. Passed 'null'
+	# instead." / gdscript_lambda_callable.cpp:242 — seen in production on
+	# multiple devices. Root cause: NimiqBridge is torn down and recreated
+	# fresh every round via Main.gd's "Play Again" -> get_tree().
+	# reload_current_scene() (see the class-level comment above and
+	# Main.gd's own "5-6 rounds" bug-fix comment). If a round ends and
+	# reloads while THIS http request is still in flight, both `http`
+	# (captured index 0 — freed as soon as NimiqBridge, its parent, is
+	# freed) and `self` (captured implicitly for the member access below)
+	# can already be gone by the time the response arrives, and resuming
+	# this Callable hits the freed capture(s). `is_instance_valid(http)`
+	# catches the first; a WeakRef on self is the one capture the engine
+	# can't silently null out for us, so check it ourselves before touching
+	# any NimiqBridge member.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return  # freed mid-flight (scene reload) — nothing left to clean up or update
 		http.queue_free()
+		if _alive.get_ref() == null: return  # NimiqBridge itself freed mid-flight — nothing left to update
 		_restoring_session = false  # resolved one way or another — see field comment above
 		# Network error / timeout — backend unreachable, do not touch token
 		if result != HTTPRequest.RESULT_SUCCESS or code == 0:
@@ -207,7 +274,21 @@ func _try_restore_session() -> void:
 				auth_expires_at = stored_exp
 				auth_verified   = true
 				_restore_network_failed = false  # we're fine
-				print("[NimiqBridge] Offline restore — trusting local token player=%s" % auth_player_id.left(8))
+				# BUG FIX: "streak badge doesn't show on first launch" — this
+				# branch fires whenever /backend/auth/me fails or times out
+				# (RESULT_SUCCESS false or code==0) but the cached token isn't
+				# expired yet — a flaky/cold first request is exactly the kind
+				# of thing that happens on a fresh app open (sleeping backend,
+				# slow mobile DNS/TLS). `streak` used to just stay at its
+				# script-default 0 here, since there's no server response to
+				# read it from — so auth_success still fired (the badge's
+				# other gates all passed) but with a 0 count, hiding the badge
+				# for a player who actually has a real streak. Read back the
+				# last-known value cached in localStorage on the last
+				# successful restore/sign instead of leaving it at 0.
+				streak = int(str(JavaScriptBridge.eval(
+					"localStorage.getItem('nj_auth_streak') || '0'", true)))
+				print("[NimiqBridge] Offline restore — trusting local token player=%s streak=%d" % [auth_player_id.left(8), streak])
 				auth_success.emit(auth_token, auth_player_id)
 			else:
 				# Expired but offline — leave token alone, set flag so poll() won't re-sign
@@ -228,7 +309,10 @@ func _try_restore_session() -> void:
 					auth_player_id  = restored_pid
 					auth_expires_at = restored_exp
 					auth_verified   = true
-					print("[NimiqBridge] Session restored player=%s expires=%d (%dd left)" % [auth_player_id.left(8), auth_expires_at, secs_left / 86400])
+					streak          = int(d.get("streak", 0))
+					print("[NimiqBridge] Session restored player=%s expires=%d (%dd left) streak=%d" % [auth_player_id.left(8), auth_expires_at, secs_left / 86400, streak])
+					JavaScriptBridge.eval(
+						"localStorage.setItem('nj_auth_streak', '%d')" % streak, true)
 					auth_success.emit(auth_token, auth_player_id)
 					return
 		# Backend says token invalid (401, etc.) — clear and re-sign
@@ -275,8 +359,8 @@ func _arm_signing_watchdog() -> void:
 
 
 ## Sign-based auth flow: get challenge → sign → verify → store token
-func _do_sign_auth() -> void:
-	print("[NimiqBridge] _do_sign_auth called auth_verified=%s addr=%s in_progress=%s" % [str(auth_verified), nimiq_address.left(12), str(_signing_in_progress)])
+func _do_sign_auth(silent: bool = false) -> void:
+	print("[NimiqBridge] _do_sign_auth called auth_verified=%s addr=%s in_progress=%s silent=%s" % [str(auth_verified), nimiq_address.left(12), str(_signing_in_progress), str(silent)])
 	if not OS.has_feature("web"): return
 	if auth_verified: return  # already logged in
 	if _signing_in_progress:
@@ -292,19 +376,27 @@ func _do_sign_auth() -> void:
 		# "challenge_not_found_or_expired". No-op instead of racing.
 		print("[NimiqBridge] sign already in progress — ignoring duplicate call")
 		return
-	_signing_in_progress = true
+	_signing_in_progress  = true
+	_silent_sign_attempt  = silent
 	_arm_signing_watchdog()
 
 	# 1. Get challenge
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# See _try_restore_session()'s comment for why both guards are needed:
+	# NimiqBridge (and this http child with it) can be freed mid-flight by
+	# a "Play Again" scene reload before the response arrives.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			push_warning("[NimiqBridge] Challenge fetch failed: %d" % code)
-			Toast.network_error("auth_challenge code=%d" % code)
+			if not _silent_sign_attempt:
+				Toast.network_error("auth_challenge code=%d" % code)
 			_fail_sign_auth("challenge_fetch_failed")
 			return
 		var j := JSON.new()
@@ -365,26 +457,51 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
+	# See _try_restore_session()'s comment — guards against a "Play Again"
+	# scene reload freeing this node (and NimiqBridge itself) before the
+	# verify response arrives.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if auth_verified or _active_verify_challenge != challenge:
 			print("[NimiqBridge] ignoring stale verify response for challenge=%s (already verified=%s, active=%s)" \
 				% [challenge.left(24), str(auth_verified), _active_verify_challenge.left(24)])
 			return
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			push_warning("[NimiqBridge] Auth verify failed: %d" % code)
-			if code == 401:
+			# BUG FIX: this used to retry on EVERY 401 with no cap at all — if
+			# something structural kept making verify fail (e.g. a stale/blank
+			# nimiq_address that never gets fixed between attempts), this was
+			# an unbounded loop that popped a brand new native wallet sign
+			# prompt each time around. That's exactly the reported "pressed
+			# Play, got asked to sign 3-4 times in a row" — the player has no
+			# way to know these are silent auto-retries, it just looks like
+			# the game is broken. One retry is enough to recover from a
+			# genuinely transient stale-challenge race; beyond that, fail
+			# cleanly so the player sees a normal error state and can press
+			# Play again themselves instead of getting silently re-prompted.
+			if code == 401 and _verify_401_retries < 1:
+				_verify_401_retries += 1
 				auth_verified = false
 				# Intentional sequential retry (challenge was rejected, get a
 				# fresh one), not a race — release the lock first so this
 				# call isn't blocked by its own now-stale guard state.
+				# Pass through the CURRENT attempt's silent-ness — this is a
+				# continuation of whichever attempt (background or
+				# user-initiated) triggered the original call, not a fresh
+				# independent one, so it must not reset back to noisy.
 				_signing_in_progress = false
-				_do_sign_auth()
+				_do_sign_auth(_silent_sign_attempt)
 				return
-			Toast.network_error("auth_verify code=%d" % code)
+			_verify_401_retries = 0
+			if not _silent_sign_attempt:
+				Toast.network_error("auth_verify code=%d" % code)
 			_fail_sign_auth("verify_failed_%d" % code)
 			return
+		_verify_401_retries = 0
 		var j := JSON.new()
 		if j.parse(body.get_string_from_utf8()) != OK:
 			_fail_sign_auth("verify_parse_error")
@@ -399,6 +516,7 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 		auth_player_id  = str(d.get("player_id", nimiq_address))
 		auth_expires_at = int(d.get("expires_at", 0))
 		auth_verified   = true
+		streak          = int(d.get("streak", 0))
 
 		# Save to localStorage
 		JavaScriptBridge.eval(
@@ -407,6 +525,10 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 			"localStorage.setItem('%s', '%s')" % [LS_AUTH_PID, auth_player_id], true)
 		JavaScriptBridge.eval(
 			"localStorage.setItem('nj_auth_exp', '%d')" % auth_expires_at, true)
+		# Cache streak too — see _try_restore_session()'s offline-trust
+		# fallback for why this matters.
+		JavaScriptBridge.eval(
+			"localStorage.setItem('nj_auth_streak', '%d')" % streak, true)
 
 		print("[NimiqBridge] Auth successful player=%s expires=%d" % [auth_player_id.left(8), auth_expires_at])
 
@@ -456,8 +578,12 @@ func _register_wallet_async(player_id: String, address: String) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# See _try_restore_session()'s comment — this is fire-and-forget and can
+	# easily outlive a "Play Again" scene reload that frees NimiqBridge (and
+	# this http child with it) before the response arrives.
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, _b):
+		if not is_instance_valid(http): return
 		http.queue_free()
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			print("[NimiqBridge] Wallet registered player=%s addr=%s" % [player_id.left(8), address.left(12)])

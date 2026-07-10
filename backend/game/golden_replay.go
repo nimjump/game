@@ -39,6 +39,7 @@ type GoldenReplay struct {
 	SourceSession string `json:"source_session,omitempty"`
 	Seed          int64  `json:"seed"`
 	Char          int    `json:"char"`
+	GyroActive    bool   `json:"gyro_active,omitempty"`
 	PlayerSeed    int64  `json:"player_seed"`
 	LogBase64     string `json:"log_base64"`
 	ExpectedScore int    `json:"expected_score"`
@@ -124,7 +125,7 @@ func RunGoldenSelfTest(goldens []GoldenReplay) []GoldenReplayResult {
 			ExpectedScore: g.ExpectedScore,
 			ExpectedTicks: g.ExpectedTicks,
 		}
-		sim, err := SimulateReplay(g.LogBase64, g.Seed, g.Char, 60, g.PlayerSeed)
+		sim, err := SimulateReplay(g.LogBase64, g.Seed, g.Char, g.GyroActive, 60, g.PlayerSeed)
 		if err != nil {
 			res.Error = err.Error()
 			log.Printf("[GOLDEN_SELFTEST] FAIL id=%s label=%q sim_error=%v", g.ID, g.Label, err)

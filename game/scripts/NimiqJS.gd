@@ -68,7 +68,21 @@ func await_request_account(timeout_sec: float = 30.0) -> Dictionary:
 ## Shortcut: request + wait (coroutine)
 func request_account(timeout_sec: float = 30.0) -> Dictionary:
 	start_request_account()
-	return await await_request_account(timeout_sec)
+	var result := await await_request_account(timeout_sec)
+	# BUG FIX: every "Connect Wallet" button in the game (StatsPanel,
+	# QuestPanel, LeaderboardPanel) and the Play-button wallet flow all
+	# funnel through this one function — and when there's genuinely no
+	# provider (window.nimiq doesn't exist, i.e. the page isn't running
+	# inside Nimiq Pay), this used to just return {ok:false, err:'no_provider'}
+	# with zero visible feedback: the button flips back to "Connect Wallet"
+	# and nothing else happens, which looks broken/dead rather than "you need
+	# to open this in the app." Same install popup the "Open ↗" banner button
+	# already shows (see index.html's showInstallPopup) — one popup, one
+	# consistent message, triggered from the single chokepoint instead of
+	# patching each panel separately.
+	if not result.get("ok", false) and str(result.get("err", "")) == "no_provider":
+		JavaScriptBridge.eval("if(window._showNimiqInstallPopup) window._showNimiqInstallPopup();", true)
+	return result
 
 
 # ── Provider method discovery ─────────────────────────────────────────────────
