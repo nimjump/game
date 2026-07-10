@@ -38,6 +38,10 @@ backend/logs/
 *.exe
 *.zip
 
+# --- Python bytecode ---
+*.pyc
+__pycache__/
+
 # --- OS / editor junk ---
 .DS_Store
 Thumbs.db
