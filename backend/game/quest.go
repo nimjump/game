@@ -202,57 +202,59 @@ type questTemplate struct {
 	reward  float64
 }
 
+// NOTE: default reward is 5 for EVERY quest (per request). Per-quest values can
+// still be overridden live from the admin panel (QuestRewardOverrides) without
+// touching this pool.
 var questPool = []questTemplate{
 	// ── Score / progress ───────────────────────────────────────────
-	{models.QuestScore,        1500,  "Score %d points in a single match",               10.0},
-	{models.QuestScore,        2500,  "Score %d points in a single match",               15.0},
-	{models.QuestScore,        4000,  "Score %d points in a single match",               20.0},
-	{models.QuestTotalScore,   5000,  "Earn %d total points today",                      12.0},
-	{models.QuestTotalScore,   10000, "Earn %d total points today",                      18.0},
+	{models.QuestScore,        1500,  "Score %d points in a single match",               5.0},
+	{models.QuestScore,        2500,  "Score %d points in a single match",               5.0},
+	{models.QuestScore,        4000,  "Score %d points in a single match",               5.0},
+	{models.QuestTotalScore,   5000,  "Earn %d total points today",                      5.0},
+	{models.QuestTotalScore,   10000, "Earn %d total points today",                      5.0},
 
 	// ── Match count ────────────────────────────────────────────────
-	{models.QuestGames,        3,     "Play %d matches today (300+ points each)",         8.0},
-	{models.QuestGames5,       5,     "Play %d matches today (300+ points each)",        12.0},
-	{models.QuestGames10,      10,    "Play %d matches today (300+ points each) — keep the streak alive!", 20.0},
+	{models.QuestGames,        3,     "Play %d matches today (300+ points each)",        5.0},
+	{models.QuestGames5,       5,     "Play %d matches today (300+ points each)",        5.0},
+	{models.QuestGames10,      10,    "Play %d matches today (300+ points each) — keep the streak alive!", 5.0},
 
 	// ── Enemy kills ────────────────────────────────────────────────
-	{models.QuestKills,        10,    "Kill %d enemies in a single match",                8.0},
-	{models.QuestKills,        20,    "Kill %d enemies in a single match",               12.0},
-	{models.QuestKills,        30,    "Kill %d enemies in a single match",               18.0},
-	{models.QuestKillsTotal,   40,    "Kill %d enemies across all matches today",        12.0},
-	{models.QuestKillsTotal,   80,    "Kill %d enemies across all matches today",        18.0},
-	{models.QuestMosquito,     5,     "Stomp %d mosquitoes",                              8.0},
-	{models.QuestMosquito,     10,    "Stomp %d mosquitoes",                             12.0},
-	{models.QuestFlying,       8,     "Kill %d flying enemies",                          10.0},
-	{models.QuestFlying,       15,    "Kill %d flying enemies",                          15.0},
-	{models.QuestNoDmgKill,    3,     "Kill %d enemies without taking any damage",       10.0},
-	{models.QuestNoDmgKill,    6,     "Kill %d enemies without taking any damage",       15.0},
-	{models.QuestMultiKill,    3,     "Kill %d different enemy types in one match",      12.0},
+	{models.QuestKills,        10,    "Kill %d enemies in a single match",               5.0},
+	{models.QuestKills,        20,    "Kill %d enemies in a single match",               5.0},
+	{models.QuestKills,        30,    "Kill %d enemies in a single match",               5.0},
+	{models.QuestKillsTotal,   40,    "Kill %d enemies across all matches today",        5.0},
+	{models.QuestKillsTotal,   80,    "Kill %d enemies across all matches today",        5.0},
+	{models.QuestMosquito,     5,     "Stomp %d mosquitoes",                             5.0},
+	{models.QuestMosquito,     10,    "Stomp %d mosquitoes",                             5.0},
+	{models.QuestFlying,       8,     "Kill %d flying enemies",                          5.0},
+	{models.QuestFlying,       15,    "Kill %d flying enemies",                          5.0},
+	{models.QuestNoDmgKill,    3,     "Kill %d enemies without taking any damage",       5.0},
+	{models.QuestNoDmgKill,    6,     "Kill %d enemies without taking any damage",       5.0},
+	{models.QuestMultiKill,    3,     "Kill %d different enemy types in one match",      5.0},
 
 	// ── Platform / movement ────────────────────────────────────────
-	{models.QuestAltitude,     2000,  "Reach score %d in a single match",                12.0},
-	{models.QuestAltitude,     3500,  "Reach score %d in a single match",                16.0},
-	{models.QuestNoHit,        1000,  "Reach %d points without taking any damage",       15.0},
-	{models.QuestSpeedrun,     1,     "Reach 1000 points in under 90 seconds",           15.0},
+	{models.QuestAltitude,     2000,  "Reach score %d in a single match",                5.0},
+	{models.QuestAltitude,     3500,  "Reach score %d in a single match",                5.0},
+	{models.QuestNoHit,        1000,  "Reach %d points without taking any damage",       5.0},
+	{models.QuestSpeedrun,     1,     "Reach 1000 points in under 90 seconds",           5.0},
 
 	// ── Coins / items ─────────────────────────────────────────────
-	{models.QuestCoinTotal,    10,    "Collect %d coins today",                           8.0},
-	{models.QuestCoinTotal,    25,    "Collect %d coins today",                          12.0},
-	{models.QuestCoinMatch,    5,     "Collect %d coins in one match",                    8.0},
-	{models.QuestCoinMatch,    8,     "Collect %d coins in one match",                   12.0},
-	{models.QuestGoldenCarot,  2,     "Collect %d golden carrots in one match",          12.0},
-	{models.QuestGoldenCarot,  4,     "Collect %d golden carrots in one match",          18.0},
-	{models.QuestItemHunter,   5,     "Pick up %d different item types today",           12.0},
-	{models.QuestPowerup,      3,     "Use %d powerups in one match",                    10.0},
-	{models.QuestPowerup,      6,     "Use %d powerups in one match",                    15.0},
-	{models.QuestNoCoins,      1,     "Reach 500+ points without collecting any coins",  12.0},
+	{models.QuestCoinTotal,    10,    "Collect %d coins today",                          5.0},
+	{models.QuestCoinTotal,    25,    "Collect %d coins today",                          5.0},
+	{models.QuestCoinMatch,    5,     "Collect %d coins in one match",                   5.0},
+	{models.QuestCoinMatch,    8,     "Collect %d coins in one match",                   5.0},
+	{models.QuestGoldenCarot,  2,     "Collect %d golden carrots in one match",          5.0},
+	{models.QuestGoldenCarot,  4,     "Collect %d golden carrots in one match",          5.0},
+	{models.QuestItemHunter,   5,     "Pick up %d different item types today",           5.0},
+	{models.QuestPowerup,      2,     "Use %d powerups in one match",                    5.0},
+	{models.QuestPowerup,      4,     "Use %d powerups in one match",                    5.0},
+	{models.QuestNoCoins,      1,     "Reach 500+ points without collecting any coins",  5.0},
 
 	// ── Style / challenge ─────────────────────────────────────────
-	{models.QuestStreak,       3,     "Pass 500 points in %d separate matches today",    15.0},
-	{models.QuestPacifist,     500,   "Reach %d points without killing a single enemy",  15.0},
-	{models.QuestNoDmgMatch,   1,     "Complete a match with min 500 points and no damage taken", 20.0},
-	{models.QuestHighJumpOnly, 200,   "Reach height %d using only jumps (no powerups)",  15.0},
-	{models.QuestMirrorRun,    1,     "Score 500+ points during a mirror-debuff run",    15.0},
+	{models.QuestStreak,       3,     "Pass 500 points in %d separate matches today",    5.0},
+	{models.QuestPacifist,     500,   "Reach %d points without killing a single enemy",  5.0},
+	{models.QuestNoDmgMatch,   1,     "Complete a match with min 500 points and no damage taken", 5.0},
+	{models.QuestHighJumpOnly, 500,   "Reach height %d using only jumps (no powerups)",  5.0},
 }
 
 // questDescription renders a template's description against the EFFECTIVE

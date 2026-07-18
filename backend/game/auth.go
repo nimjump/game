@@ -160,8 +160,21 @@ func (s *Store) GetSession(token string) (*models.AuthSession, error) {
 
 // ── Auth flow ─────────────────────────────────────────────────────────────────
 
-// VerifyAndLogin — verifies challenge + publicKey + signature, creates session
-func (s *Store) VerifyAndLogin(challenge, nimiqAddress, publicKeyHex, signatureHex, deviceID string) (*models.AuthSession, error) {
+// VerifyAndLogin — verifies challenge + publicKey + signature, creates session.
+//
+// authSource identifies which sign-in channel produced this login:
+// models.AuthSourceNimiqPay (real Nimiq Pay mini-app, via the mini-app SDK) or
+// models.AuthSourceWeb (plain browser tab, via the Nimiq Hub API popup).
+// QueueReward halves NIM payouts for AuthSourceWeb players (see game/nimiq.go)
+// — Nimiq Pay play is the "real" full-reward channel, web play is discounted.
+// Anything other than the two known constants is treated as web (the safe/
+// conservative default going forward — full reward is opt-in-by-proof, not
+// the fallback, for any NEW login from here on). This is a client-asserted
+// value like the rest of the app-signature scheme already in place: it stops
+// casual/careless forgery, not a determined attacker who reverse-engineers
+// the client, since both SDKs produce byte-identical signed-message proofs
+// server-side has no way to tell apart cryptographically.
+func (s *Store) VerifyAndLogin(challenge, nimiqAddress, publicKeyHex, signatureHex, deviceID, authSource string) (*models.AuthSession, error) {
 	// 1. Consume challenge (single-use + expiry check)
 	ac, err := s.consumeChallenge(challenge)
 	if err != nil {
@@ -176,14 +189,35 @@ func (s *Store) VerifyAndLogin(challenge, nimiqAddress, publicKeyHex, signatureH
 		return nil, fmt.Errorf("signature_invalid: %w", err)
 	}
 
+	// 2b. SECURITY (account-takeover fix): the signature above only proves the
+	// caller owns `publicKeyHex` — it says NOTHING about the `nimiqAddress` they
+	// CLAIM, which used to be trusted verbatim as the playerID. So anyone could
+	// sign the challenge with their OWN key and pass a VICTIM'S address, logging
+	// in as that victim. Bind the two: the claimed address MUST be the one this
+	// public key actually derives to, otherwise reject. (nimiqAddressesEqual
+	// normalises spacing/case, so this is format-agnostic — and we deliberately
+	// keep the playerID in its long-standing normalised-claim format below so
+	// existing accounts/data keyed by it are untouched.)
+	derivedAddr, derr := PublicKeyToNimiqAddress(publicKeyHex)
+	if derr != nil {
+		return nil, fmt.Errorf("pubkey_derive_failed: %w", derr)
+	}
+	if !nimiqAddressesEqual(derivedAddr, nimiqAddress) {
+		return nil, fmt.Errorf("address_pubkey_mismatch")
+	}
+
 	// 3. Normalize address
 	nimiqAddress = strings.ToUpper(strings.TrimSpace(nimiqAddress))
 
 	// playerID = Nimiq address (NQ...)
 	playerID := nimiqAddress
 
+	if authSource != models.AuthSourceNimiqPay && authSource != models.AuthSourceWeb {
+		authSource = models.AuthSourceWeb
+	}
+
 	// 4. Save wallet address (upsert)
-	_ = s.RegisterPlayerWallet(playerID, nimiqAddress)
+	_ = s.RegisterPlayerWallet(playerID, nimiqAddress, authSource)
 
 	// 5. Create session
 	return s.CreateSession(playerID, nimiqAddress, deviceID)

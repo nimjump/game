@@ -3,9 +3,7 @@ package handlers
 // origin.go — single source of truth for "does this request/connection come
 // from somewhere we actually expect" (the game's own domain, our own backend
 // domain, or a local dev box). Used by main.go's CORS middleware (rejects
-// disallowed browser Origins on every /backend/* HTTP request) and by
-// vs_live.go's WebSocket upgrader (rejects disallowed Origins on /live and
-// /watch upgrade requests).
+// disallowed browser Origins on every /backend/* HTTP request).
 //
 // Important honesty check: this is a real, meaningful hardening layer
 // against "some other website's JS quietly calls our API" or "a random

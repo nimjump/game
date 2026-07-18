@@ -13,6 +13,11 @@ const (
 	VSExpiredPayout      VSRoomStatus = "expired_payout"       // 24h passed, only one side played+paid, forfeit payout done
 	VSExpiredRefunded    VSRoomStatus = "expired_refunded"     // 24h passed, no real match happened — refunded
 	VSCancelled          VSRoomStatus = "cancelled"            // creator cancelled before opponent joined (only if unpaid/free)
+	// VSManualReview — a HELD state: one side's replay was flagged (possible
+	// cheat) or failed server re-simulation, so the match must NOT auto-settle
+	// or pay anyone out. It waits for an admin to investigate and resolve
+	// (declare a winner or refund both). NOT terminal — admin still acts on it.
+	VSManualReview       VSRoomStatus = "manual_review"
 )
 
 // VSRoom — one async 1v1 "VS" challenge room.
@@ -21,8 +26,17 @@ const (
 // before their own round; on settlement the winner receives 95% of the
 // pooled entries (5% system fee kept in the app wallet — no separate tx).
 type VSRoom struct {
-	ID       string `json:"id"`
-	Seed     string `json:"seed"` // decimal int64, matches game_seed format used elsewhere
+	ID string `json:"id"`
+	// ShortCode — a short, friendly, purely-numeric PUBLIC handle (4 digits for
+	// public rooms, 8 for private) used in the shareable invite link (?vs=1903)
+	// and shown to players. Unlike ID it is NOT globally unique forever: it's
+	// only unique among currently-active rooms and is recycled once a room ends
+	// (so "1903" can belong to a different room tomorrow). All security-relevant
+	// and internal operations — payment memo, storage key, etc. — use the long
+	// unguessable ID instead; ShortCode is purely a nicer public alias that the
+	// backend resolves back to a room (see GetVSRoomByShortCode).
+	ShortCode string `json:"short_code"`
+	Seed      string `json:"seed"` // decimal int64, matches game_seed format used elsewhere
 	EntryNIM float64 `json:"entry_nim"` // 0 = free room
 	// IsPrivate — if true, this room never appears in the public "open rooms"
 	// browse list; it only works via its direct invite link (still fully
@@ -40,6 +54,19 @@ type VSRoom struct {
 
 	OpponentID       string `json:"opponent_id,omitempty"`
 	OpponentNickname string `json:"opponent_nickname,omitempty"`
+
+	// ── Opponent slot reservation (INTERNAL — never exposed to clients) ──────
+	// Paying IS joining: a paid room's opponent slot (OpponentID above) is only
+	// ever set once the entry payment is confirmed. Until then the would-be
+	// opponent is merely "pending": they've tapped Accept and are paying, but
+	// they do NOT count as joined and appear nowhere as a participant. These
+	// fields exist only so (a) the reconciler can credit a genuinely-paid but
+	// never-confirmed opponent, and (b) the server can tell the pending payer
+	// themselves "here's your Pay button" on a re-fetch. json:"-" keeps them
+	// out of every API response, so no one ever sees an unpaid opponent.
+	PendingOpponentID       string `json:"-"`
+	PendingOpponentNickname string `json:"-"`
+	PendingOpponentSince    int64  `json:"-"`
 	OpponentPaid     bool   `json:"opponent_paid"`
 	OpponentPayTx    string `json:"opponent_pay_tx,omitempty"`
 	OpponentScore    *int   `json:"opponent_score,omitempty"`
@@ -57,6 +84,13 @@ type VSRoom struct {
 	CreatorForfeitRequested  bool `json:"creator_forfeit_requested,omitempty"`
 	OpponentForfeitRequested bool `json:"opponent_forfeit_requested,omitempty"`
 
+	// NeedsReview — set true the moment EITHER side's VS submission is flagged
+	// by anti-cheat or fails server replay re-simulation. While set, the match
+	// can never auto-settle/pay out — settleVSRoom parks it in VSManualReview
+	// for an admin to resolve. ReviewReason records why (which side + reason).
+	NeedsReview  bool   `json:"needs_review,omitempty"`
+	ReviewReason string `json:"review_reason,omitempty"`
+
 	WinnerID     string  `json:"winner_id,omitempty"`     // "" if tie-split or refunded
 	PayoutNIM    float64 `json:"payout_nim,omitempty"`     // total amount actually paid out (post-fee)
 	FeeNIM       float64 `json:"fee_nim,omitempty"`
@@ -66,13 +100,6 @@ type VSRoom struct {
 
 	CreatedAt int64 `json:"created_at"`
 	ExpiresAt int64 `json:"expires_at"` // CreatedAt + 24h
-
-	// Live — true while a participant is actively streaming their run via
-	// the live relay (see backend/handlers/vs_live.go). Transient — computed
-	// fresh on every response (handlers.IsVSRoomLive), never persisted to
-	// BadgerDB, so this deliberately has no json tag omitempty concerns; it's
-	// always set to the current truth right before serialization.
-	Live bool `json:"live"`
 }
 
 // IsFree — true if this room has no entry fee (pure friendly match).

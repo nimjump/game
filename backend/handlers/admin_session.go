@@ -197,6 +197,25 @@ func (s *Server) requireAdminSession(next fasthttp.RequestHandler) fasthttp.Requ
 			writeJSON(ctx, 401, map[string]any{"error": "not_authenticated"})
 			return
 		}
+		// CSRF defense (belt-and-suspenders with corsMiddleware's origin
+		// allowlist, which already 403s any /backend/admin request whose Origin
+		// is PRESENT but not allowed): for state-changing methods, REQUIRE an
+		// allowlisted Origin. Browsers set Origin on every cross-site request
+		// AND on same-origin POST/PUT/PATCH/DELETE, so a forged cross-site
+		// admin action always carries the attacker's (non-allowlisted) origin
+		// and is rejected here; a legitimate admin-panel fetch carries the
+		// admin app's own allowlisted origin. Fail closed if it's missing
+		// entirely (the one gap corsMiddleware's `if origin != ""` left open).
+		switch string(ctx.Method()) {
+		case "POST", "PUT", "PATCH", "DELETE":
+			origin := string(ctx.Request.Header.Peek("Origin"))
+			if origin == "" || !IsAllowedOrigin(origin) {
+				log.Printf("[ADMIN_CSRF] blocked mutating request origin=%q path=%s ip=%s", origin, ctx.Path(), realClientIP(ctx))
+				ctx.SetStatusCode(403)
+				writeJSON(ctx, 403, map[string]any{"error": "csrf_origin_required"})
+				return
+			}
+		}
 		next(ctx)
 	}
 }

@@ -34,7 +34,7 @@ func (s *Server) handleWalletRegister(ctx *fasthttp.RequestCtx) {
 		writeErr(ctx, 400, "invalid_nimiq_address")
 		return
 	}
-	if err := s.Store.RegisterPlayerWallet(playerID, req.NimiqAddress); err != nil {
+	if err := s.Store.RegisterPlayerWallet(playerID, req.NimiqAddress, ""); err != nil {
 		writeErr(ctx, 500, "save_error")
 		return
 	}

@@ -209,9 +209,22 @@ func main() {
 		dbPath = "./data/db"
 	}
 
-	// Badger DB
+	// Badger DB.
+	//
+	// SyncWrites(true): every committed transaction is fsync'd to disk BEFORE
+	// Update() returns. This is the "no payment can EVER be lost" guarantee —
+	// with the default (false), a committed write lingers in an OS/WAL buffer
+	// and a hard crash (kill -9, power loss, OS panic) between the commit and
+	// the next periodic flush would silently drop it. That's unacceptable for
+	// anything touching real money: a room marked paid, a queued payout, or a
+	// refund must be durably on disk the instant we consider it done. The
+	// throughput cost of an fsync-per-commit is irrelevant at this game's write
+	// volume, and correctness for money always wins. (Incoming VS payments are
+	// additionally self-healing via the chain reconciler, but SyncWrites makes
+	// EVERY write — including outgoing payouts/refunds — crash-durable too.)
 	opts := badger.DefaultOptions(dbPath).
 		WithLogger(nil).
+		WithSyncWrites(true).
 		WithValueLogFileSize(64 << 20) // 64 MB vlog files (default is 2 GB)
 	db, err := badger.Open(opts)
 	if err != nil {
@@ -333,14 +346,62 @@ func corsMiddleware(next fasthttp.RequestHandler) fasthttp.RequestHandler {
 	return func(ctx *fasthttp.RequestCtx) {
 		path := string(ctx.Path())
 
-		// COOP + COEP: required for SharedArrayBuffer / Atomics (thread support in Godot web export).
-		// Must be on ALL responses including static files.
-		ctx.Response.Header.Set("Cross-Origin-Opener-Policy", "same-origin")
-		ctx.Response.Header.Set("Cross-Origin-Embedder-Policy", "require-corp")
-
-		// Cross-Origin-Resource-Policy: allow Godot .wasm / .pck to be loaded cross-origin
-		// (needed when COEP is active — every sub-resource must opt in)
-		ctx.Response.Header.Set("Cross-Origin-Resource-Policy", "cross-origin")
+		// COOP + COEP: originally set for SharedArrayBuffer / Atomics (thread
+		// support in Godot web export) — but this project's export explicitly
+		// does NOT require threads (see index.html's
+		// Engine.getMissingFeatures({threads:false}) check and the
+		// GODOT_CONFIG['ensureCrossOriginIsolationHeaders']=false override),
+		// so crossOriginIsolated was never actually load-bearing for gameplay.
+		//
+		// BUG FIX ("invalid request" from the Nimiq Hub API popup on the web
+		// sign-in path): COOP "same-origin" (the strict value) puts any popup
+		// THIS page opens into a SEPARATE browsing-context group, severing the
+		// window.opener relationship — which is exactly how
+		// hub.nimiq.com's signMessage() popup talks back to us. With that
+		// link severed, the popup's own RPC handshake with our page fails and
+		// Hub surfaces it as "Invalid Request" — a well-known real-world
+		// footgun for any popup-based auth flow (Google Sign-In, OAuth, etc.)
+		// under strict COOP. "same-origin-allow-popups" keeps same-origin
+		// isolation from other TOP-LEVEL documents while explicitly carving
+		// out an exception for popups we open ourselves — exactly this case.
+		//
+		// ROUND 2 FIX: relaxing COOP alone did NOT fix "Invalid Request" (user
+		// confirmed it persists identically after deploy). Root cause was
+		// actually the OTHER half of the pair: Cross-Origin-Embedder-Policy:
+		// require-corp, which was still set below. A page that is
+		// cross-origin-isolated (COOP same-origin[-allow-popups] + COEP
+		// require-corp TOGETHER) cannot retain window.opener on ANY
+		// cross-origin popup, no matter how COOP alone is relaxed — this is a
+		// documented browser-level restriction (the same one that broke
+		// Google/Firebase OAuth popups site-wide when COEP started rolling
+		// out). COEP require-corp was only ever here for SharedArrayBuffer/
+		// thread support, which (per the comment above) this single-threaded
+		// export never needed. Removing it entirely is what actually restores
+		// the popup's opener link. Cross-Origin-Resource-Policy is dropped
+		// alongside it since it was only required to satisfy COEP.
+		//
+		// ROUND 3 FIX ("Connection was closed" / "Invalid Request" STILL
+		// persisting even with a genuine synchronous click opening the popup):
+		// confirmed via reading Nimiq Hub's own source (nimiq/hub RpcApi.ts +
+		// @nimiq/rpc PostMessageRpcClient) that this error is thrown when the
+		// popup's window.opener is NULL — Hub's 1s connect-timeout handler
+		// branches specifically on `window.opener === null`, abandons the
+		// postMessage handshake, and renders its "Invalid Request" page; our
+		// RPC client then sees the severed window handle as closed and rejects
+		// with "Connection was closed". The opener gets nulled by a COOP
+		// browsing-context-group SWITCH. Crucially, `same-origin-allow-popups`
+		// is only meaningful as the popup-escape-hatch for a page that is
+		// otherwise cross-origin ISOLATED (i.e. paired with COEP). With COEP
+		// already gone (round 2 above) this page is NOT isolated, so this COOP
+		// value buys us zero security/functionality — it only remains as a
+		// footgun that can still trigger a BCG switch (and thus null the
+		// popup's opener) against a cross-origin popup like hub.nimiq.com.
+		// `unsafe-none` (the default) is the classic, maximally-compatible
+		// setting that preserves a cross-origin popup's opener relationship in
+		// every browser — exactly what popup-based auth (OAuth, Google
+		// Sign-In, and Nimiq Hub) needs. Set explicitly rather than omitted so
+		// no upstream proxy/CDN default can silently reintroduce isolation.
+		ctx.Response.Header.Set("Cross-Origin-Opener-Policy", "unsafe-none")
 
 		// CORS for API endpoints only
 		if len(path) > 8 && path[:8] == "/backend" {

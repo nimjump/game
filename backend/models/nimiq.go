@@ -5,7 +5,22 @@ type PlayerWallet struct {
 	PlayerID     string `json:"player_id"`
 	NimiqAddress string `json:"nimiq_address"` // "NQ..." format
 	RegisteredAt int64  `json:"registered_at"`
+	// AuthSource records which sign-in channel produced the MOST RECENT
+	// successful login for this player: AuthSourceNimiqPay (inside the real
+	// Nimiq Pay mini-app, via the mini-app SDK) or AuthSourceWeb (a plain
+	// browser tab, via the Nimiq Hub API popup). Used by QueueReward to halve
+	// NIM payouts for web-sourced players (see game/nimiq.go). Empty string
+	// means this wallet was registered before this field existed — treated
+	// as AuthSourceNimiqPay at reward time (see QueueReward), since every
+	// login before this feature shipped could only have come from inside
+	// Nimiq Pay (the web sign-in path didn't exist yet).
+	AuthSource string `json:"auth_source,omitempty"`
 }
+
+const (
+	AuthSourceNimiqPay = "nimiq_pay"
+	AuthSourceWeb      = "web"
+)
 
 // RewardStatus — status of a pending reward
 type RewardStatus string
@@ -15,6 +30,13 @@ const (
 	RewardSent      RewardStatus = "sent"      // successfully sent
 	RewardFailed    RewardStatus = "failed"    // send failed, awaiting retry
 	RewardNoWallet  RewardStatus = "no_wallet" // player's wallet not registered
+	// RewardSkipped — terminal, permanently un-sendable: the recipient address
+	// equals the app's own payout wallet (sender == recipient), which the
+	// Nimiq mempool rejects outright ("Sender same as recipient"). Retrying can
+	// never help, so these are parked here instead of retried forever. Happens
+	// e.g. when someone plays/tests using the same wallet the app pays out from
+	// (notably the near-zero VS "match started" notification ping).
+	RewardSkipped   RewardStatus = "skipped"
 )
 
 // PendingReward — reward record that needs to be sent

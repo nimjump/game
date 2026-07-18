@@ -1,15 +1,14 @@
 package handlers
 
 // appsig.go — app-wide request signing. Every non-admin /backend/* request
-// (including the vsroom live/watch WebSocket upgrades — those still start
-// as a plain HTTP GET before hijacking) must carry `app_ts` (a Unix
+// must carry `app_ts` (a Unix
 // timestamp) and `app_sig` (an HMAC-SHA256 over the request path + that
 // timestamp, keyed by a secret shared with the game client — see
 // ApiConfig.gd's APP_SIGNING_KEY and sign_url()). Enforced centrally in
 // main.go's corsMiddleware, which wraps literally every route, so there is
 // no endpoint that can be reached without it.
 //
-// Same honesty note as origin.go and vs_live_security.go: the key is baked
+// Same honesty note as origin.go: the key is baked
 // into the compiled/exported game client, which is downloadable by anyone,
 // so this is not "impossible to reproduce" for someone willing to pull the
 // key out of the WASM/executable — no public web client can have a truly

@@ -17,7 +17,13 @@ import (
 // VS Rooms — async 1v1 "VS" challenge with optional NIM entry fee.
 // See backend/game/vsroom.go for the full flow description.
 
-const vsMaxEntryNIM = 100_000 // sanity cap — avoid fat-finger/overflow room amounts
+// vsMaxEntryNIM — NOT a product limit on how big a stake can be: the wallet
+// itself already blocks paying more than you actually hold, so there's no need
+// to cap what someone chooses to bet. This ceiling exists ONLY as an overflow
+// guard for the NIM→luna math (NIM * 100000 must stay well inside int64, which
+// overflows around ~92 trillion NIM). 1 billion is astronomically above any
+// real stake while keeping that math provably safe.
+const vsMaxEntryNIM = 1_000_000_000
 // Free (0 NIM) rooms are no longer allowed — every room needs a real stake.
 // The client keypad defaults to 100 and refuses to submit below this, but
 // enforce it here too since the client can't be trusted alone.
@@ -61,19 +67,29 @@ func (s *Server) handleVSRoomCreate(ctx *fasthttp.RequestCtx) {
 	}
 
 	writeJSON(ctx, 200, map[string]any{
-		"ok":          true,
-		"room":        room,
-		"invite_url":  vsRoomInviteURL(room.ID),
+		"ok": true,
+		// Strip the seed: a just-created room is unpaid, so the creator must
+		// not see it yet (see game.StripVSSeed / canSeeVSSeed — closes the
+		// free create->peek-seed->cancel grinding exploit). The seed arrives
+		// on the next room GET once the creator has actually paid.
+		"room":        game.StripVSSeed(*room, playerID),
+		"invite_url":  vsRoomInviteURL(room.ShortCode),
 		"pay_to":      s.Store.GetNimiqConfig().WalletAddress,
 		"pay_amount":  room.EntryNIM,
 		"pay_memo":    vsRoomMemoForRole(room.ID, "creator"),
 	})
 }
 
-// GET /backend/vsroom/{id}
+// GET /backend/vsroom/{id} — {id} accepts EITHER the long internal room ID OR
+// the short public ?vs= code (invite links carry the short code). Tries the
+// exact ID first, then resolves it as a ShortCode.
 func (s *Server) handleVSRoomGet(ctx *fasthttp.RequestCtx) {
 	roomID := ctx.UserValue("id").(string)
 	room, err := s.Store.GetVSRoom(roomID)
+	if err != nil || room == nil {
+		// Not an internal ID — maybe it's a public short code from an invite link.
+		room, err = s.Store.GetVSRoomByShortCode(roomID)
+	}
 	if err != nil || room == nil {
 		writeErr(ctx, 404, "room_not_found")
 		return
@@ -85,24 +101,7 @@ func (s *Server) handleVSRoomGet(ctx *fasthttp.RequestCtx) {
 	// before playing their own round. Strip it unless the caller is actually
 	// one of the room's two participants.
 	viewRoom := game.StripVSSeed(*room, playerID)
-	viewRoom.Live = IsVSRoomLive(viewRoom.ID)
-	resp := map[string]any{"ok": true, "room": viewRoom, "invite_url": vsRoomInviteURL(room.ID)}
-
-	// While the room is actually live, hand out the real seed + a signed
-	// watch ticket regardless of participant status. This isn't a new leak:
-	// watching the live input stream itself already fully reveals the
-	// platform/enemy layout in real time as it plays out, seed number or
-	// not, so gating the raw seed specifically no longer protects anything
-	// once a round is genuinely in progress — the StripVSSeed protection
-	// above still fully applies before anyone's played (waiting_opponent /
-	// awaiting_*_play with nobody streaming yet), which is the case that
-	// actually matters (scouting the layout before your own attempt).
-	if viewRoom.Live {
-		viewRoomWithSeed := viewRoom
-		viewRoomWithSeed.Seed = room.Seed
-		resp["room"] = viewRoomWithSeed
-		resp["watch_ticket"] = MakeWatchTicket(viewRoom.ID)
-	}
+	resp := map[string]any{"ok": true, "room": viewRoom, "invite_url": vsRoomInviteURL(room.ShortCode)}
 
 	// If the caller is a participant who still needs to pay, include the same
 	// pay_to/pay_amount/pay_memo fields create/join return — lets the panel
@@ -114,6 +113,14 @@ func (s *Server) handleVSRoomGet(ctx *fasthttp.RequestCtx) {
 			role = "creator"
 		} else if playerID == room.OpponentID && !room.OpponentPaid {
 			role = "opponent"
+		} else if room.OpponentID == "" && playerID == room.PendingOpponentID {
+			// Pay-to-join: this player tapped Accept and is the pending payer.
+			// They're NOT a committed opponent yet (OpponentID is still empty and
+			// nobody sees them as joined), but THEY need their Pay button back on
+			// a re-fetch. viewer_is_pending_opponent tells their own client to
+			// treat them as the paying opponent.
+			role = "opponent"
+			resp["viewer_is_pending_opponent"] = true
 		}
 		if role != "" {
 			resp["pay_to"] = s.Store.GetNimiqConfig().WalletAddress
@@ -147,13 +154,23 @@ func (s *Server) handleVSRoomJoin(ctx *fasthttp.RequestCtx) {
 	}
 
 	cfg := s.Store.GetNimiqConfig()
-	writeJSON(ctx, 200, map[string]any{
-		"ok":         true,
-		"room":       room,
+	resp := map[string]any{
+		"ok": true,
+		// Strip the seed — a paid room's opponent has only RESERVED the slot to
+		// pay; they haven't committed yet, so they must not scout the level
+		// before paying (see game.canSeeVSSeed). Delivered once they've paid.
+		"room":       game.StripVSSeed(*room, playerID),
 		"pay_to":     cfg.WalletAddress,
 		"pay_amount": room.EntryNIM,
 		"pay_memo":   vsRoomMemoForRole(room.ID, "opponent"),
-	})
+	}
+	// For a paid room the join didn't commit them — flag them as the pending
+	// payer so their own client shows the Pay button (OpponentID is still empty
+	// and no one else sees them as joined until the payment confirms).
+	if room.EntryNIM > 0 && room.OpponentID == "" {
+		resp["viewer_is_pending_opponent"] = true
+	}
+	writeJSON(ctx, 200, resp)
 }
 
 // POST /backend/vsroom/{id}/pay
@@ -179,7 +196,10 @@ func (s *Server) handleVSRoomConfirmPayment(ctx *fasthttp.RequestCtx) {
 		writeErr(ctx, 400, err.Error())
 		return
 	}
-	writeJSON(ctx, 200, map[string]any{"ok": true, "room": room})
+	// Payment just succeeded, so canSeeVSSeed now returns the seed to this
+	// player — but route it through StripVSSeed anyway (defense-in-depth: if
+	// the paid flag somehow isn't set, the seed still won't leak).
+	writeJSON(ctx, 200, map[string]any{"ok": true, "room": game.StripVSSeed(*room, playerID)})
 }
 
 // POST /backend/vsroom/{id}/cancel
@@ -231,12 +251,27 @@ func (s *Server) handleVSRoomMine(ctx *fasthttp.RequestCtx) {
 		writeErr(ctx, 500, "list_failed")
 		return
 	}
-	for i := range rooms {
-		rooms[i].Live = IsVSRoomLive(rooms[i].ID)
-	}
 	writeJSON(ctx, 200, map[string]any{
 		"ok": true, "rooms": rooms, "total": total, "offset": offset, "limit": limit,
 	})
+}
+
+// GET /backend/vsroom/pending-count — number of this player's matches that
+// are waiting on THEM (opponent joined, not finished, they haven't played
+// their round yet). Drives the red "it's your turn" badge on the VS tab in
+// the main menu. Cheap enough to poll periodically.
+func (s *Server) handleVSRoomPendingCount(ctx *fasthttp.RequestCtx) {
+	playerID := s.tokenPlayerID(ctx)
+	if playerID == "" {
+		writeErr(ctx, 401, "auth_required")
+		return
+	}
+	n, err := s.Store.CountVSRoomsNeedingAction(playerID)
+	if err != nil {
+		writeErr(ctx, 500, "count_failed")
+		return
+	}
+	writeJSON(ctx, 200, map[string]any{"ok": true, "count": n})
 }
 
 // GET /backend/vsroom/open?limit=&offset= — public browse list: rooms open
@@ -260,7 +295,6 @@ func (s *Server) handleVSRoomOpen(ctx *fasthttp.RequestCtx) {
 	rooms := make([]models.VSRoom, len(page))
 	for i, r := range page {
 		rooms[i] = game.StripVSSeed(r, "")
-		rooms[i].Live = IsVSRoomLive(rooms[i].ID)
 	}
 	writeJSON(ctx, 200, map[string]any{
 		"ok": true, "rooms": rooms, "total": total, "offset": offset, "limit": limit,
@@ -296,9 +330,6 @@ func (s *Server) handleAdminVSRooms(ctx *fasthttp.RequestCtx) {
 	}
 	limit, offset := queryPage(ctx, 100)
 	rooms, total := game.PaginateVSRooms(all, limit, offset)
-	for i := range rooms {
-		rooms[i].Live = IsVSRoomLive(rooms[i].ID)
-	}
 	writeJSON(ctx, 200, map[string]any{
 		"ok": true, "rooms": rooms, "total": total, "offset": offset, "limit": limit,
 	})
@@ -330,14 +361,48 @@ func (s *Server) handleAdminVSRoomsReconcile(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, map[string]any{"ok": true})
 }
 
+// POST /backend/admin/vs-rooms/{id}/resolve — declare the winner of a disputed /
+// under-review match and pay it out. Body: {"outcome":"creator|opponent|tie"}.
+func (s *Server) handleAdminVSRoomResolve(ctx *fasthttp.RequestCtx) {
+	roomID := ctx.UserValue("id").(string)
+	var req struct {
+		Outcome string `json:"outcome"`
+	}
+	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+		writeErr(ctx, 400, "bad_json")
+		return
+	}
+	room, err := s.Store.AdminResolveVSRoomWinner(roomID, req.Outcome)
+	if err != nil {
+		writeErr(ctx, 400, err.Error())
+		return
+	}
+	writeJSON(ctx, 200, map[string]any{"ok": true, "room": room})
+}
+
+// POST /backend/admin/vs-rooms/{id}/reopen — wipe scores + review, fresh seed,
+// reset the play window so both funded players can replay the match cleanly.
+func (s *Server) handleAdminVSRoomReopen(ctx *fasthttp.RequestCtx) {
+	roomID := ctx.UserValue("id").(string)
+	room, err := s.Store.AdminReopenVSRoom(roomID)
+	if err != nil {
+		writeErr(ctx, 400, err.Error())
+		return
+	}
+	writeJSON(ctx, 200, map[string]any{"ok": true, "room": room})
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-func vsRoomInviteURL(roomID string) string {
+// vsRoomInviteURL builds the shareable link from the room's PUBLIC ShortCode
+// (not the long internal ID) — "?vs=1903". The backend resolves that code back
+// to the room on the GET route (see handleVSRoomGet).
+func vsRoomInviteURL(shortCode string) string {
 	baseURL := os.Getenv("GAME_URL")
 	if baseURL == "" {
 		baseURL = "https://nimjump.io"
 	}
-	return fmt.Sprintf("%s/?vsroom=%s", baseURL, roomID)
+	return fmt.Sprintf("%s/?vs=%s", baseURL, shortCode)
 }
 
 func vsRoomMemoForRole(roomID, role string) string {

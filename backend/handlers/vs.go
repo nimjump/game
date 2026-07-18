@@ -7,9 +7,7 @@ package handlers
 // raw input relay between two connected players). It was never reachable
 // from the shipped game (no invite-link generator existed for it) and has
 // been fully replaced by the VS Rooms system (backend/game/vsroom.go +
-// backend/handlers/vsroom.go), which now also carries a live spectator
-// relay (see vs_live.go) covering the same "watch a match in progress" use
-// case this legacy system was originally meant for.
+// backend/handlers/vsroom.go).
 //
 // The routes that used to point here were removed from server.go. Nothing
 // elsewhere in the codebase references any identifier that used to live in

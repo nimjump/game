@@ -149,11 +149,22 @@ func getEnvFloat(key string, fallback float64) float64 {
 
 // ── Player wallet ─────────────────────────────────────────────────────────────
 
-func (s *Store) RegisterPlayerWallet(playerID, nimiqAddress string) error {
+// authSource: models.AuthSourceNimiqPay / models.AuthSourceWeb, or "" when the
+// caller doesn't know/isn't a real login (e.g. the legacy /bj/wallet/register
+// bind-only endpoint) — in that case the player's previously-known AuthSource
+// (if any) is preserved instead of being wiped back to empty.
+func (s *Store) RegisterPlayerWallet(playerID, nimiqAddress, authSource string) error {
+	src := authSource
+	if src == "" {
+		if existing, _ := s.GetPlayerWallet(playerID); existing != nil {
+			src = existing.AuthSource
+		}
+	}
 	pw := models.PlayerWallet{
 		PlayerID:     playerID,
 		NimiqAddress: nimiqAddress,
 		RegisteredAt: time.Now().Unix(),
+		AuthSource:   src,
 	}
 	data, err := json.Marshal(pw)
 	if err != nil {
@@ -269,13 +280,42 @@ func (s *Store) ListRewardsByPlayer(playerID string, limit int) ([]models.Pendin
 
 // ── Main reward function — SAVE FIRST, then send ─────────────────────────────
 
+// WebAuthRewardMultiplier — NIM reward multiplier applied when the player's
+// most recent login (models.PlayerWallet.AuthSource) came through the web
+// (Nimiq Hub API popup) sign-in channel rather than the real Nimiq Pay app.
+// Legacy wallets with an empty AuthSource (registered before this field
+// existed) are NOT discounted — every login before the web sign-in path
+// shipped could only have come from inside Nimiq Pay.
+const WebAuthRewardMultiplier = 0.5
+
 // QueueReward — saves reward to DB first, then attempts to send.
 // If sending fails, the record is not deleted — the retry loop continues.
+// Applies WebAuthRewardMultiplier for web-sourced players. Use this for every
+// real "prize" payout (leaderboard, quest, streak, VS win/split/forfeit,
+// in-game coin earn). For payouts that are NOT really a prize — a VS room
+// refund (returning the player's own entry fee) or the cosmetic join-ping
+// notification — use QueueRewardRaw instead, which skips the multiplier.
 func (s *Store) QueueReward(playerID string, amountNIM float64, reason string) (*models.PendingReward, error) {
+	return s.queueReward(playerID, amountNIM, reason, true)
+}
+
+// QueueRewardRaw — identical to QueueReward but never applies
+// WebAuthRewardMultiplier. See QueueReward's doc comment for when to use this
+// instead (refunds, cosmetic pings — anything that isn't actually a prize).
+func (s *Store) QueueRewardRaw(playerID string, amountNIM float64, reason string) (*models.PendingReward, error) {
+	return s.queueReward(playerID, amountNIM, reason, false)
+}
+
+func (s *Store) queueReward(playerID string, amountNIM float64, reason string, applyChannelMultiplier bool) (*models.PendingReward, error) {
 	// Look up player's wallet address
 	walletInfo, err := s.GetPlayerWallet(playerID)
 	if err != nil {
 		return nil, fmt.Errorf("wallet_lookup: %w", err)
+	}
+
+	if applyChannelMultiplier && walletInfo != nil && walletInfo.AuthSource == models.AuthSourceWeb {
+		amountNIM *= WebAuthRewardMultiplier
+		reason = reason + ":web_half"
 	}
 
 	reward := &models.PendingReward{
@@ -480,6 +520,22 @@ func (s *Store) attemptSend(reward *models.PendingReward) {
 	reward.LastAttempt = time.Now().Unix()
 
 	cfg := s.GetNimiqConfig()
+
+	// Permanent guard: a tx whose recipient equals our own payout wallet
+	// (sender == recipient) is rejected by the Nimiq mempool every single time
+	// ("Sender same as recipient"), so retrying it forever just spams the log
+	// and clogs the queue. Park it in a terminal "skipped" state instead of
+	// the retry loop. This mainly happens when a player uses the very wallet
+	// the app pays out from — most often the near-zero VS "match started"
+	// notification ping to that same address.
+	if nimiqAddressesEqual(reward.NimiqAddress, cfg.WalletAddress) {
+		reward.Status   = models.RewardSkipped
+		reward.ErrorMsg = "recipient_equals_sender_wallet"
+		log.Printf("[REWARD] SKIPPED id=%s reason=%s — recipient equals app wallet (sender==recipient, un-sendable)", reward.ID, reward.Reason)
+		_ = s.saveReward(reward)
+		return
+	}
+
 	txHash, err := nimiqSendTransaction(cfg, reward.NimiqAddress, reward.AmountLuna, buildMemo(reward.AmountNIM, reward.Reason))
 
 	if err != nil {

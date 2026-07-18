@@ -95,6 +95,12 @@ type AppConfig struct {
 	// STREAK_REWARD_MAX_NIM → 10.0 NIM default.
 	StreakRewardMaxNIM *float64 `json:"streak_reward_max_nim,omitempty"`
 
+	// VSFeePercent — admin-editable system fee (in PERCENT, 0–100) taken from a
+	// VS match pot on settlement; the winner receives the remaining
+	// (100 - VSFeePercent)%. Pointer because 0 is a legitimate choice ("no fee —
+	// winner takes the whole pot"). nil → the 5% default (see VSFeeFraction).
+	VSFeePercent *float64 `json:"vs_fee_percent,omitempty"`
+
 	// MaxRewardAccountsPerIP — anti-multi-accounting guard (see
 	// game/ip_reward_guard.go): the same IP can only receive a NIM reward
 	// (streak claim today, initially — see that file's doc comment for how

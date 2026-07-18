@@ -48,6 +48,9 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 		// MaxRewardAccountsPerIP — see game/ip_reward_guard.go. Minimum 1
 		// enforced (0 would mean "block every claim from every IP").
 		MaxRewardAccountsPerIP *int `json:"max_reward_accounts_per_ip"`
+		// VSFeePercent — system fee % taken from a VS pot (0..100). 0 is valid
+		// (no fee), so it's a pointer like the streak knobs.
+		VSFeePercent *float64 `json:"vs_fee_percent"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
@@ -77,6 +80,9 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	}
 	if req.MaxRewardAccountsPerIP != nil && *req.MaxRewardAccountsPerIP >= 1 {
 		cfg.MaxRewardAccountsPerIP = req.MaxRewardAccountsPerIP
+	}
+	if req.VSFeePercent != nil && *req.VSFeePercent >= 0 && *req.VSFeePercent <= 100 {
+		cfg.VSFeePercent = req.VSFeePercent
 	}
 	if err := s.Store.SaveAppConfig(cfg); err != nil {
 		writeErr(ctx, 500, "save_error")

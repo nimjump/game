@@ -140,6 +140,23 @@ func slip10ChildKey(parentKey, parentChain []byte, index uint32) (key, chain []b
 }
 
 
+// PublicKeyToNimiqAddress derives the user-friendly Nimiq address that an
+// Ed25519 public key (32-byte hex) corresponds to — address = Blake2b-256 of
+// the public key, first 20 bytes, IBAN-encoded. Used by auth to prove that a
+// login's claimed address actually belongs to the key that signed the
+// challenge (see VerifyAndLogin) — without this the address is just an
+// unverified client claim and anyone could impersonate anyone.
+func PublicKeyToNimiqAddress(pubKeyHex string) (string, error) {
+	pub, err := hex.DecodeString(pubKeyHex)
+	if err != nil || len(pub) != 32 {
+		return "", fmt.Errorf("invalid_public_key")
+	}
+	h, _ := blake2b.New256(nil)
+	h.Write(pub)
+	addrBytes := h.Sum(nil)[:20]
+	return nimiqEncodeAddress(addrBytes), nil
+}
+
 // ── Nimiq address encoding ────────────────────────────────────────────────────
 
 // nimiqEncodeAddress encodes 20 raw bytes as a Nimiq user-friendly address.

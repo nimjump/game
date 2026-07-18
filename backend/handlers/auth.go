@@ -43,6 +43,12 @@ func (s *Server) handleAuthVerify(ctx *fasthttp.RequestCtx) {
 		Platform  string `json:"platform,omitempty"`
 		Screen    string `json:"screen,omitempty"`
 		DPR       string `json:"dpr,omitempty"`
+		// AuthSource: "nimiq_pay" (signed via the real Nimiq Pay mini-app SDK)
+		// or "web" (signed via the Nimiq Hub API popup, plain browser). Drives
+		// the reward-halving in game.Store.QueueReward — see VerifyAndLogin's
+		// doc comment for why this is client-asserted and what that does/
+		// doesn't protect against.
+		AuthSource string `json:"auth_source,omitempty"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
@@ -71,7 +77,7 @@ func (s *Server) handleAuthVerify(ctx *fasthttp.RequestCtx) {
 	}
 
 	log.Printf("[AUTH] verify attempt chal=%s pub=%s sig=%s", req.Challenge, req.PublicKey[:8], req.Signature[:8])
-	sess, err := s.Store.VerifyAndLogin(req.Challenge, req.NimiqAddress, req.PublicKey, req.Signature, req.DeviceID)
+	sess, err := s.Store.VerifyAndLogin(req.Challenge, req.NimiqAddress, req.PublicKey, req.Signature, req.DeviceID, req.AuthSource)
 	if err != nil {
 		log.Printf("[AUTH] verify failed addr=%s err=%v", req.NimiqAddress[:min8(req.NimiqAddress)], err)
 		// Return a generic error — do not leak internal details.
@@ -121,13 +127,12 @@ func (s *Server) handleAuthVerify(ctx *fasthttp.RequestCtx) {
 
 // GET /bj/auth/me?token=xxx  — checks token validity
 func (s *Server) handleAuthMe(ctx *fasthttp.RequestCtx) {
-	token := string(ctx.QueryArgs().Peek("token"))
-	if token == "" {
-		// Bearer header'dan da al
-		auth := string(ctx.Request.Header.Peek("Authorization"))
-		if strings.HasPrefix(auth, "Bearer ") {
-			token = auth[7:]
-		}
+	// Bearer header only — tokens are never accepted from the query string
+	// (they'd leak into access/proxy logs and Referer headers).
+	token := ""
+	auth := string(ctx.Request.Header.Peek("Authorization"))
+	if strings.HasPrefix(auth, "Bearer ") {
+		token = strings.TrimSpace(auth[7:])
 	}
 	if token == "" {
 		writeErr(ctx, 401, "token_required")

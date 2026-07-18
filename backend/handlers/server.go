@@ -35,8 +35,10 @@ func (s *Server) Register(r *router.Router) {
 		return s.rl.Middleware(h, isAuthed)
 	}
 
-	// Admin login — no auth required to reach these (this IS the auth).
-	r.POST("/backend/admin/login", s.handleAdminLogin)
+	// Admin login — no auth required to reach these (this IS the auth). Rate-
+	// limited (rl) to blunt online password brute-force; the credential check
+	// itself is already constant-time (see handleAdminLogin).
+	r.POST("/backend/admin/login", rl(s.handleAdminLogin))
 	r.POST("/backend/admin/logout", s.handleAdminLogout)
 	r.GET("/backend/admin/me", s.handleAdminMe)
 
@@ -167,27 +169,22 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/cosmetics/buy", rl(s.handleCosmeticsBuy))
 	r.POST("/backend/cosmetics/equip", rl(s.handleCosmeticsEquip))
 
-	// VS Rooms — async 1v1 challenge with optional NIM entry fee, plus a
-	// live spectator relay (see vs_live.go) for whichever side is currently
-	// playing their round.
+	// VS Rooms — async 1v1 challenge with optional NIM entry fee.
 	r.POST("/backend/vsroom/create", rl(s.handleVSRoomCreate))
 	r.GET("/backend/vsroom/mine", rl(s.handleVSRoomMine))
+	r.GET("/backend/vsroom/pending-count", rl(s.handleVSRoomPendingCount))
 	r.GET("/backend/vsroom/open", rl(s.handleVSRoomOpen))
 	r.GET("/backend/vsroom/{id}", rl(s.handleVSRoomGet))
 	r.POST("/backend/vsroom/{id}/join", rl(s.handleVSRoomJoin))
 	r.POST("/backend/vsroom/{id}/pay", rl(s.handleVSRoomConfirmPayment))
 	r.POST("/backend/vsroom/{id}/cancel", rl(s.handleVSRoomCancel))
 	r.POST("/backend/vsroom/{id}/forfeit", rl(s.handleVSRoomForfeit))
-	// Rate-limited like every other route (guards the handshake itself
-	// against reconnect-storm/scan abuse — the already-open WS connection's
-	// own frame traffic afterward is unaffected). Origin is separately
-	// checked at upgrade time in vs_live.go's CheckOrigin.
-	r.GET("/backend/vsroom/{id}/live", rl(s.handleVSRoomLivePlay))   // player streams their run
-	r.GET("/backend/vsroom/{id}/watch", rl(s.handleVSRoomLiveWatch)) // spectator
 	r.GET("/backend/admin/vs-rooms", s.requireAdminSession(s.handleAdminVSRooms))
 	r.POST("/backend/admin/vs-rooms/sweep", s.requireAdminSession(s.handleAdminVSRoomsSweep))
 	r.POST("/backend/admin/vs-rooms/reconcile-payments", s.requireAdminSession(s.handleAdminVSRoomsReconcile))
 	r.POST("/backend/admin/vs-rooms/{id}/cancel", s.requireAdminSession(s.handleAdminVSRoomCancel))
+	r.POST("/backend/admin/vs-rooms/{id}/resolve", s.requireAdminSession(s.handleAdminVSRoomResolve))
+	r.POST("/backend/admin/vs-rooms/{id}/reopen", s.requireAdminSession(s.handleAdminVSRoomReopen))
 }
 
 // StartBackgroundServices — starts retry loop, balance monitor, and the
@@ -563,6 +560,14 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		sid8, req.Score, flagged, req.PlayerID)
 	// ─────────────────────────────────────────────────────────────────────────
 
+	// A submission flagged up-front (basic anti-cheat, before replay sim even
+	// runs) that belongs to a VS match must also send that match to manual
+	// review — otherwise the flagged side would just be silently dropped and the
+	// other side could auto-forfeit-win at expiry.
+	if flagged && req.VSRoomID != "" {
+		s.Store.FlagVSRoomForReview(req.VSRoomID, req.VSRole, "anti_cheat: "+reason)
+	}
+
 	// Replay simulation (background)
 	if !flagged {
 		// BUG-AVOIDANCE: ctx (fasthttp.RequestCtx) gets reused/reset by
@@ -589,6 +594,12 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 				stored.State = models.StateReplayFailed
 				stored.ReplayError = "all retries exhausted"
 				_ = s.Store.Save(stored)
+				// If this was one side of a VS match, the match must NOT auto-settle
+				// (that would forfeit-win the other side off a replay we couldn't
+				// even verify) — hold it for manual admin review instead.
+				if vsRoomID != "" {
+					s.Store.FlagVSRoomForReview(vsRoomID, vsRole, "replay_failed: all retries exhausted")
+				}
 				return
 			}
 
@@ -638,9 +649,14 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 			// ── VS room score reporting ──────────────────────────────────────
 			// Only the server-verified score is ever trusted here — a flagged
 			// (client/server mismatch or anti-cheat) submission never counts
-			// toward a VS match.
-			if !simFlagged && vsRoomID != "" {
-				if _, verr := s.Store.UpdateVSRoomScore(vsRoomID, vsRole, result.ServerScore, sessionID); verr != nil {
+			// toward a VS match. Instead of just being dropped (which would let
+			// the OTHER side auto-forfeit-win the pot at expiry), a flagged VS
+			// side sends the whole match to MANUAL REVIEW so no money moves until
+			// an admin has looked at it.
+			if vsRoomID != "" {
+				if simFlagged {
+					s.Store.FlagVSRoomForReview(vsRoomID, vsRole, "score_mismatch: "+simReason)
+				} else if _, verr := s.Store.UpdateVSRoomScore(vsRoomID, vsRole, result.ServerScore, sessionID); verr != nil {
 					log.Printf("[VSROOM] score update failed room=%s role=%s session=%s err=%v", vsRoomID, vsRole, sessionID[:8], verr)
 				}
 			}
@@ -763,13 +779,13 @@ func (s *Server) handleAdminSnapshot(ctx *fasthttp.RequestCtx) {
 // tokenPlayerID extracts and validates the Bearer token from the Authorization header,
 // returning the playerID it belongs to, or "" if missing/invalid.
 func (s *Server) tokenPlayerID(ctx *fasthttp.RequestCtx) string {
+	// Bearer header only — never the query string (a URL token leaks into
+	// access/proxy logs and Referer headers). All authenticated client calls
+	// send the Authorization header (see ApiConfig/_headers()).
 	auth := string(ctx.Request.Header.Peek("Authorization"))
 	token := ""
 	if strings.HasPrefix(auth, "Bearer ") {
 		token = strings.TrimSpace(auth[7:])
-	}
-	if token == "" {
-		token = string(ctx.QueryArgs().Peek("token"))
 	}
 	if token == "" {
 		return ""
