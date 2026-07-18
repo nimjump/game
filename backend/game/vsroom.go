@@ -804,9 +804,10 @@ func (s *Store) ReconcileVSPayments() {
 		if r.IsFree() || isVSTerminalStatus(r.Status) {
 			continue
 		}
-		if !r.CreatorPaid || (r.OpponentID != "" && !r.OpponentPaid) {
-			pending = append(pending, r)
-		}
+		// Every non-terminal paid room is scanned — not only ones still missing a
+		// payment. A fully-paid room still needs a pass so a DUPLICATE entry (slow
+		// wallet re-send) landing after it was paid gets refunded, not pocketed.
+		pending = append(pending, r)
 	}
 	if len(pending) == 0 {
 		return
@@ -880,6 +881,19 @@ func (s *Store) ReconcileVSPayments() {
 					log.Printf("[VSROOM] reconcile: committed pending opponent room=%s player=%s tx=%s (confirm was lost)", r.ID, r.OpponentID, hash)
 				}
 			}
+			// Refund any DUPLICATE entry payments (same memo, extra tx) for either
+			// paid side back to whoever sent them — the "player double-paid because
+			// the wallet was slow" case. Idempotent (RefundedDupTxs).
+			if r.CreatorPaid {
+				if s.refundDuplicateVSSide(r, txs, cfg.WalletAddress, "c", r.CreatorPayTx) {
+					changed = true
+				}
+			}
+			if r.OpponentPaid {
+				if s.refundDuplicateVSSide(r, txs, cfg.WalletAddress, "o", r.OpponentPayTx) {
+					changed = true
+				}
+			}
 			if changed {
 				_ = s.saveVSRoom(r)
 			}
@@ -899,6 +913,64 @@ func findMatchingTx(txs []map[string]any, wantAddress, expectedMemo string, expe
 		}
 	}
 	return ""
+}
+
+// findAllMatchingVSTxs — every transaction matching the given memo/amount to
+// wantAddress (not just the first). Used to spot DUPLICATE entry payments for a
+// side that is already paid, so the extras can be refunded.
+func findAllMatchingVSTxs(txs []map[string]any, wantAddress, expectedMemo string, expectedLuna int64) []map[string]any {
+	var out []map[string]any
+	for _, tx := range txs {
+		if ok, _ := txMatchesVSPayment(tx, wantAddress, expectedMemo, expectedLuna); ok {
+			out = append(out, tx)
+		}
+	}
+	return out
+}
+
+func sliceContainsStr(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
+}
+
+// refundDuplicateVSSide — for one already-paid side (role "c"/"o" with its
+// committed entry tx keptHash), refunds every OTHER on-chain tx carrying the
+// same room+role memo back to whoever sent it. This is what makes double-paying
+// safe: a slow wallet / Nimiq-Pay delay that makes a player re-send their entry
+// leaves the room keeping exactly one payment and the extra returned to them.
+// Idempotent via r.RefundedDupTxs. Returns true if it changed r. MUST be called
+// under the room lock; caller saves r.
+func (s *Store) refundDuplicateVSSide(r *models.VSRoom, txs []map[string]any, wantAddress, role, keptHash string) bool {
+	// Can't safely tell the kept entry apart from a duplicate unless we have a
+	// real, specific hash for it — skip (never risk refunding the real entry).
+	if keptHash == "" || keptHash == "found" {
+		return false
+	}
+	memo := vsRoomMemo(r.ID, role)
+	expectedLuna := int64(entryLuna(r.EntryNIM))
+	changed := false
+	for _, tx := range findAllMatchingVSTxs(txs, wantAddress, memo, expectedLuna) {
+		hash, _ := tx["hash"].(string)
+		if hash == "" || hash == keptHash {
+			continue // no hash, or this IS the committed entry — keep it
+		}
+		if sliceContainsStr(r.RefundedDupTxs, hash) {
+			continue // already refunded this duplicate on an earlier pass
+		}
+		sender, _ := tx["from"].(string)
+		if sender == "" {
+			continue // can't refund what we can't attribute
+		}
+		s.refundVSRoom(r, sender, r.EntryNIM)
+		r.RefundedDupTxs = append(r.RefundedDupTxs, hash)
+		changed = true
+		log.Printf("[VSROOM] duplicate %s payment refunded room=%s to=%s tx=%s", role, r.ID, sender, hash)
+	}
+	return changed
 }
 
 // nimiqGetTransactionsByAddress — recent transactions (in or out) for an
@@ -1041,6 +1113,111 @@ func (s *Store) UpdateVSRoomScore(roomID, role string, score int, sessionID stri
 	return r, nil
 }
 
+// MarkVSRoomPlayed records that a side has SUBMITTED its run (played) the moment
+// the submission arrives — independent of the async replay simulation that only
+// verifies + records the actual score later. Without this, a room whose replay
+// is still being simulated (or one flagged into manual review, where the score
+// is never recorded at all) keeps showing the player a "Play" button because
+// CreatorScore/OpponentScore is still nil — letting them replay the same match.
+// Sets ONLY the played-at timestamp (+ session id); never touches scores or
+// triggers settlement. Idempotent.
+func (s *Store) MarkVSRoomPlayed(roomID, role, sessionID string) {
+	if roomID == "" {
+		return
+	}
+	lock := vsRoomLock(roomID)
+	lock.Lock()
+	defer lock.Unlock()
+	r, err := s.GetVSRoom(roomID)
+	if err != nil || r == nil {
+		return
+	}
+	switch role {
+	case "creator":
+		if r.CreatorPlayedAt > 0 || r.CreatorScore != nil {
+			return
+		}
+		r.CreatorPlayedAt = time.Now().Unix()
+		if r.CreatorSession == "" {
+			r.CreatorSession = sessionID
+		}
+	case "opponent":
+		if r.OpponentPlayedAt > 0 || r.OpponentScore != nil {
+			return
+		}
+		r.OpponentPlayedAt = time.Now().Unix()
+		if r.OpponentSession == "" {
+			r.OpponentSession = sessionID
+		}
+	default:
+		return
+	}
+	_ = s.saveVSRoom(r)
+	log.Printf("[VSROOM] marked played id=%s role=%s session=%s", r.ID, role, sessionID)
+}
+
+// ClaimVSRoomPlay atomically claims a participant's SINGLE play attempt at the
+// START of their run — the network-safe lock that makes replaying a VS match
+// impossible. It marks the caller's side as played RIGHT NOW (before they
+// actually play), so that even if their later score submission never reaches the
+// server (connection dropped mid-submit, app killed, tab closed…) the match can
+// NEVER offer them a fresh attempt: the played lock was already committed here,
+// under the room lock, before the round even began. A second claim for a side
+// that has already played (or already scored) is refused with "already_played".
+// Enforces the same readiness gate as scoring. Returns the room (seed included
+// for this participant) so the client starts the round from the authoritative
+// server seed, not a locally-held one.
+func (s *Store) ClaimVSRoomPlay(roomID, playerID string) (*models.VSRoom, error) {
+	if roomID == "" || playerID == "" {
+		return nil, fmt.Errorf("bad_request")
+	}
+	lock := vsRoomLock(roomID)
+	lock.Lock()
+	defer lock.Unlock()
+	r, err := s.GetVSRoom(roomID)
+	if err != nil || r == nil {
+		return nil, fmt.Errorf("room_not_found")
+	}
+	if isVSTerminalStatus(r.Status) {
+		return nil, fmt.Errorf("match_over")
+	}
+	var role string
+	switch playerID {
+	case r.CreatorID:
+		role = "creator"
+	case r.OpponentID:
+		role = "opponent"
+	default:
+		return nil, fmt.Errorf("not_a_participant")
+	}
+	// Same readiness gate as UpdateVSRoomScore: nobody plays before the opponent
+	// has joined AND (paid rooms) both sides have paid.
+	if r.OpponentID == "" {
+		return nil, fmt.Errorf("opponent_not_joined")
+	}
+	if !r.IsFree() && (!r.CreatorPaid || !r.OpponentPaid) {
+		return nil, fmt.Errorf("both_must_pay_first")
+	}
+	now := time.Now().Unix()
+	switch role {
+	case "creator":
+		if r.CreatorPlayedAt > 0 || r.CreatorScore != nil {
+			return nil, fmt.Errorf("already_played")
+		}
+		r.CreatorPlayedAt = now
+	case "opponent":
+		if r.OpponentPlayedAt > 0 || r.OpponentScore != nil {
+			return nil, fmt.Errorf("already_played")
+		}
+		r.OpponentPlayedAt = now
+	}
+	if err := s.saveVSRoom(r); err != nil {
+		return nil, err
+	}
+	log.Printf("[VSROOM] play claimed id=%s role=%s player=%s", r.ID, role, playerID)
+	return r, nil
+}
+
 // ── Settlement ────────────────────────────────────────────────────────────────
 
 // VSFeeFraction — the winner's share of the pot (0..1), i.e. 1 minus the
@@ -1107,6 +1284,30 @@ func (s *Store) settleVSRoom(r *models.VSRoom) {
 	}
 
 	bothPlayed := r.CreatorScore != nil && r.OpponentScore != nil
+
+	// FAIRNESS HOLD: a side that CLAIMED its attempt (PlayedAt>0) but has no
+	// recorded score started a run whose result never made it back — a dropped
+	// score-submit, a crash mid-run, or a replay that failed/never verified. That
+	// must NEVER auto-forfeit against them (the other side can't win a pot off a
+	// run we simply failed to receive). Hold the whole match for an admin to sort
+	// out (let them resubmit, replay, or refund both). A side that never even
+	// claimed (PlayedAt==0) is a genuine no-show and still forfeits normally.
+	if !bothPlayed {
+		creatorStartedNoScore := r.CreatorPlayedAt > 0 && r.CreatorScore == nil
+		opponentStartedNoScore := r.OpponentPlayedAt > 0 && r.OpponentScore == nil
+		if creatorStartedNoScore || opponentStartedNoScore {
+			r.NeedsReview = true
+			if r.ReviewReason == "" {
+				r.ReviewReason = "played_no_score: a side started a run whose result never arrived"
+			}
+			if r.Status != models.VSManualReview {
+				r.Status = models.VSManualReview
+				_ = s.saveVSRoom(r)
+				log.Printf("[VSROOM] settle held for MANUAL REVIEW id=%s — claimed-but-no-score", r.ID)
+			}
+			return
+		}
+	}
 
 	if r.IsFree() {
 		r.Status = models.VSCompleted

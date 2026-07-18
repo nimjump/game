@@ -541,6 +541,9 @@ export interface AppConfig {
   // that can claim ANY reward (streak, quest, in-game coin). See
   // backend/game/ip_reward_guard.go.
   max_reward_accounts_per_ip?: number;
+  // VS match system fee, in PERCENT (0–100). Winner gets (100 - this)% of the
+  // pot. See backend/game/vsroom.go VSFeeFraction. undefined = 5% default.
+  vs_fee_percent?: number;
 }
 
 export async function fetchAppConfig(): Promise<AppConfig> {
@@ -558,6 +561,7 @@ export async function saveAppConfig(patch: Partial<{
   streak_reward_extra_per_day_nim: number;
   streak_reward_max_nim: number;
   max_reward_accounts_per_ip: number;
+  vs_fee_percent: number;
 }>): Promise<AppConfig> {
   const r = await fetch(`${BASE}/backend/admin/config`, {
     method: "POST",
@@ -892,10 +896,8 @@ export interface VSRoom {
   expires_at: number;
   creator_forfeit_requested?: boolean;
   opponent_forfeit_requested?: boolean;
-  // Live — true while a participant is actively streaming their run via the
-  // live relay (backend/handlers/vs_live.go). Transient — computed fresh on
-  // every response, never persisted.
-  live?: boolean;
+  needs_review?: boolean;
+  review_reason?: string;
 }
 
 // fetchVSRooms — paginated: a single player can open unlimited paid rooms,
@@ -925,6 +927,26 @@ export async function cancelVSRoomAdmin(id: string): Promise<{ ok: boolean; room
   const r = await fetch(`${BASE}/backend/admin/vs-rooms/${encodeURIComponent(id)}/cancel`, { method: "POST" });
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || "cancel failed");
+  return data;
+}
+
+// Declare the winner of a disputed / under-review match. outcome: creator | opponent | tie.
+export async function resolveVSRoomAdmin(id: string, outcome: "creator" | "opponent" | "tie"): Promise<{ ok: boolean; room: VSRoom }> {
+  const r = await fetch(`${BASE}/backend/admin/vs-rooms/${encodeURIComponent(id)}/resolve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ outcome }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || "resolve failed");
+  return data;
+}
+
+// Reopen a funded match for a clean rematch (fresh seed, scores wiped, review cleared).
+export async function reopenVSRoomAdmin(id: string): Promise<{ ok: boolean; room: VSRoom }> {
+  const r = await fetch(`${BASE}/backend/admin/vs-rooms/${encodeURIComponent(id)}/reopen`, { method: "POST" });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || "reopen failed");
   return data;
 }
 

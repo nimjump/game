@@ -70,6 +70,9 @@ func show_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
 	show()
 	if is_instance_valid(_panel_ctrl):
+		# BUG FIX ("panel pops in from the top-left corner") — see VSPanel.gd's
+		# show_panel() doc comment for the full explanation. Same fix here.
+		_panel_ctrl.pivot_offset = _panel_ctrl.size * 0.5
 		_panel_ctrl.modulate.a = 0.0
 		_panel_ctrl.scale      = Vector2(0.92, 0.92)
 		_anim_tween = create_tween()
@@ -162,7 +165,7 @@ func _build_ui() -> void:
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed:
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
 	)
 	_panel_ctrl.add_child(dim)
@@ -300,9 +303,15 @@ func _fetch_catalog() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — CustomizePanel (self)
+	# or this http node can be freed mid-flight (panel closed/queue_free'd,
+	# or a window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -457,9 +466,15 @@ func _do_buy(item_id: String, price_nim: float, pay_memo: String, btn: Button) -
 	var http := HTTPRequest.new()
 	http.timeout = 20.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — CustomizePanel (self)
+	# or this http node can be freed mid-flight (panel closed/queue_free'd,
+	# or a window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result2, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result2 == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -489,9 +504,15 @@ func _do_equip(item_id: String, btn: Button) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — CustomizePanel (self)
+	# or this http node can be freed mid-flight (panel closed/queue_free'd,
+	# or a window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:

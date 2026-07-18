@@ -4,6 +4,7 @@ signal nimiq_ready(address: String, label: String, avatar: String, device_id: St
 signal auth_success(token: String, player_id: String)
 signal auth_failed(reason: String)
 
+const UITheme := preload("res://scripts/UITheme.gd")   # shared short-address helper
 var BACKEND_URL : String = ApiConfig.base_url()   # resolved at runtime (same origin on web)
 const LS_AUTH_TOKEN := "nj_auth_token"
 const LS_AUTH_PID   := "nj_auth_pid"
@@ -60,6 +61,14 @@ var _signing_in_progress := false
 # from "this is our own passive background attempt" (fail quietly — poll()
 # / the player pressing Play later will just try again for real).
 var _silent_sign_attempt := false
+
+# Which sign-in channel the CURRENTLY in-flight attempt is using:
+# "nimiq_pay" (_do_sign_auth) or "web" (do_web_sign_auth). Set at the start of
+# each flow, read by _verify_with_backend() (sent to the backend so
+# game.Store.QueueReward can halve rewards for "web") and by the 401-retry
+# branch (so a retry re-enters the SAME path it started with, not the other
+# one).
+var _current_auth_source := "nimiq_pay"
 
 # Counts consecutive automatic retries triggered by a 401 from /backend/auth/
 # verify (see _verify_with_backend) — capped at 1 so a structural failure
@@ -326,7 +335,12 @@ func _try_restore_session() -> void:
 		auth_expires_at = 0
 		# poll() is waiting on auth_verified — it will call _do_sign_auth() when loop ends
 	)
-	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/auth/me?token=" + str(token).uri_encode()))
+	# Send the token in the Authorization header (Bearer), never in the URL —
+	# query-string tokens leak into server logs, proxy logs and Referer headers.
+	http.request(
+		ApiConfig.sign_url(BACKEND_URL + "/backend/auth/me"),
+		PackedStringArray(["Authorization: Bearer " + str(token)]),
+	)
 
 
 ## Releases the _signing_in_progress lock and (optionally) emits auth_failed.
@@ -378,9 +392,40 @@ func _do_sign_auth(silent: bool = false) -> void:
 		return
 	_signing_in_progress  = true
 	_silent_sign_attempt  = silent
+	_current_auth_source  = "nimiq_pay"
 	_arm_signing_watchdog()
+	_fetch_challenge_then(func(challenge: String): _sign_and_verify(challenge))
 
-	# 1. Get challenge
+
+## Web-browser sign-in: get challenge → Nimiq Hub API popup sign → verify →
+## store token. This is the counterpart to _do_sign_auth() above for players
+## OUTSIDE Nimiq Pay (window.nimiq never gets set there — see _initNimiq's
+## window._nimiqProviderMissing flag in index.html). Routed to from Main.gd's
+## _ensure_wallet_then_sign() when that flag is confirmed true.
+##
+## MUST only ever be called from a real user gesture (a button's pressed
+## handler) — the Hub API opens a popup, and popups opened outside a
+## synchronous click/tap get silently blocked with no visible error. There is
+## deliberately no "silent"/background variant of this path at all, unlike
+## _do_sign_auth(silent=true) — see NimiqJS.gd's start_hub_sign() doc comment.
+func do_web_sign_auth() -> void:
+	print("[NimiqBridge] do_web_sign_auth called auth_verified=%s in_progress=%s" % [str(auth_verified), str(_signing_in_progress)])
+	if not OS.has_feature("web"): return
+	if auth_verified: return  # already logged in
+	if _signing_in_progress:
+		print("[NimiqBridge] sign already in progress — ignoring duplicate web sign call")
+		return
+	_signing_in_progress  = true
+	_silent_sign_attempt  = false  # web sign-in is never silent/background — see doc comment above
+	_current_auth_source  = "web"
+	_arm_signing_watchdog()
+	_fetch_challenge_then(func(challenge: String): _hub_sign_and_verify(challenge))
+
+
+## Shared challenge-fetch step for both sign paths above (_do_sign_auth's
+## Nimiq Pay path and do_web_sign_auth's web path) — identical HTTP plumbing,
+## only what happens once the challenge arrives differs.
+func _fetch_challenge_then(on_challenge: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
@@ -408,13 +453,12 @@ func _do_sign_auth(silent: bool = false) -> void:
 		if challenge == "":
 			_fail_sign_auth("empty_challenge")
 			return
-		# 2. Call window.nimiq.sign(challenge)
-		_sign_and_verify(challenge)
+		on_challenge.call(challenge)
 	)
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/auth/challenge"))
 
 
-## Calls window.nimiq.sign() and sends result to backend
+## Calls window.nimiq.sign() and sends result to backend — Nimiq Pay path.
 func _sign_and_verify(challenge: String) -> void:
 	if not OS.has_feature("web"): return
 
@@ -435,7 +479,37 @@ func _sign_and_verify(challenge: String) -> void:
 	print("[SIG1] %s" % signature.left(64))
 	print("[SIG2] %s" % signature.right(signature.length() - 64))
 	print("[SIGLEN] %d" % signature.length())
-	_verify_with_backend(challenge, pub_key, signature)
+	_verify_with_backend(challenge, pub_key, signature, "nimiq_pay")
+
+
+## Calls the Nimiq Hub API popup sign and sends result to backend — web path.
+## Unlike the Nimiq Pay path, the Hub API returns the signer's address in the
+## SAME popup interaction, so nimiq_address/nimiq_label are (re)set from the
+## result here instead of relying on window._nimiqAddress (which never gets
+## set outside Nimiq Pay — see NimiqBridge._poll()'s early Guest fallback).
+func _hub_sign_and_verify(challenge: String) -> void:
+	if not OS.has_feature("web"): return
+
+	print("[NimiqBridge] waiting for hub sign result...")
+	var sd := await NimiqJS.request_hub_sign(challenge, 90.0)
+	print("[NimiqBridge] hub sign result ok=%s" % str(sd.get("ok", false)))
+	auth_attempted = true
+
+	if not sd.get("ok", false):
+		var err := str(sd.get("err", "user_rejected"))
+		print("[NimiqBridge] Hub sign not completed: %s" % err)
+		_fail_sign_auth(err)
+		return
+
+	var addr      : String = str(sd.get("address", ""))
+	var pub_key   : String = str(sd.get("publicKey", ""))
+	var signature : String = str(sd.get("signature", ""))
+	if addr == "" or pub_key == "" or signature == "":
+		_fail_sign_auth("hub_sign_incomplete_result")
+		return
+	nimiq_address = addr
+	nimiq_label   = UITheme.short_address(addr)   # canonical short form (see UITheme)
+	_verify_with_backend(challenge, pub_key, signature, "web")
 
 
 ## Guards _verify_with_backend()'s response handler against acting on a
@@ -451,9 +525,13 @@ func _sign_and_verify(challenge: String) -> void:
 ##      "the one in flight" — a newer attempt has already superseded it.
 var _active_verify_challenge := ""
 
-## Sends challenge + signature to backend, receives token
-func _verify_with_backend(challenge: String, public_key: String, signature: String) -> void:
+## Sends challenge + signature to backend, receives token.
+## auth_source: "nimiq_pay" or "web" — see _current_auth_source's doc comment.
+## Also stored in _current_auth_source so the 401-retry branch below re-enters
+## the same sign path this attempt started with.
+func _verify_with_backend(challenge: String, public_key: String, signature: String, auth_source: String) -> void:
 	_active_verify_challenge = challenge
+	_current_auth_source = auth_source
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
@@ -483,7 +561,14 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 			# genuinely transient stale-challenge race; beyond that, fail
 			# cleanly so the player sees a normal error state and can press
 			# Play again themselves instead of getting silently re-prompted.
-			if code == 401 and _verify_401_retries < 1:
+			# NOTE: the auto-retry below only applies to the Nimiq Pay path.
+			# The web path's retry would mean re-opening the Hub API popup
+			# from inside this async HTTP callback — NOT a synchronous click
+			# handler — which browsers silently block (see NimiqJS.gd's
+			# start_hub_sign() doc comment). A web-path 401 fails straight
+			# through to _fail_sign_auth() below instead; the player presses
+			# Play again themselves, which is a fresh real gesture.
+			if code == 401 and _verify_401_retries < 1 and _current_auth_source == "nimiq_pay":
 				_verify_401_retries += 1
 				auth_verified = false
 				# Intentional sequential retry (challenge was rejected, get a
@@ -567,6 +652,7 @@ func _verify_with_backend(challenge: String, public_key: String, signature: Stri
 		"platform":      platform,
 		"screen":        screen_str,
 		"dpr":           dpr_str,
+		"auth_source":   auth_source,
 	})
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/auth/verify"),
 		["Content-Type: application/json"], HTTPClient.METHOD_POST, body)

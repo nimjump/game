@@ -1228,8 +1228,8 @@ func _cloud_ai(_delta: float) -> void:
 	var follow_speed : float = CLOUD_FOLLOW_SPEED * _speed_variance
 
 	# X: follow player slowly
-	# user request: yatay hız %30 azaltıldı
-	var x_speed : float = follow_speed * 0.7
+	# user request: yatay hız %30, %25, %10 azaltıldı, sonra %10 arttırıldı
+	var x_speed : float = follow_speed * 0.7 * 0.75 * 0.90 * 1.10
 	var target_x : float = global_position.x + signf(dx) * minf(abs(dx), x_speed * FIXED_DELTA)
 	global_position.x = target_x
 
@@ -1237,7 +1237,7 @@ func _cloud_ai(_delta: float) -> void:
 	# Move upward slowly so player ends up below the cloud
 	var hover_offset : float = _vh * 0.12   # how far above player to hover
 	var target_y : float = p.global_position.y - hover_offset
-	var y_speed  : float = follow_speed * 0.825 * 1.15 * FIXED_DELTA   # user request: dikey hız %15 artırıldı
+	var y_speed  : float = follow_speed * 0.825 * 1.15 * 0.70 * 0.80 * 1.10 * FIXED_DELTA   # user request: dikey hız %15 arttırıldı, %30, %20 azaltıldı, sonra %10 arttırıldı
 	if global_position.y > target_y:
 		# Cloud is below target — move up
 		global_position.y = maxf(global_position.y - y_speed, target_y)

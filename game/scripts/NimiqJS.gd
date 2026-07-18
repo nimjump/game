@@ -143,39 +143,117 @@ func await_sign(timeout_sec: float = 60.0) -> Dictionary:
 	return {ok = false, err = "timeout"}
 
 
+# ── Hub API sign (web browser, outside Nimiq Pay) ───────────────────────────
+## window._nimiqHubSign(challenge) — real Nimiq wallet sign-in via the Nimiq
+## Hub API popup (hub.nimiq.com), for players in a plain browser tab where
+## window.nimiq (the mini-app SDK, see start_sign() above) never gets set.
+## Same DOM-dataset async-callback pattern as start_sign()/await_sign().
+##
+## IMPORTANT: MUST be called synchronously from a real user gesture (a
+## button's pressed handler) — Hub API opens a popup, and popups opened
+## outside a user gesture get blocked by the browser. Never call this from a
+## background/silent auto-sign attempt. In practice this is reached from a
+## Play/Connect button's pressed handler, which runs within the same input
+## frame as the tap, i.e. still inside the browser's ~5s transient-activation
+## window — so window.open() is permitted. The eager module preload in
+## index.html ensures signMessage() (and its window.open()) then runs with no
+## async gap. The "Invalid Request"/"Connection was closed" error this whole
+## flow used to hit was NEVER a gesture problem — it was cross-origin
+## isolation (COOP/COEP) severing the popup's window.opener, fixed in the
+## _headers file. See that file's doc comment for the full story.
+func start_hub_sign(challenge: String) -> void:
+	if not OS.has_feature("web"):
+		return
+	document_dataset_clear("nimiqHubSign")
+	# JSON.stringify (not naive string concatenation) so this is safe
+	# regardless of the challenge's exact contents — even though in practice
+	# NewChallenge()'s format (backend/game/auth.go) is always plain ASCII.
+	var js_literal := JSON.stringify(challenge)
+	JavaScriptBridge.eval(
+		"if(window._nimiqHubSign) window._nimiqHubSign(" + js_literal + ");",
+		true
+	)
+
+
+## Waits for start_hub_sign() result. timeout_sec: enough time for the user to
+## pick an account and approve in the Hub API popup.
+## Returns: {ok:true, address, publicKey, signature} or {ok:false, err}
+func await_hub_sign(timeout_sec: float = 90.0) -> Dictionary:
+	var steps := int(timeout_sec * 10)
+	var j := JSON.new()
+	for _i in steps:
+		await get_tree().create_timer(0.1).timeout
+		var raw_str = JavaScriptBridge.eval("document.body.dataset.nimiqHubSign || ''", true)
+		if raw_str == null:
+			continue
+		var s := str(raw_str).strip_edges()
+		if s == "" or s == "null":
+			continue
+		document_dataset_clear("nimiqHubSign")
+		if j.parse(s) == OK:
+			return j.get_data()
+	return {ok = false, err = "timeout"}
+
+
+## Shortcut: request + wait (coroutine).
+## Returns: {ok:true, address, publicKey, signature} or {ok:false, err}
+func request_hub_sign(challenge: String, timeout_sec: float = 90.0) -> Dictionary:
+	start_hub_sign(challenge)
+	return await await_hub_sign(timeout_sec)
+
+
 # ── Payment (VS room entry fee) ─────────────────────────────────────────────
-## window.nimiq.sendBasicTransactionWithData({recipient, value, data}) — signs
-## and broadcasts a tx straight from the player's own connected wallet.
-## value is in luna (1 NIM = 100000 luna, matches NimLunaMultiplier backend-side).
-## data is the short "vs:<room_id>:<c|o>" memo tag the backend matches the
-## incoming payment against — see backend/game/vsroom.go.
+## Sends a NIM payment and writes the result to document.body.dataset.nimiqPay
+## as {ok:true, tx:"<hash>"} or {ok:false, err}. value is in luna (1 NIM =
+## 100000 luna, matches NimLunaMultiplier backend-side). data is the short
+## "vs:<room_id>:<c|o>" memo tag the backend matches the incoming payment
+## against — see backend/game/vsroom.go.
+##
+## Two channels, chosen at runtime:
+##   • Inside Nimiq Pay — the mini-app SDK's
+##     window.nimiq.sendBasicTransactionWithData() (native wallet UI).
+##   • Plain web browser (no window.nimiq) — the Hub API checkout() popup
+##     (window._nimiqHubCheckout in index.html). This is the fix for
+##     "payment failed: no_provider" on web: outside Nimiq Pay there is no
+##     window.nimiq, so we route through the same Hub popup channel web
+##     sign-in uses instead of failing. MUST be reached synchronously from a
+##     real button-press gesture so the popup isn't blocked (see _do_pay).
+## JSON.stringify() is used for recipient/data so the injected JS is safe
+## regardless of their contents (defense-in-depth; both are plain ASCII here).
 func start_payment(recipient: String, value_luna: int, data: String) -> void:
 	if not OS.has_feature("web"):
 		return
 	document_dataset_clear("nimiqPay")
+	var rcpt := JSON.stringify(recipient)
+	var memo := JSON.stringify(data)
 	var js : String = (
 		"(function(){"
 		+ "document.body.dataset.nimiqPay = '';"
 		+ "var _prov = window.nimiq || (window._nimiqData && window._nimiqData._provider);"
-		+ "if(!_prov){"
-		+   "document.body.dataset.nimiqPay = JSON.stringify({ok:false,err:'no_provider'});"
+		+ "if(_prov){"
+		+   "_prov.sendBasicTransactionWithData({"
+		+     "recipient:" + rcpt + ","
+		+     "value:" + str(value_luna) + ","
+		+     "data:" + memo
+		+   "})"
+		+     ".then(function(r){"
+		+       "if(r && r.error){"
+		+         "document.body.dataset.nimiqPay = JSON.stringify({ok:false,err:(r.error.message||'rejected')});"
+		+         "return;"
+		+       "}"
+		+       "document.body.dataset.nimiqPay = JSON.stringify({ok:true,tx:String(r)});"
+		+     "}).catch(function(e){"
+		+       "var _em=e&&e.message?e.message:(typeof e==='string'?e:JSON.stringify(e)||'rejected');"
+		+       "document.body.dataset.nimiqPay = JSON.stringify({ok:false,err:_em});"
+		+     "});"
 		+   "return;"
 		+ "}"
-		+ "_prov.sendBasicTransactionWithData({"
-		+   "recipient:'" + recipient + "',"
-		+   "value:" + str(value_luna) + ","
-		+   "data:'" + data + "'"
-		+ "})"
-		+   ".then(function(r){"
-		+     "if(r && r.error){"
-		+       "document.body.dataset.nimiqPay = JSON.stringify({ok:false,err:(r.error.message||'rejected')});"
-		+       "return;"
-		+     "}"
-		+     "document.body.dataset.nimiqPay = JSON.stringify({ok:true,tx:String(r)});"
-		+   "}).catch(function(e){"
-		+     "var _em=e&&e.message?e.message:(typeof e==='string'?e:JSON.stringify(e)||'rejected');"
-		+     "document.body.dataset.nimiqPay = JSON.stringify({ok:false,err:_em});"
-		+   "});"
+		# No mini-app provider → plain web browser → Hub API checkout popup.
+		+ "if(window._nimiqHubCheckout){"
+		+   "window._nimiqHubCheckout(" + rcpt + "," + str(value_luna) + "," + memo + ");"
+		+   "return;"
+		+ "}"
+		+ "document.body.dataset.nimiqPay = JSON.stringify({ok:false,err:'no_provider'});"
 		+ "})();"
 	)
 	JavaScriptBridge.eval(js, true)

@@ -2,6 +2,7 @@ extends CanvasLayer
 ## QuestPanel.gd — Daily quests: countdown, progress, claim button
 
 signal closed
+signal connect_requested   # emitted when user taps Connect in the not-signed-in state
 
 var BACKEND_URL : String = ApiConfig.base_url()   # resolved at runtime (same origin on web)
 const UITheme     := preload("res://scripts/UITheme.gd")
@@ -77,6 +78,9 @@ func show_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
 	show()
 	if is_instance_valid(_panel_ctrl):
+		# BUG FIX ("panel pops in from the top-left corner") — see VSPanel.gd's
+		# show_panel() doc comment for the full explanation. Same fix here.
+		_panel_ctrl.pivot_offset = _panel_ctrl.size * 0.5
 		_panel_ctrl.modulate.a = 0.0
 		_panel_ctrl.scale      = Vector2(0.92, 0.92)
 		_anim_tween = create_tween()
@@ -148,7 +152,7 @@ func _build_ui() -> void:
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed:
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
 	)
 	_panel_ctrl.add_child(dim)
@@ -268,9 +272,15 @@ func _fetch_quests() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — QuestPanel (self) or
+	# this http node can be freed mid-flight (panel closed/queue_free'd, or a
+	# window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -307,9 +317,15 @@ func _claim_quest(quest_id: String, claim_btn: Button) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — QuestPanel (self) or
+	# this http node can be freed mid-flight (panel closed/queue_free'd, or a
+	# window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			# BUG FIX: this used to treat any 200 as "all claimed, done" and
 			# just re-fetch — but /quests/claim_all responds 200 with a
@@ -578,31 +594,29 @@ func _show_connect_prompt() -> void:
 	vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	_list_root.add_child(vbox)
 
-	var row := HBoxContainer.new()
-	row.alignment = BoxContainer.ALIGNMENT_CENTER
-	row.add_theme_constant_override("separation", int(ref * 0.010))
-	vbox.add_child(row)
-	row.add_child(UITheme.lucide_icon("wallet", int(ref * 0.038), Color(0.480, 0.340, 0.200)))
+	# Same "not signed in" scheme as the Statistics panel: a single centered
+	# line in mid-brown + the standard warm Connect Wallet button (no icon).
 	var lbl := Label.new()
-	lbl.text = "Connect your Nimiq account\nto see daily quests"
+	lbl.text = "Connect your wallet to see daily quests"
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	UITheme.apply_label(lbl, Color(0.480, 0.340, 0.200), int(ref * 0.028))
+	# Exact same mid-brown as the Statistics panel's connect label (_C_MID).
+	UITheme.apply_label(lbl, Color(0.480, 0.340, 0.200), int(ref * 0.030))
 	vbox.add_child(lbl)
 
-	if OS.has_feature("web"):
-		var btn := Button.new()
-		btn.text = "Connect Wallet"
-		btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		btn.custom_minimum_size.y = int(ref * 0.068)
-		btn.add_theme_font_size_override("font_size", int(ref * 0.032))
-		_warm_btn(btn, 8)
-		btn.pressed.connect(func():
-			btn.disabled = true
-			btn.text = "Waiting..."
-			_request_account_connect(btn)
-		)
-		vbox.add_child(btn)
+	var btn := Button.new()
+	btn.text = "Connect Wallet"
+	btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+	btn.custom_minimum_size = Vector2(ref * 0.55, ref * 0.080)
+	btn.add_theme_font_size_override("font_size", int(ref * 0.034))
+	_warm_btn(btn, 8)
+	# Route through the shared, web-aware connect handler (Main._request_wallet_
+	# connect) — the old inline path used NimiqJS.request_account(), the mini-
+	# app-SDK-only flow that never works in a plain web browser (no window.nimiq
+	# there). The signal handler picks Nimiq Pay vs the Hub API web popup
+	# correctly, exactly like Stats/VS.
+	btn.pressed.connect(func(): emit_signal("connect_requested"))
+	vbox.add_child(btn)
 
 
 func _request_account_connect(btn: Button) -> void:

@@ -172,49 +172,6 @@ var _replay_speed_acc : float = 0.0
 var _replay_nickname  : String = ""
 # ── Player's own seed preserved before replay (used when returning to lobby) ──
 
-# ── VS live streaming — SENDER side (VSRoom system — see vs_room_id/vs_role
-# below and backend/handlers/vs_live.go). A small client-side WebSocket that
-# streams this player's OWN run to the server while they're actually
-# playing their VS round, so spectators watching /backend/vsroom/{id}/watch
-# see it live. Replaces the old real-time-match ghost-opponent system
-# entirely (that whole VSManager-based block lived here before and has been
-# removed along with VSManager.gd/vs.go).
-#
-# What gets sent is not score/position snapshots — it's the exact same
-# RLE-encoded input bytes already being written into _replay_log during
-# RECORDING (see the "RECORDING: RLE log" block in _simulate_gm_tick). A
-# spectator's client appends these straight onto its OWN _replay_log and
-# runs the real deterministic replay player (PLAYING mode) — so watching a
-# live VS match is pixel-for-pixel the actual game, not a stand-in view.
-#
-# One wrinkle: the RLE encoder can still be mutating the LAST byte in
-# _replay_log (extending the current run's count as long as the same input
-# stays held), so that byte isn't safe to send yet — only bytes strictly
-# before it are guaranteed final ("sealed"). _vs_live_sent_len tracks how
-# many bytes have already been sent; every flush sends up to
-# size()-1 (holding the possibly-still-growing last byte back), except the
-# final flush on game end, which sends everything since no more ticks are
-# coming to mutate it.
-var _vs_live_ws        : WebSocketPeer = null
-var _vs_live_sent_len  : int = 0
-var _vs_live_flush_ctr : int = 0
-const _VS_LIVE_FLUSH_EVERY := 6   # ~10Hz — plenty responsive, keeps WS message count low
-
-# ── VS live streaming — RECEIVER side (spectating). Set by Main.gd right
-# before it starts the real replay player on a live/still-growing log (see
-# live_start_watch/live_append/live_replace_log below). When true, running
-# out of decodable input bytes freezes playback (waits for more) instead of
-# ending the match — the crucial difference from watching a normal, already-
-# finished replay.
-var _live_watch_mode : bool = false
-# _live_watch_active — narrower than _live_watch_mode: true only once the
-# steady-state watch loop has actually begun (countdown finished, first
-# unpause done). live_append()/live_replace_log() only auto-resume playback
-# when this is true — otherwise a chunk arriving mid-countdown (while
-# Main.gd has deliberately paused playback at spawn for the 3-2-1 overlay)
-# would prematurely unpause it.
-var _live_watch_active : bool = false
-
 var _pre_replay_seed        : int = 0
 var _pre_replay_player_seed : int = 0
 var _pre_replay_char        : int = 0
@@ -568,15 +525,6 @@ func _run_one_tick() -> void:
 		_check_interactables()
 	_tick_spring_resets()
 
-	# ── VS live streaming: relay this player's own input bytes to spectators ──
-	if vs_room_id != "" and player_ready and _replay_mode == ReplayMode.RECORDING:
-		_vs_live_poll()
-		if is_instance_valid(_vs_live_ws) and _vs_live_ws.get_ready_state() == WebSocketPeer.STATE_OPEN:
-			_vs_live_flush_ctr += 1
-			if _vs_live_flush_ctr >= _VS_LIVE_FLUSH_EVERY:
-				_vs_live_flush_ctr = 0
-				_vs_live_flush_log(false)
-
 	# ── Divergence detector ──────────────────────────────────────────
 	# Also skipped during seek_to_tick()'s silent burst — see comment above.
 	if _dbg_enabled and not _is_seeking and player_ready:
@@ -663,19 +611,6 @@ func _simulate_gm_tick() -> void:
 				if _dbg_enabled and not _is_seeking and _replay_tick_count % 100 == 0:
 					print("[SNAP] tick=%d score=%d pos=(%.2f,%.2f) vel_y=%.2f rng=%d" % [_replay_tick_count, score, player.position.x, player.position.y, player.velocity.y, _rng.state])
 			else:
-				# Live-watching a match still in progress: running out of
-				# decoded input just means we've caught up to whatever the
-				# player has streamed so far — freeze on this exact frame
-				# (do NOT set _game_over/_replay_mode=OFF, which would be a
-				# one-way dead end — _physics_process bails out permanently
-				# once _game_over is true). live_append()/live_replace_log()
-				# flip _replay_paused back off the moment more bytes arrive,
-				# so playback just resumes seamlessly from here.
-				if _live_watch_mode:
-					_replay_paused = true
-					if is_instance_valid(player):
-						player.set("_replay_dir", 0)
-					return
 				_game_over     = true
 				_replay_mode   = ReplayMode.OFF
 				# "viewer" = leaderboard/stats/web replay — log ended, just stop, do not emit
@@ -796,7 +731,27 @@ func _simulate_gm_tick() -> void:
 		_sim_cam_y = target_y
 		# Visual camera lerps smoothly (display only — does NOT affect game logic)
 		if not _is_headless:
-			camera.position.y = lerpf(camera.position.y, _sim_cam_y, minf(25.0 * delta, 1.0))
+			# BUG FIX (general movement flicker — reported worst going up, but
+			# present moving any direction): project settings have
+			# 2d/snap/snap_2d_transforms_to_pixel=true for crisp pixel-art
+			# rendering. That snap happens per-node, independently, at render
+			# time. The player sprite's position is an exact deterministic
+			# simulated value each tick, but this camera lerp produces a
+			# continuously-changing SUB-PIXEL value approaching it — so every
+			# frame, Godot's snap rounds the camera to the nearest pixel
+			# independently of where it rounds the player, and the gap
+			# between those two independent roundings drifts by a whole
+			# pixel back and forth as the lerp's fractional part crosses
+			# rounding boundaries — exactly what reads as "flickering" during
+			# any sustained movement, since the camera is CONSTANTLY chasing
+			# a moving target (never settles, unlike a stationary camera
+			# where the same rounding mismatch would just be a single static
+			# 1px offset, never a visible flicker). Rounding the camera's own
+			# driving value to a whole pixel BEFORE Godot's internal snap
+			# ever sees it removes that extra, independently-drifting
+			# rounding source — the snap then has nothing left to disagree
+			# with the player's own already-integer-ish position about.
+			camera.position.y = roundf(lerpf(camera.position.y, _sim_cam_y, minf(25.0 * delta, 1.0)))
 		else:
 			camera.position.y = _sim_cam_y
 
@@ -865,164 +820,6 @@ func _simulate_gm_tick() -> void:
 		if _drunk_plat_timer >= DRUNK_PLAT_INTERVAL:
 			_drunk_plat_timer = 0.0
 			_spawn_drunk_platform_ghost()
-
-
-# ───────────────────────────────────────────────────────────────────
-#  VS LIVE STREAMING (spectator relay — see backend/handlers/vs_live.go)
-# ───────────────────────────────────────────────────────────────────
-# While the local player is actually playing their VS round (vs_room_id set,
-# _replay_mode == RECORDING), this opens a small WebSocket to
-# /backend/vsroom/{id}/live and streams compact per-tick frames so anyone
-# watching /backend/vsroom/{id}/watch sees the run as it happens. Purely a
-# broadcast — nothing here affects gameplay or the deterministic sim; if the
-# connection fails or drops, the match just isn't watchable live, the actual
-# recorded replay (submitted normally afterward) is unaffected.
-
-## Called once from _init_game_from_seed() right as a VS round starts
-## recording, if vs_room_id is set. No-op outside the web export (native
-## builds never open VS rooms) and silently no-ops if auth/token is missing.
-func _vs_live_connect() -> void:
-	if vs_room_id == "": return
-	if not OS.has_feature("web"): return
-	var tok := ""
-	if is_instance_valid(main_node) and main_node.get("_auth_token") != null:
-		tok = str(main_node.get("_auth_token"))
-	if tok == "": return   # can't authenticate the stream — just skip it
-
-	_vs_live_disconnect()  # defensive — clear out any stale prior connection
-	var base := ApiConfig.base_url()
-	var ws_base := base.replace("https://", "wss://").replace("http://", "ws://")
-	# Signed like every other /backend request — the WS upgrade starts as a
-	# plain HTTP GET before hijacking, so it goes through the exact same
-	# app-signature check in main.go's corsMiddleware as anything else.
-	var url := ApiConfig.sign_url("%s/backend/vsroom/%s/live?token=%s" % [ws_base, vs_room_id.uri_encode(), tok.uri_encode()])
-
-	_vs_live_ws = WebSocketPeer.new()
-	var err := _vs_live_ws.connect_to_url(url)
-	if err != OK:
-		print("[VS_LIVE] connect_to_url failed err=%d" % err)
-		_vs_live_ws = null
-		return
-	_vs_live_sent_len  = 0
-	_vs_live_flush_ctr = 0
-
-
-func _vs_live_poll() -> void:
-	if not is_instance_valid(_vs_live_ws): return
-	_vs_live_ws.poll()
-	# Drain any incoming data — the play-side socket doesn't expect messages
-	# back, but reading keeps the connection's internal buffers healthy and
-	# lets us notice a server-side close promptly.
-	while _vs_live_ws.get_ready_state() == WebSocketPeer.STATE_OPEN and _vs_live_ws.get_available_packet_count() > 0:
-		_vs_live_ws.get_packet()
-	if _vs_live_ws.get_ready_state() == WebSocketPeer.STATE_CLOSED:
-		_vs_live_ws = null
-
-
-## Sends any newly-sealed _replay_log bytes since the last flush, as a single
-## binary WS message. `final`=true (called once, from _vs_live_disconnect at
-## game end) also sends the very last byte, which is only safe once no more
-## ticks are coming to potentially still extend its RLE run count.
-func _vs_live_flush_log(final: bool) -> void:
-	if not is_instance_valid(_vs_live_ws): return
-	var avail : int = _replay_log.size()
-	var send_upto : int = avail if final else maxi(_vs_live_sent_len, avail - 1)
-	if send_upto <= _vs_live_sent_len: return
-	var chunk := _replay_log.slice(_vs_live_sent_len, send_upto)
-	_vs_live_ws.send(chunk)  # binary by default
-	_vs_live_sent_len = send_upto
-
-
-## Called from _submit_session() once the round is over — flushes whatever's
-## left (now safe to send in full since the run is genuinely done) and stops
-## streaming, regardless of whether the round ended in a win/loss/disconnect.
-func _vs_live_disconnect() -> void:
-	if is_instance_valid(_vs_live_ws):
-		_vs_live_ws.poll()
-		_vs_live_flush_log(true)
-		_vs_live_ws.poll()
-		_vs_live_ws.close()
-	_vs_live_ws        = null
-	_vs_live_sent_len  = 0
-	_vs_live_flush_ctr = 0
-
-
-# ───────────────────────────────────────────────────────────────────
-#  VS LIVE WATCHING — RECEIVER side (spectating a match in progress)
-# ───────────────────────────────────────────────────────────────────
-# Main.gd/VSPanel.gd drive the actual WebSocket connection to
-# /backend/vsroom/{id}/watch (reconnect handling, viewer-count/status UI
-# all live there — see Main.gd's _watch_vs_live). This GameManager only
-# needs to know how to (a) keep decoding a replay log that keeps growing
-# instead of ending, and (b) accept new bytes / a replaced buffer as they
-# arrive over the wire.
-
-## Shared RLE tick-count decoder — same algorithm used inline in
-## start_replay()/_submit_session(), pulled out here since live-watch needs
-## to recompute it every time new bytes arrive instead of just once.
-func _decode_rle_tick_count(log: PackedByteArray) -> int:
-	var total := 0
-	var i := 0
-	while i < log.size():
-		var b : int = log[i]
-		if b == 0xFF:
-			if i + 2 < log.size():
-				i += 3
-			else:
-				break
-			continue
-		total += maxi(1, (b >> 2) & 0x3F)
-		i += 1
-	return total
-
-
-## Called by Main.gd right before starting the replay player on a live
-## (still-growing) log, so the log-exhausted path in _simulate_gm_tick knows
-## to freeze-and-wait instead of ending the match.
-func live_start_watch() -> void:
-	_live_watch_mode   = true
-	_live_watch_active = false
-
-
-## Called by Main.gd once its own 3-2-1 countdown has finished and it's
-## about to unpause for real — from this point on, live_append()/
-## live_replace_log() are allowed to auto-unpause on new data (see below).
-func live_mark_active() -> void:
-	_live_watch_active = true
-
-
-## Called by Main.gd when the spectator closes the live view / navigates
-## away, so a stray late WS message can't resurrect playback afterward.
-func live_stop_watch() -> void:
-	_live_watch_mode   = false
-	_live_watch_active = false
-
-
-## New bytes arrived over the /watch socket — append them to the log being
-## played back and recompute the tick count so the seek bar (and the
-## catch-up check below) reflect the new data. If playback had frozen
-## waiting for more input, this wakes it back up. Guarded by
-## _live_watch_active (not just _live_watch_mode) so a chunk arriving during
-## Main.gd's deliberate pre-countdown pause doesn't unpause it early.
-func live_append(bytes: PackedByteArray) -> void:
-	if bytes.is_empty(): return
-	_replay_log.append_array(bytes)
-	_replay_total_ticks = _decode_rle_tick_count(_replay_log)
-	if _live_watch_active and _replay_paused:
-		_replay_paused = false
-
-
-## Used after a spectator WS reconnect: the server always resends the FULL
-## backlog on a fresh /watch handshake, so instead of appending (which would
-## duplicate everything) this swaps the whole buffer in place — read
-## position (_rle_run_pos) and playback tick are left untouched, since the
-## fresh backlog is always a prefix-compatible superset of what was already
-## decoded (append-only server-side buffer, same room).
-func live_replace_log(bytes: PackedByteArray) -> void:
-	_replay_log = bytes
-	_replay_total_ticks = _decode_rle_tick_count(_replay_log)
-	if _live_watch_active and _replay_paused:
-		_replay_paused = false
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -2300,8 +2097,24 @@ func _ls_get(key: String) -> Array:
 func _ls_set(key: String, arr: Array) -> void:
 	if not OS.has_feature("web"):
 		return
-	var escaped := JSON.stringify(arr).replace("'", "\\'")
-	JavaScriptBridge.eval("localStorage.setItem('%s','%s')" % [key, escaped], true)
+	# BUG FIX: this used to build the JS eval() string by hand — JSON.stringify(arr)
+	# then a naive .replace("'", "\\'") to escape single quotes for embedding inside
+	# a single-quoted JS string literal. That only escapes quote CHARACTERS; when
+	# any queued entry's own "body" field is ITSELF a JSON string (which it always
+	# is here — see _pending_save below), JSON.stringify()'s OWN escaping of that
+	# nested string's double-quotes produces literal backslash-quote (\") sequences
+	# in the output. Embedding THAT raw inside a JS string literal is wrong: JS's
+	# own string-literal parser treats \" as an escape sequence for a bare quote,
+	# silently consuming the backslash — the nested JSON's quotes end up
+	# unescaped once eval() runs, corrupting the stored JSON (exactly the
+	# "[PendingSubmissions] failed to parse ... Expected '}' or ','" report this
+	# was causing). Base64-encoding the JSON text sidesteps the whole class of
+	# problem: base64 only ever contains [A-Za-z0-9+/=], which never needs any
+	# escaping to embed in a JS string literal, so atob() on the JS side always
+	# reconstructs the exact original bytes with zero ambiguity.
+	var json_str := JSON.stringify(arr)
+	var b64 := Marshalls.utf8_to_base64(json_str)
+	JavaScriptBridge.eval("localStorage.setItem('%s', atob('%s'))" % [key, b64], true)
 
 func _ls_remove(key: String) -> void:
 	if not OS.has_feature("web"):
@@ -2367,8 +2180,6 @@ func _init_game_from_seed() -> void:
 	if game_seed == 0:
 		print("[GM] seed=0, aborting init")
 		return
-	_live_watch_mode   = false   # a real game is starting — never the live-watch freeze/resume path
-	_live_watch_active = false
 	# Clean up nodes from previous game
 	for child in get_children().duplicate():
 		if child == player or child == camera: continue
@@ -2465,20 +2276,11 @@ func _init_game_from_seed() -> void:
 		camera.position = Vector2(VW * 0.5, _sim_cam_y)
 	_spawn_initial_platforms()
 	print("[GM] platforms spawned, game ready")
-	if vs_room_id != "":
-		_vs_live_connect()
 	ready_to_play.emit()
 
 func start_replay() -> void:
 	# Clear nickname on direct call; start_replay_external overrides it afterward
 	_replay_nickname = ""
-	# Reset here, not just in _init_game_from_seed() — otherwise watching a
-	# NORMAL (finished, non-live) replay right after watching a live match
-	# would inherit the "freeze instead of end" behavior. Main.gd re-enables
-	# it via live_start_watch() right after start_replay_external() returns,
-	# specifically for the live-watch call path — see _watch_vs_live.
-	_live_watch_mode   = false
-	_live_watch_active = false
 	if _replay_log.is_empty():
 		print("[REPLAY] Log empty, no replay")
 		return
@@ -3071,9 +2873,17 @@ func _submit_quest_progress() -> void:
 
 	var http := HTTPRequest.new()
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — GameManager (self) or
+	# this http node can be freed mid-flight (e.g. "Play Again" ->
+	# reload_current_scene) before the response lands. `main_node` is also
+	# captured here and can independently go stale if Main itself is freed
+	# (e.g. scene reload) while this request is in flight.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result: int, code: int, _h, body_resp: PackedByteArray):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if code == 401:
 			# 401 here means token was missing or expired — don't trigger re-sign,
 			# quest progress is best-effort and server processes it via submit anyway
@@ -3087,7 +2897,7 @@ func _submit_quest_progress() -> void:
 					var done : Array = data["completed"]
 					if done.size() > 0:
 						print("[GM] Quest completed: ", done)
-						if main_node and main_node.has_method("_on_quests_updated"):
+						if is_instance_valid(main_node) and main_node.has_method("_on_quests_updated"):
 							main_node.call("_on_quests_updated")
 	)
 	var headers := PackedStringArray(["Content-Type: application/json"])
@@ -3184,9 +2994,6 @@ func _submit_session() -> void:
 		print("[SUBMIT] tagging as VS room=%s role=%s" % [vs_room_id, vs_role])
 	var body := JSON.stringify(payload)
 	_send_submit_with_retry(session_id, body)
-	# Stop streaming to spectators now that the round is actually over —
-	# must happen before clearing vs_room_id below.
-	_vs_live_disconnect()
 	# One-shot tag — a solo run right after a VS match must not inherit it.
 	vs_room_id = ""
 	vs_role    = ""
@@ -3224,9 +3031,15 @@ func _send_submit_with_retry(sid: String, body: String) -> void:
 	var http := HTTPRequest.new()
 	add_child(http)
 	http.timeout = 12.0
+	# BUG FIX: "Lambda capture at index 0 was freed" — GameManager (self) or
+	# this http node can be freed mid-flight (e.g. "Play Again" ->
+	# reload_current_scene) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(_r, code, _h, _b):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		print("[GM] submit code=%d sid=%s" % [code, sid.left(8)])
 		# 200 or 4xx (except 401) → definitive answer → drop from queue
 		# 401 → no auth yet → keep in queue, retry when signed in
@@ -3342,9 +3155,15 @@ func flush_pending() -> void:
 		add_child(http)
 		http.timeout = 12.0
 		var _sid := sid
+		# BUG FIX: "Lambda capture at index 0 was freed" — GameManager (self)
+		# or this http node can be freed mid-flight (e.g. "Play Again" ->
+		# reload_current_scene) before the response lands.
+		var _alive : WeakRef = weakref(self)
 		http.request_completed.connect(ApiConfig.check_clock_skew)
 		http.request_completed.connect(func(_r, code, _h, _b):
+			if not is_instance_valid(http): return
 			http.queue_free()
+			if _alive.get_ref() == null: return
 			print("[GM] flush submit code=%d sid=%s" % [code, _sid.left(8)])
 			if code == 200:
 				_pending_remove(_sid)

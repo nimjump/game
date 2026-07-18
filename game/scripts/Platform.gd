@@ -20,6 +20,11 @@ var _col_shape     : CollisionShape2D
 var _break_tex     : Texture2D
 var _normal_tex    : Texture2D
 
+# Quest/altitude counter guard — true once this platform has been counted, so
+# repeated landings on the SAME platform don't inflate the total (see
+# on_player_landed). Platforms are never pooled, so this never needs resetting.
+var _quest_counted := false
+
 # Break state
 var _breaking      := false
 var _break_timer   := 0.0
@@ -137,8 +142,14 @@ func simulate_tick() -> bool:
 # Called on each jump
 func on_player_landed() -> void:
 	if _breaking: return
-	# Quest counter
-	if is_instance_valid(game_manager) and game_manager.has_method("on_platform_landed"):
+	# Quest/altitude counter — count each DISTINCT platform only ONCE. This used
+	# to fire on EVERY landing, so bouncing on the same platform again (falling
+	# back onto it after missing the next one, or repeated in-place bounces)
+	# kept inflating the "platforms climbed" total even though no new height was
+	# gained. Gate it so each platform contributes at most 1. The break/crumble
+	# logic below still runs on every landing (crumble counts steps).
+	if not _quest_counted and is_instance_valid(game_manager) and game_manager.has_method("on_platform_landed"):
+		_quest_counted = true
 		game_manager.call("on_platform_landed")
 
 	if platform_type == PlatformType.BROKEN:

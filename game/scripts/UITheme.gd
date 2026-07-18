@@ -143,6 +143,28 @@ static func _solid_texture(color: Color, w: int, h: int) -> ImageTexture:
 	return ImageTexture.create_from_image(img)
 
 # ── PANELS (Visual Proportioning) ─────────────────────────
+## Canonical short form for a Nimiq address / player id — the ONE place every
+## screen (leaderboard, VS, settings, replay-watch, etc.) goes through so the
+## same address always renders identically instead of "6..3" here and "9...4"
+## there. Nickname-vs-address choice stays with the caller; this is purely the
+## address → short-address transform.
+static func short_address(addr: String) -> String:
+	if addr == null:
+		return ""
+	if addr.length() <= 11:
+		return addr
+	return addr.left(6) + "…" + addr.right(3)
+
+## display_name — shared "what to show for this player": their chosen nickname
+## if they have a real one, otherwise the short address. Treats the backend's
+## default "Player" placeholder and empty/"null" as "no nickname". Used
+## everywhere a player is labelled so the rules never drift between screens.
+static func display_name(nickname: String, address: String) -> String:
+	if nickname != "" and nickname != "null" and nickname != "Player":
+		return nickname
+	var s := short_address(address)
+	return s if s != "" else "Player"
+
 static func apply_panel(panel: Control, _color: Color = Color.WHITE) -> void:
 	var assets := get_theme_assets()
 	var s := _with_no_padding(_nine_patch(assets["panel_1"], 8, 8, 8, 8))
@@ -556,6 +578,11 @@ static func confirm_external_link(parent: Node, url: String, ref: float) -> void
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	overlay.add_child(dim)
+	# Tap anywhere outside the dialog (on the dim) dismisses it — same as Cancel.
+	dim.gui_input.connect(func(e):
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+			overlay.queue_free()
+	)
 
 	# Fixed width AND height (not content-auto-sized) with anchor_top/bottom
 	# both at 0.5 — this is the same "center a variable-height popup" pattern
@@ -630,4 +657,115 @@ static func confirm_external_link(parent: Node, url: String, ref: float) -> void
 	open_btn.pressed.connect(func():
 		OS.shell_open(url)
 		overlay.queue_free()
+	)
+
+
+# ── Generic "are you sure?" confirmation ─────────────────────────────────────
+# Same centered dim-overlay dialog as confirm_external_link (self-removing,
+# no deferred-tween cleanup so it can't leave an invisible input-eating layer
+# behind), but with caller-supplied title/body/confirm label and an on_confirm
+# callback. Use for any destructive/irreversible action (cancel a match, etc.).
+# `danger` tints the confirm button red instead of the usual orange.
+static func confirm_action(parent: Node, title_text: String, body_text: String, confirm_label: String, ref: float, on_confirm: Callable, danger: bool = true) -> void:
+	const BG      := Color(0.957, 0.898, 0.800)
+	const BORDER  := Color(0.700, 0.520, 0.340)
+	const BROWN   := Color(0.220, 0.130, 0.060)
+	const MID     := Color(0.480, 0.340, 0.200)
+	const ORANGE  := Color(0.780, 0.380, 0.120)
+
+	var overlay := Control.new()
+	overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	overlay.z_index = 200
+	overlay.mouse_filter = Control.MOUSE_FILTER_STOP
+	parent.add_child(overlay)
+
+	var dim := ColorRect.new()
+	dim.color = Color(0, 0, 0, 0.6)
+	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	overlay.add_child(dim)
+	# Tap anywhere outside the dialog (on the dim) dismisses it — same as "No".
+	dim.gui_input.connect(func(e):
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+			overlay.queue_free()
+	)
+
+	# Center an AUTO-HEIGHT panel so title/body/buttons sit snugly with no big
+	# empty gap (the old fixed offset_top/bottom forced a tall box with the
+	# buttons floating high inside it). A CenterContainer sizes to the panel's
+	# own minimum and centers it on screen.
+	var center := CenterContainer.new()
+	center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	overlay.add_child(center)
+
+	var pw := ref * 0.82
+	var pc := PanelContainer.new()
+	pc.custom_minimum_size = Vector2(pw, 0)
+	var pc_st := StyleBoxFlat.new()
+	pc_st.bg_color = BG
+	pc_st.border_color = BORDER
+	pc_st.set_border_width_all(3)
+	pc_st.set_corner_radius_all(16)
+	pc_st.content_margin_left   = ref * 0.045
+	pc_st.content_margin_right  = ref * 0.045
+	pc_st.content_margin_top    = ref * 0.032
+	pc_st.content_margin_bottom = ref * 0.032
+	pc.add_theme_stylebox_override("panel", pc_st)
+	center.add_child(pc)
+
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", int(ref * 0.020))
+	pc.add_child(vb)
+
+	var hdr := HBoxContainer.new()
+	hdr.add_theme_constant_override("separation", int(ref * 0.012))
+	vb.add_child(hdr)
+	hdr.add_child(lucide_icon("alert-triangle", int(ref * 0.040), ORANGE))
+	var title := Label.new()
+	title.text = title_text
+	apply_label(title, BROWN, int(ref * 0.032))
+	hdr.add_child(title)
+
+	var body := Label.new()
+	body.text = body_text
+	body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	apply_label(body, MID, int(ref * 0.024))
+	vb.add_child(body)
+
+	var btn_row := HBoxContainer.new()
+	btn_row.add_theme_constant_override("separation", int(ref * 0.016))
+	vb.add_child(btn_row)
+
+	var no_btn := Button.new()
+	no_btn.text = "No"
+	no_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	no_btn.custom_minimum_size.y = int(ref * 0.064)
+	apply_ghost_button(no_btn)
+	btn_row.add_child(no_btn)
+	no_btn.pressed.connect(func(): overlay.queue_free())
+
+	var yes_btn := Button.new()
+	yes_btn.text = confirm_label
+	yes_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	yes_btn.custom_minimum_size.y = int(ref * 0.064)
+	apply_play_button(yes_btn)
+	if danger:
+		var dn := StyleBoxFlat.new(); var dh := StyleBoxFlat.new(); var dp := StyleBoxFlat.new()
+		for s in [dn, dh, dp]: s.set_corner_radius_all(10)
+		# Warm brick-red that sits with the cream/brown theme instead of the
+		# harsh fire-engine red before — still clearly "destructive".
+		dn.bg_color = Color(0.770, 0.320, 0.240)
+		dh.bg_color = Color(0.830, 0.380, 0.290)
+		dp.bg_color = Color(0.640, 0.250, 0.180)
+		yes_btn.add_theme_stylebox_override("normal",  dn)
+		yes_btn.add_theme_stylebox_override("hover",   dh)
+		yes_btn.add_theme_stylebox_override("pressed", dp)
+		yes_btn.add_theme_color_override("font_color", Color(0.990, 0.965, 0.940))
+		yes_btn.add_theme_color_override("font_hover_color", Color(1, 1, 1))
+		yes_btn.add_theme_color_override("font_pressed_color", Color(0.990, 0.965, 0.940))
+	btn_row.add_child(yes_btn)
+	yes_btn.pressed.connect(func():
+		overlay.queue_free()
+		on_confirm.call()
 	)

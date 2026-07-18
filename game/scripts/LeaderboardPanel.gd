@@ -57,6 +57,9 @@ func show_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
 	show()
 	if is_instance_valid(_panel_ctrl):
+		# BUG FIX ("panel pops in from the top-left corner") — see VSPanel.gd's
+		# show_panel() doc comment for the full explanation. Same fix here.
+		_panel_ctrl.pivot_offset = _panel_ctrl.size * 0.5
 		_panel_ctrl.modulate.a = 0.0
 		_panel_ctrl.scale      = Vector2(0.90, 0.90)
 		_anim_tween = create_tween()
@@ -90,7 +93,7 @@ func hide_panel() -> void:
 
 
 const _C_BG     := Color(0.957, 0.898, 0.800)
-const _C_CARD   := Color(0.910, 0.850, 0.750)
+const _C_CARD   := Color(0.940, 0.878, 0.776)   # same card tone as the Statistics panel
 const _C_BORDER := Color(0.580, 0.380, 0.220)
 const _C_BROWN  := Color(0.220, 0.130, 0.060)
 const _C_MID    := Color(0.480, 0.340, 0.200)
@@ -109,6 +112,14 @@ func _build_ui() -> void:
 	var dim := ColorRect.new()
 	dim.color = Color(0.0, 0.0, 0.0, 0.55)
 	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	# Tap outside the panel (on the dim) to close — consistent with every other
+	# panel (Stats/Quest/Streak/Customize/VS all do this); this was the one
+	# panel missing it.
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	dim.gui_input.connect(func(e):
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+			hide_panel(); closed.emit()
+	)
 	_panel_ctrl.add_child(dim)
 
 	var pw := ref * 0.92   # FIX: vw yerine ref — büyük ekranda genişlemeyi önler
@@ -274,9 +285,15 @@ func _fetch_prizes_then_lb(_retry: bool = false) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 5.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — LeaderboardPanel (self)
+	# or this http node can be freed mid-flight (panel closed/queue_free'd, or
+	# a window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -301,9 +318,15 @@ func _fetch_lb(_retry: bool = false) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 6.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — LeaderboardPanel (self)
+	# or this http node can be freed mid-flight (panel closed/queue_free'd, or
+	# a window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -516,9 +539,9 @@ func _build_list(data: Variant) -> void:
 		var rank    : int        = e.get("rank", i + 1)
 		var address : String     = str(e.get("player_id", e.get("address", "")))
 		var _raw_nick : String   = str(e.get("nickname", ""))
-		# Fallback: short wallet address if no nickname set
-		var nick : String = _raw_nick if _raw_nick != "" and _raw_nick != "null" else \
-			(address.left(6) + ".." + address.right(3) if address.length() > 9 else address)
+		# Shared nickname-or-short-address rule (see UITheme.display_name) so the
+		# leaderboard matches VS / settings / everywhere exactly.
+		var nick : String = UITheme.display_name(_raw_nick, address)
 		var score   : int        = e.get("server_score", e.get("client_score", 0))
 		var ts      : int        = e.get("submitted_at", 0)
 		var prize   : float      = prizes[i] if i < prizes.size() else 0.0
@@ -852,10 +875,19 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 	add_child(http)
 	_replay_cancelled    = false
 	_pending_replay_http = http
+	# BUG FIX: "Lambda capture at index 0 was freed" — LeaderboardPanel (self)
+	# or this http node can be freed mid-flight (panel closed/queue_free'd, or
+	# a window-resize rebuild) before the response lands. The existing
+	# is_inside_tree() check below does NOT protect against self itself being
+	# freed (calling it on a freed self is exactly what crashes), so guard
+	# with a WeakRef first.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
-		_pending_replay_http = null
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
+		_pending_replay_http = null
 		if _replay_cancelled: return
 		if not is_inside_tree(): return
 		if not is_instance_valid(btn): return

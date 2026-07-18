@@ -1001,12 +1001,23 @@ func simulate_tick() -> void:
 
 func _update_animation() -> void:
 	if _is_headless: return
+	# Let a hurt animation play out its flash window without being overridden.
+	if _hurt_flash > 0.0: return
 	var target := "stand"
 	if velocity.y < -100:       target = "jump"
 	elif abs(velocity.x) > 10: target = "walk"
-	if target != _current_anim:
+	# BUG FIX ("jetpack/fly animation sometimes stuck on the normal pose"):
+	# compare against the sprite's ACTUAL current animation, not the cached
+	# _current_anim. Other code (do_spring_jump, take-damage/hurt and its revert
+	# tween, die) calls _anim_sprite.play(...) DIRECTLY without updating
+	# _current_anim — so the cache would go stale and, whenever the stale value
+	# happened to equal `target`, this early-outed and left the sprite frozen on
+	# whatever clip that direct play() had set (e.g. "stand"/"hurt" while flying
+	# a jetpack, where target is "jump"). Reading the real animation self-heals
+	# every such desync.
+	if _anim_sprite.animation != target:
 		_current_anim = target
-		_anim_sprite.play(_current_anim)
+		_anim_sprite.play(target)
 
 
 func _update_overlays_visual(delta: float) -> void:

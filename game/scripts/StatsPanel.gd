@@ -89,13 +89,17 @@ func _build_ui() -> void:
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed:
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
 	)
 	dim_ctrl.add_child(dim)
 
 	_panel_ctrl = Control.new()
 	_panel_ctrl.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	# IGNORE so taps on the empty area around the panel fall THROUGH to the dim
+	# below (which closes the panel). Its child panel `pc` keeps its own STOP, so
+	# the panel itself still captures input — only the surrounding gap passes.
+	_panel_ctrl.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	dim_ctrl.add_child(_panel_ctrl)
 
 	var pc := PanelContainer.new()
@@ -659,6 +663,11 @@ func _refresh() -> void:
 
 
 func _on_stats_response(_result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	# BUG FIX: "Lambda capture at index 0 was freed" — this fires as a
+	# connected named-method callback rather than a lambda, but StatsPanel
+	# (self) and/or _http can still be freed mid-flight (panel closed/
+	# queue_free'd, or a window-resize rebuild) before the response lands.
+	if not is_instance_valid(_http): return
 	print("[STATS] response code=%d" % response_code)
 	if response_code != 200:
 		for k in _stat_labels:
@@ -734,6 +743,11 @@ func _on_stats_response(_result: int, response_code: int, _headers: PackedString
 
 
 func _on_rewards_response(_result: int, response_code: int, _headers: PackedStringArray, body: PackedByteArray) -> void:
+	# BUG FIX: "Lambda capture at index 0 was freed" — named-method callback,
+	# but StatsPanel (self) and/or _http_rewards can still be freed mid-flight
+	# (panel closed/queue_free'd, or a window-resize rebuild) before the
+	# response lands.
+	if not is_instance_valid(_http_rewards): return
 	if not is_instance_valid(_reward_root):
 		return
 	for c in _reward_root.get_children():
@@ -960,9 +974,15 @@ func _fetch_and_watch(session_id: String, btn: Button) -> void:
 	http.timeout = 10.0
 	add_child(http)
 
+	# BUG FIX: "Lambda capture at index 0 was freed" — StatsPanel (self) or
+	# this http node can be freed mid-flight (panel closed/queue_free'd, or a
+	# window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if not is_instance_valid(btn):
 			return
 		btn.disabled = false
@@ -1015,6 +1035,9 @@ func show_panel() -> void:
 	show()
 	_refresh()
 	if is_instance_valid(_panel_ctrl):
+		# BUG FIX ("panel pops in from the top-left corner") — see VSPanel.gd's
+		# show_panel() doc comment for the full explanation. Same fix here.
+		_panel_ctrl.pivot_offset = _panel_ctrl.size * 0.5
 		_panel_ctrl.modulate.a = 0.0
 		_panel_ctrl.scale      = Vector2(0.90, 0.90)
 		_anim_tween = create_tween()

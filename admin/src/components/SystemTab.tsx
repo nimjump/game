@@ -32,6 +32,7 @@ export default function SystemTab() {
   const [clearing, setClearing] = useState(false);
   const [capInput, setCapInput] = useState("100");
   const [coinRateInput, setCoinRateInput] = useState("1");
+  const [vsFeeInput, setVsFeeInput] = useState("5");
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   // ── Quest reward overrides ──────────────────────────────────────────
@@ -192,6 +193,7 @@ export default function SystemTab() {
       setCfg(c);
       setCapInput(String(c.daily_earn_cap_nim && c.daily_earn_cap_nim > 0 ? c.daily_earn_cap_nim : 100));
       setCoinRateInput(String(c.coin_nim_rate && c.coin_nim_rate > 0 ? c.coin_nim_rate : 1));
+      setVsFeeInput(String(c.vs_fee_percent != null ? c.vs_fee_percent : 5));
       setBinary(b);
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
@@ -222,6 +224,20 @@ export default function SystemTab() {
     setSaving(true);
     try {
       const updated = await saveAppConfig({ coin_nim_rate: n });
+      setCfg(updated);
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveVSFee() {
+    const n = parseFloat(vsFeeInput);
+    if (!Number.isFinite(n) || n < 0 || n > 100) { alert("VS fee must be a percentage between 0 and 100."); return; }
+    setSaving(true);
+    try {
+      const updated = await saveAppConfig({ vs_fee_percent: n });
       setCfg(updated);
     } catch (e) {
       alert("Error: " + String(e));
@@ -387,6 +403,20 @@ export default function SystemTab() {
             <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
               How many NIM 1 in-game coin is worth (e.g. 0.001 = 1000 coins per NIM). Applied to coins
               collected in a run, still subject to the daily earn cap above.
+            </span>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>VS system fee (%):</span>
+            <input type="number" min={0} max={100} step="any" value={vsFeeInput}
+              onChange={e => setVsFeeInput(e.target.value)}
+              style={{ width: 100, padding: "4px 8px", fontSize: 13 }} />
+            <button className="btn" disabled={saving || vsFeeInput === String(cfg.vs_fee_percent ?? 5)} onClick={saveVSFee}>
+              Save
+            </button>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              Fee kept from a VS match pot on settlement; the winner receives the rest.
+              e.g. 5 = winner takes 95% of the pot. Default 5%.
             </span>
           </div>
         </div>

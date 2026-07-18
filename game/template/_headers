@@ -7,19 +7,46 @@
 # `Content-Encoding: br` here would make browsers try to brotli-decode
 # them and fail.
 #
-# Left empty for now — add rules back here if/when we need custom
-# caching or headers again (e.g. Cache-Control for .part1/.part2 or
-# wasm-loader.js). Whatever goes here gets copied into export/ as-is
-# by build.py on every run — this file (in game/template/) is the
-# source of truth, don't edit the copy inside export/ directly.
-
-# ── CSP FIX (broad/permissive on purpose) ───────────────────────────────────
-# Root cause of "loads to 100%, then the page reloads itself" on some
-# mobile browsers/webviews: script-src-elem and connect-src were being
-# blocked (no explicit CSP was set anywhere before this, so the browser/
-# host's own default kicked in and blocked things like unpkg.com and the
-# wasm/pck asset fetches). This policy is intentionally wide open so
-# NOTHING gets blocked while we stabilize — tighten it later once confirmed
-# fixed (swap the https:/wss: wildcards for the actual backend + CDN domains).
+# Whatever goes here gets copied into export/ as-is by build.py on every
+# run — this file (in game/template/) is the source of truth, don't edit
+# the copy inside export/ directly.
+#
+# ── CROSS-ORIGIN ISOLATION OFF (Nimiq Hub popup fix) ─────────────────────────
+# THE actual root cause of the persistent "Invalid Request" / "Connection was
+# closed" error on the Nimiq Hub web sign-in popup. The DEPLOYED page (served
+# by Cloudflare Pages, NOT the Go backend) was coming back with:
+#     cross-origin-opener-policy: same-origin
+#     cross-origin-embedder-policy: require-corp
+# i.e. a fully cross-origin-ISOLATED page. Those two together sever the
+# window.opener link on ANY cross-origin popup (hub.nimiq.com) — so inside the
+# popup window.opener is null, Hub's own 1s connect-timeout handler
+# (nimiq/hub RpcApi.ts branches on `window.opener === null`) abandons the
+# postMessage handshake and shows its "Invalid Request" page, which our RPC
+# client then surfaces as "Connection was closed". This was NOT fixable from
+# the Go backend's headers: the HTML document is served by Cloudflare Pages,
+# whose header layer is controlled by THIS file — the Go COOP/COEP changes
+# only ever applied to /backend/* API responses, never to index.html.
+#
+# Setting both to their non-isolating values here explicitly OVERRIDES the
+# stale/default isolation that was being served, restoring the classic
+# behavior where a cross-origin popup keeps its opener — exactly what
+# popup-based auth (OAuth, Google Sign-In, Nimiq Hub) needs. Safe: this
+# single-threaded Godot export never needed SharedArrayBuffer/threads (see
+# index.html's Engine features {threads:false} +
+# GODOT_CONFIG['ensureCrossOriginIsolationHeaders']=false), so losing
+# crossOriginIsolated/SAB costs nothing.
+#
+# ── CSP (broad/permissive on purpose) ────────────────────────────────────────
+# Fixes "loads to 100%, then the page reloads itself" on some mobile
+# browsers/webviews: script-src-elem and connect-src were being blocked by the
+# host's default CSP (unpkg.com, wasm/pck fetches). Intentionally wide open for
+# now — tighten later (swap https:/wss: wildcards for the real backend + CDN
+# domains) once confirmed stable.
+#
+# NOTE (Cloudflare _headers format): all headers for a path must sit directly
+# under the path line with NO blank line between them — a blank line ends the
+# rule block. Keep COOP/COEP/CSP contiguous below.
 /*
+  Cross-Origin-Opener-Policy: unsafe-none
+  Cross-Origin-Embedder-Policy: unsafe-none
   Content-Security-Policy: default-src 'self' https: wss: blob: data:; script-src 'self' https: blob: data: 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; script-src-elem 'self' https: blob: data: 'unsafe-inline'; worker-src 'self' https: blob: data:; connect-src 'self' https: wss: blob: data:; style-src 'self' https: 'unsafe-inline'; img-src 'self' https: blob: data:; font-src 'self' https: data:; media-src 'self' https: blob: data:; manifest-src 'self' https:; frame-src 'self' https:; child-src 'self' https: blob:; object-src 'none'

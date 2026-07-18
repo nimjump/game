@@ -177,6 +177,7 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/vsroom/{id}", rl(s.handleVSRoomGet))
 	r.POST("/backend/vsroom/{id}/join", rl(s.handleVSRoomJoin))
 	r.POST("/backend/vsroom/{id}/pay", rl(s.handleVSRoomConfirmPayment))
+	r.POST("/backend/vsroom/{id}/start", rl(s.handleVSRoomStartPlay))
 	r.POST("/backend/vsroom/{id}/cancel", rl(s.handleVSRoomCancel))
 	r.POST("/backend/vsroom/{id}/forfeit", rl(s.handleVSRoomForfeit))
 	r.GET("/backend/admin/vs-rooms", s.requireAdminSession(s.handleAdminVSRooms))
@@ -559,6 +560,16 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 	log.Printf("[SUBMIT] session=%s score=%d flagged=%v player=%s saved",
 		sid8, req.Score, flagged, req.PlayerID)
 	// ─────────────────────────────────────────────────────────────────────────
+
+	// Mark this side as PLAYED right now, synchronously — before the async
+	// replay sim runs and independent of whether it gets flagged. The actual
+	// score is only recorded later (after successful re-simulation), so without
+	// this immediate marker the room would keep offering a "Play" button while
+	// the replay is still being verified, or forever if the match went to manual
+	// review — letting the player play the same match twice.
+	if req.VSRoomID != "" {
+		s.Store.MarkVSRoomPlayed(req.VSRoomID, req.VSRole, req.Session)
+	}
 
 	// A submission flagged up-front (basic anti-cheat, before replay sim even
 	// runs) that belongs to a VS match must also send that match to manual

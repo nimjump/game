@@ -202,6 +202,32 @@ func (s *Server) handleVSRoomConfirmPayment(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, map[string]any{"ok": true, "room": game.StripVSSeed(*room, playerID)})
 }
 
+// POST /backend/vsroom/{id}/start
+// Claims the caller's SINGLE play attempt BEFORE their run begins. This is the
+// network-safe lock: once this returns ok, that side is marked played forever,
+// so a later dropped score-submit can never earn them a fresh replay. The client
+// MUST get a 200 here before starting the round; if this call fails (offline),
+// the round simply never starts and nothing is lost. Returns the room with the
+// seed so the round runs from the authoritative server seed.
+func (s *Server) handleVSRoomStartPlay(ctx *fasthttp.RequestCtx) {
+	playerID := s.tokenPlayerID(ctx)
+	if playerID == "" {
+		writeErr(ctx, 401, "auth_required")
+		return
+	}
+	roomID := ctx.UserValue("id").(string)
+	room, err := s.Store.ClaimVSRoomPlay(roomID, playerID)
+	if err != nil {
+		// "already_played" is a normal, expected outcome (double-tap, a retry
+		// after a lost response, or reopening the room) — the client turns it into
+		// "you've already played this match" and shows the result/waiting screen.
+		log.Printf("[VSROOM] start-play refused room=%s player=%s err=%v", roomID, playerID, err)
+		writeErr(ctx, 409, err.Error())
+		return
+	}
+	writeJSON(ctx, 200, map[string]any{"ok": true, "room": game.StripVSSeed(*room, playerID)})
+}
+
 // POST /backend/vsroom/{id}/cancel
 func (s *Server) handleVSRoomCancel(ctx *fasthttp.RequestCtx) {
 	playerID := s.tokenPlayerID(ctx)

@@ -6,6 +6,27 @@
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
   <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, viewport-fit=cover">
+  <!-- PERF/BUG FIX: Nimiq Hub's own popup (hub.nimiq.com) starts a hardcoded
+       1-SECOND timeout the instant it loads (see nimiq/hub's RpcApi.start()
+       -> RpcServer.init(onClientTimeout), window.setTimeout(...,1000)) —
+       if our client's first ping doesn't reach an already-booted Hub SPA
+       within that 1s window, Hub gives up and shows its own "Invalid
+       Request" error page, which is what produces the "Connection was
+       closed" error our RPC client then sees (confirmed by reading Hub's
+       and its rpc library's actual source — this is NOT a popup-blocking or
+       user-gesture-timing issue, a genuine synchronous click still hits
+       this exact race). The Hub SPA has to do real work in that same
+       window — bootstrap its Vue app, AND its Keyguard client/iframe
+       (keyguard.nimiq.com) — before it can even start listening for our
+       ping. DNS/TLS/connection warmup ahead of time (before the popup ever
+       opens) is the one part of that budget we can shave down for free —
+       every visitor pays this cost on their very first sign-in attempt.
+       Safe unconditionally: no user data sent, browser just resolves DNS/
+       opens a TLS connection speculatively. -->
+  <link rel="preconnect" href="https://hub.nimiq.com" crossorigin>
+  <link rel="dns-prefetch" href="https://hub.nimiq.com">
+  <link rel="preconnect" href="https://keyguard.nimiq.com" crossorigin>
+  <link rel="dns-prefetch" href="https://keyguard.nimiq.com">
   <title>$GODOT_PROJECT_NAME</title>
   <style>
     html, body {
@@ -181,6 +202,38 @@
     window._nimiqDeviceId = '';
     window._nimiqData     = null;
 
+    // BUG FIX (web sign-in sometimes routes to the Nimiq-Pay-only flow even
+    // in a plain browser, silently skipping the Hub API popup entirely):
+    // Main.gd's Play/Connect-Wallet handlers used to decide mini-app-SDK vs
+    // Hub-API routing by reading ONLY window._nimiqProviderMissing — which
+    // _initNimiq() below never sets until its OWN async handshake actually
+    // finishes rejecting: a fixed 3.5s startup delay, PLUS sdk.init()'s own
+    // internal 10s timeout, PLUS an unpkg module fetch — worst case ~15s+
+    // before it's ever set. A player who taps Play quickly (the completely
+    // normal case) hits that check while it's still `undefined`, which read
+    // as `false` — the code then treated "not yet confirmed missing" as
+    // "assume still might be Nimiq Pay", took the mini-app-SDK detour
+    // (which can never succeed outside Nimiq Pay), burned its own several
+    // seconds of internal timeouts, and only fell through to a guest/no-
+    // wallet start — the Hub API path was never even reached. window.nimiq
+    // and window._nimiqReady are also both still unset at that same early
+    // moment for the exact same reason, so none of the three ever help fast
+    // enough on their own.
+    //
+    // window._nimiqInsidePayNow() fixes this by checking window.nimiqPay
+    // too — the flag Nimiq Pay's own WebView host injects directly, IN
+    // ADDITION to (not instead of) window.nimiq/_nimiqReady — so a genuine
+    // Nimiq Pay session is very unlikely to still show false the instant a
+    // real user gesture (a Play tap) can happen at all. Exposed as its own
+    // always-defined global (NOT nested inside the dismissible Nimiq-Pay-
+    // banner IIFE further below, which early-returns and skips its own
+    // internal copy of this same check entirely once the banner has been
+    // dismissed once this session) so GDScript can call it synchronously,
+    // with zero waiting, at the exact moment of any Play/Connect tap.
+    window._nimiqInsidePayNow = function() {
+      return !!(window.nimiqPay || window.nimiq || window._nimiqReady);
+    };
+
     async function _initNimiq() {
       try {
         // Pinned (was @latest) — this package is still 0.x, so @latest could
@@ -239,6 +292,218 @@
       if (typeof requestIdleCallback !== 'undefined') requestIdleCallback(_initNimiq, { timeout: 2000 });
       else _initNimiq();
     }, 3500);
+  </script>
+
+  <!-- ── NIMIQ HUB API (web browser sign-in) ─────────────────────────────────
+       Only relevant OUTSIDE Nimiq Pay: real wallet sign-in for players who
+       open the game in a plain browser tab. This is a SEPARATE integration
+       from the mini-app SDK above (_initNimiq) — that one only initializes
+       inside Nimiq Pay's own host and rejects everywhere else (sets
+       window._nimiqProviderMissing), so it can never work standalone. The
+       Hub API talks to hub.nimiq.com directly via a popup and works in any
+       normal browser.
+
+       BUG FIX ("Invalid Request" from hub.nimiq.com, persisting even after
+       the COOP/COEP fixes in main.go): Nimiq's own docs are explicit that
+       Hub API methods "must be called synchronously within a user action,
+       such as a click" (https://nimiq.github.io/hub/usage#calling-methods).
+       This used to be lazy-loaded — _loadHubApi() only started its dynamic
+       import() of the CDN module the FIRST time window._nimiqHubSign() was
+       actually called, i.e. from inside the Play/Connect tap's own handler.
+       A dynamic import() is a real network fetch, not a same-tick
+       microtask — by the time it resolved and hubApi.signMessage() (which
+       internally does window.open()) finally ran, the click's transient
+       user-activation window had already elapsed. The popup could still
+       open (window.open() doesn't hard-require activation in every
+       browser), but without a genuine synchronous-gesture-linked open,
+       hub.nimiq.com's own client-side RPC handshake with our page
+       apparently doesn't reliably complete — surfacing as "Invalid
+       Request"/timeout on Hub's side. Fix: kick off _loadHubApi() eagerly,
+       right away on page load (below), instead of waiting for the first
+       sign attempt — a small, harmless module fetch everyone already pays
+       for anyway once Godot itself finishes loading. By the time a player
+       can realistically tap Play/Connect, window._HubApiCtor is normally
+       already resolved, so window._nimiqHubSign() below calls
+       hubApi.signMessage() (and therefore window.open()) IMMEDIATELY,
+       fully synchronously inside the click handler's own call stack — no
+       .then() in between. The old lazy/async path is kept ONLY as a
+       fallback for the rare case where the module genuinely hasn't finished
+       loading yet by click-time (very slow network) — that fallback can
+       still hit the same popup-blocking risk this fix is otherwise
+       eliminating, but it's now the rare edge case, not the default path.
+       IMPORTANT (unchanged): window._nimiqHubSign() must still only ever be
+       called from a real user gesture (a button's pressed handler) — see
+       NimiqJS.gd's start_hub_sign() doc comment. -->
+  <script data-cfasync="false">
+  (function() {
+    var DEV = window._DEV;
+    var _hubApiPromise = null;
+
+    function _bytesToHex(bytes) {
+      var hex = '';
+      for (var i = 0; i < bytes.length; i++) {
+        var b = bytes[i].toString(16);
+        hex += (b.length === 1 ? '0' + b : b);
+      }
+      return hex;
+    }
+
+    // Dynamic import, same pattern as the identicons library above. Version
+    // pinned (see the mini-app SDK comment above for why: an unpinned
+    // @latest could silently pull a behavior-breaking update with zero
+    // corresponding change on our side). Kicked off EAGERLY below (not
+    // waiting for the first sign attempt) — see this script block's
+    // top-of-file doc comment for why: window.open() needs to fire
+    // synchronously inside the click handler, which is only possible if
+    // this module is already loaded by the time a real Play/Connect tap
+    // happens.
+    function _loadHubApi() {
+      if (_hubApiPromise) return _hubApiPromise;
+      _hubApiPromise = new Promise(function(resolve, reject) {
+        window._HubApiCtor = null;
+        var s = document.createElement('script');
+        s.type = 'module';
+        s.textContent = [
+          'import HubApi from "https://cdn.jsdelivr.net/npm/@nimiq/hub-api@v1.2.3/dist/standalone/HubApi.standalone.es.js";',
+          'window._HubApiCtor = HubApi;'
+        ].join('\n');
+        document.head.appendChild(s);
+        var waited = 0;
+        var poll = setInterval(function() {
+          waited += 100;
+          if (window._HubApiCtor) {
+            clearInterval(poll);
+            resolve(window._HubApiCtor);
+          } else if (waited >= 15000) {
+            clearInterval(poll);
+            reject(new Error('hub_api_load_timeout'));
+          }
+        }, 100);
+      });
+      return _hubApiPromise;
+    }
+
+    var _hubApiInstance = null;
+    function _getHubApi(HubApiCtor) {
+      if (!_hubApiInstance) {
+        // Mainnet endpoint — matches the backend's default NIMIQ_NETWORK=
+        // mainnet (see backend/.env.example). Swap to
+        // 'https://hub.nimiq-testnet.com' if this deployment ever runs
+        // against testnet.
+        _hubApiInstance = new HubApiCtor('https://hub.nimiq.com');
+      }
+      return _hubApiInstance;
+    }
+
+    // Called from GDScript (NimiqJS.gd's start_hub_sign()). Writes result to
+    // document.body.dataset.nimiqHubSign — same async-callback-via-DOM-dataset
+    // pattern used by the mini-app SDK's start_sign() (see NimiqJS.gd),
+    // because Emscripten's JavaScriptBridge.eval() can't directly await a
+    // JS Promise from GDScript.
+    // Result shape: {ok:true, address, publicKey (hex), signature (hex)}
+    //            or {ok:false, err}
+    // NOTE: unlike the mini-app SDK path, Hub API's signMessage() returns the
+    // signer's address directly in the SAME popup interaction — no separate
+    // "connect"/"listAccounts" round trip needed first.
+    function _finishHubSign(promise) {
+      promise.then(function(result) {
+        var pubHex = _bytesToHex(result.signerPublicKey);
+        var sigHex = _bytesToHex(result.signature);
+        document.body.dataset.nimiqHubSign = JSON.stringify({
+          ok: true, address: result.signer, publicKey: pubHex, signature: sigHex
+        });
+        console.log('[HubSign] ok addr=' + result.signer);
+      }).catch(function(err) {
+        var msg = (err && err.message) ? err.message : String(err);
+        console.warn('[HubSign] failed:', err, msg);
+        document.body.dataset.nimiqHubSign = JSON.stringify({ ok: false, err: msg });
+      });
+    }
+    // DIAGNOSTIC (deliberately NOT gated behind `if (DEV)` — this is the one
+    // thing we actually need to see in a real player's console to tell
+    // whether a given build/deploy is even running this fix at all, vs an
+    // older cached build, vs the fix running but hub.nimiq.com still
+    // rejecting for some other reason). Safe to remove once this is
+    // confirmed working across a few real tests.
+    console.log('[HubSign] script loaded, build tag=eager-preload-v1');
+
+    window._nimiqHubSign = function(message) {
+      document.body.dataset.nimiqHubSign = '';
+      // FAST PATH (the normal case — see this file's top-of-block doc
+      // comment): the eager preload below has almost certainly already
+      // resolved window._HubApiCtor by the time a real Play/Connect tap can
+      // happen, so call signMessage() (and therefore window.open())
+      // IMMEDIATELY here, with zero .then()/microtask hop, so it runs
+      // inside this click handler's own synchronous call stack.
+      if (window._HubApiCtor) {
+        console.log('[HubSign] FAST PATH — calling signMessage synchronously');
+        _finishHubSign(_getHubApi(window._HubApiCtor).signMessage({ appName: 'NimJump', message: message }));
+        return;
+      }
+      // SLOW-NETWORK FALLBACK ONLY: module genuinely isn't ready yet. This
+      // still risks the popup-blocking/handshake issue the eager preload
+      // exists to avoid, but it's strictly better than never attempting at
+      // all, and should be rare in practice.
+      console.warn('[HubSign] SLOW PATH — _HubApiCtor not ready yet at click time, falling back to async load (popup may be blocked)');
+      _finishHubSign(_loadHubApi().then(function(HubApiCtor) {
+        return _getHubApi(HubApiCtor).signMessage({ appName: 'NimJump', message: message });
+      }));
+    };
+
+    // ── WEB PAYMENT via Hub API checkout ────────────────────────────────────
+    // Counterpart to _nimiqHubSign for PAYMENTS (VS room entry fee, cosmetics).
+    // Inside Nimiq Pay, NimiqJS.start_payment() uses the mini-app SDK's
+    // window.nimiq.sendBasicTransactionWithData(). On a plain web browser there
+    // is no window.nimiq provider (that's the "payment failed: no_provider"
+    // error), so payments must go through the Hub API's checkout() popup — the
+    // same channel web sign-in uses. checkout() opens the Hub popup, the user
+    // confirms, Hub broadcasts the NIM transaction to the network, and returns
+    // a SignedTransaction whose hash the backend then verifies on-chain
+    // (getTransactionByHash — see backend/game/vsroom.go). Result is written to
+    // document.body.dataset.nimiqPay in the SAME {ok,tx}/{ok,err} shape the
+    // native path uses, so NimiqJS.await_payment() needs no changes.
+    // MUST be called synchronously from a real user gesture (the "Pay" button's
+    // pressed handler) for the popup not to be blocked — same as _nimiqHubSign.
+    function _finishHubCheckout(promise) {
+      promise.then(function(result) {
+        // Hub's SignedTransaction exposes the on-chain tx hash as .hash; guard
+        // across Hub versions with a couple of fallbacks just in case.
+        var hash = (result && (result.hash || result.transactionHash
+          || (result.raw && result.raw.hash))) || '';
+        document.body.dataset.nimiqPay = JSON.stringify({ ok: true, tx: String(hash) });
+        console.log('[HubCheckout] ok tx=' + hash);
+      }).catch(function(err) {
+        var msg = (err && err.message) ? err.message : String(err);
+        console.warn('[HubCheckout] failed:', err, msg);
+        document.body.dataset.nimiqPay = JSON.stringify({ ok: false, err: msg });
+      });
+    }
+    window._nimiqHubCheckout = function(recipient, valueLuna, extraData) {
+      document.body.dataset.nimiqPay = '';
+      var req = { appName: 'NimJump', recipient: recipient, value: valueLuna };
+      if (extraData) req.extraData = extraData;  // the "vs:<room>:<c|o>" memo tag
+      if (window._HubApiCtor) {
+        console.log('[HubCheckout] FAST PATH — calling checkout synchronously');
+        _finishHubCheckout(_getHubApi(window._HubApiCtor).checkout(req));
+        return;
+      }
+      console.warn('[HubCheckout] SLOW PATH — _HubApiCtor not ready yet at click time, falling back to async load (popup may be blocked)');
+      _finishHubCheckout(_loadHubApi().then(function(HubApiCtor) {
+        return _getHubApi(HubApiCtor).checkout(req);
+      }));
+    };
+
+    // Eager preload — see this script block's top-of-file doc comment.
+    // Fire-and-forget: any failure here just means _nimiqHubSign() falls
+    // back to the slow-network path above when actually needed; nothing
+    // else depends on this promise directly.
+    console.log('[HubSign] eager preload starting...');
+    _loadHubApi().then(function() {
+      console.log('[HubSign] eager preload finished OK — _HubApiCtor ready');
+    }).catch(function(err) {
+      console.warn('[HubSign] eager preload failed (will retry on demand):', err);
+    });
+  })();
   </script>
 
   <!-- ── NIMIQ IDENTICONS ───────────────────────────────────────────────────── -->
@@ -425,7 +690,7 @@
       title.textContent = 'Get Nimiq Pay';
       title.style.cssText = 'font-size:18px;font-weight:bold;margin-bottom:10px';
       var body = document.createElement('div');
-      body.textContent = "Looks like you don't have Nimiq Pay installed yet — install it to connect your wallet and earn real NIM.";
+      body.textContent = "Looks like you don't have Nimiq Pay installed yet — install it to connect your wallet and earn 2× the NIM rewards. Web play pays only half.";
       body.style.cssText = 'font-size:14px;line-height:1.4;color:#cfd0e0;margin-bottom:18px';
       var getBtn = document.createElement('button');
       getBtn.textContent = 'Get Nimiq Pay ↗';
@@ -452,7 +717,7 @@
       banner.id='nq-banner';
       banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:99998;background:linear-gradient(90deg,#1a1a2e,#16213e);color:#fff;display:flex;align-items:center;justify-content:space-between;padding:10px 14px;font-family:sans-serif;font-size:14px;box-shadow:0 2px 8px rgba(0,0,0,.5);box-sizing:border-box';
       var txt=document.createElement('span');
-      txt.textContent='🐰 Play in Nimiq Pay & earn NIM rewards!';
+      txt.textContent='🐰 Play in Nimiq Pay & earn 2× NIM rewards!';
       txt.style.cssText='flex:1;margin-right:10px;line-height:1.3';
       var open=document.createElement('button');
       open.textContent='Open ↗';
@@ -1036,20 +1301,23 @@ function initGodotGame() {
   }
   var _caps = _probeCapabilities();
 
-  // Cross-origin isolation check — this deployment sets COOP:same-origin /
-  // COEP:require-corp (see backend/main.go corsMiddleware) specifically so
-  // SharedArrayBuffer/threads work. Those headers can silently fail to reach
-  // the browser in ways the backend can't see from its own side: a CDN/proxy
-  // stripping them, or (very plausible here — this game runs inside Nimiq
-  // Pay's mini-app WebView host, see comments elsewhere in this file) a host
-  // WebView that doesn't propagate isolation to the embedded page at all.
-  // If the wasm build actually needs threads and isolation didn't land, the
-  // loader can download 100% of the bytes fine and then hang forever during
-  // WASM instantiate/thread-pool init with NO further onProgress calls and
-  // NO rejection either — which looks exactly like "stuck at some %,
-  // forever" with zero clue why. Logging this once, up front, means a
-  // LOAD_STALL for a given session can be cross-referenced against whether
-  // isolation was actually active for that same session.
+  // Cross-origin isolation check — kept as an informational log only.
+  // crossOriginIsolated is EXPECTED to read false now: backend/main.go's
+  // corsMiddleware deliberately relaxed Cross-Origin-Opener-Policy from
+  // "same-origin" to "same-origin-allow-popups" (see that file's comment) to
+  // fix the Nimiq Hub API's web sign-in popup, which strict COOP was
+  // silently breaking ("Invalid Request" from hub.nimiq.com — same-origin
+  // severs window.opener for any popup this page opens, which is exactly how
+  // Hub's popup talks back to us). Relaxing COOP alone wasn't enough though —
+  // Cross-Origin-Embedder-Policy: require-corp had to be removed too, since a
+  // cross-origin-isolated page (COOP + COEP together) can't retain
+  // window.opener on ANY cross-origin popup regardless of the COOP value.
+  // That trade-off costs crossOriginIsolated/
+  // SharedArrayBuffer, which this project's export never actually needed —
+  // see Engine.getMissingFeatures({threads:false}) below and
+  // GODOT_CONFIG['ensureCrossOriginIsolationHeaders']=false. Logged once, up
+  // front, purely so a LOAD_STALL report can still be cross-referenced
+  // against this if a *future* build ever does add a threaded export.
   var _coi = !!window.crossOriginIsolated;
   var _sab = (typeof SharedArrayBuffer !== 'undefined');
   var _coiMsg = 'COI crossOriginIsolated=' + _coi + ' SharedArrayBuffer=' + _sab;

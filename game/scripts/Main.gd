@@ -51,6 +51,17 @@ var _damage_volume  := 0.90
 # ── Vibration tracking ─────────────────────────────────────────────
 var _prev_lives : int = 3   # detect damage by lives decrease
 
+# Carries a VS room id across a reload_current_scene() on NATIVE builds (web
+# uses the "?vs=" URL param instead). Set when "Play Again" is pressed after a
+# VS match; consumed once on the next boot to open that room's result screen.
+static var _pending_vs_result_room : String = ""
+
+# The VS room id of the run currently on the game-over screen. Captured in
+# show_game_over() while _gm.vs_room_id is STILL set — the background LOCAL
+# session that spins up right after game-over clears vs_room_id, so reading it
+# at "View Result" press time gives "" and drops the player on the home menu.
+var _last_go_vs_room_id : String = ""
+
 var _hud        : CanvasLayer
 var _go_panel   : PanelContainer
 var _replay_bar : CanvasLayer
@@ -149,30 +160,6 @@ var _customize_panel : CanvasLayer = null   # hat/glasses/outfit/shoes shop — 
 # to bring the whole feature back with no other changes needed.
 const _COSMETICS_ENABLED := false
 
-# ── VS live spectating — see _watch_vs_live() and friends below. Reuses the
-# real replay player/HUD (same one "Watch Replay" uses); these vars are just
-# the small amount of extra state needed for the WebSocket connection,
-# reconnect-with-backoff, and the viewer-count/paused-banner overlay.
-var _vs_watch_ws              : WebSocketPeer = null
-var _vs_watch_room_id         : String  = ""
-var _vs_watch_started         : bool    = false   # has _start_replay actually fired yet?
-var _vs_watch_reconnecting    : bool    = false
-var _vs_watch_reconnect_delay : float   = 1.0
-const _VS_WATCH_RECONNECT_MAX_DELAY := 10.0
-var _vs_watch_hud             : CanvasLayer = null
-var _vs_watch_viewer_lbl      : Label = null
-var _vs_watch_banner          : Control = null
-var _vs_watch_banner_lbl      : Label = null
-var _vs_watch_seed_val        : int = 0
-var _vs_watch_player_seed     : int = 0
-# True right after opening a socket (first connect OR any reconnect) until
-# its first binary message has been handled. That first message is always
-# "the full backlog as of right now" — on the very first connection this
-# starts playback fresh; on a RECONNECT it must REPLACE the existing log
-# (live_replace_log), not append to it, or the RLE stream would be
-# duplicated. Every message after that first one on the same connection is
-# a genuine incremental update (live_append).
-var _vs_watch_awaiting_initial_chunk : bool = true
 var _backend_ok    : bool   = true   # no longer used for ping — always true
 var _ping_retry_timer: SceneTreeTimer = null  # auto-retry handle
 var _torch_rects   : Array  = []     # [left_torch, right_torch] TextureRect nodes
@@ -217,6 +204,12 @@ var _auth_token     : String:
 	get: return _nimiq_bridge.auth_token if is_instance_valid(_nimiq_bridge) and _nimiq_bridge.auth_token != "" else _auth_token_local
 	set(v): _auth_token_local = v
 
+var _vs_badge_lbl   : Label = null   # red "it's your turn" count on the VS tab
+var _vs_badge_timer : Timer = null   # polls the pending-count endpoint
+var _vs_countdown_pending := false   # true while a VS round's level is built but
+                                     # frozen behind the 3-2-1 countdown, so
+                                     # _on_gm_ready must NOT auto-activate the
+                                     # player yet (we activate on "GO" instead)
 var _player_nickname: String = ""  # chosen display name (from /backend/nickname)
 var _nickname_cooldown_end: int = 0 # unix: can't change nickname until this
 var _avatar_tex     : ImageTexture = null
@@ -366,6 +359,17 @@ func _ready() -> void:
 				// 400ms lets that transient settle before anything counts toward
 				// the baseline.
 				var _listenerStartMs = Date.now();
+				// BUG FIX (iOS'ta gyro ters hareket ediyordu): iOS Safari/WebKit's
+				// devicemotion.accelerationIncludingGravity reports the OPPOSITE sign
+				// on the x-axis compared to Chrome/Android for the exact same physical
+				// tilt — this is a long-documented WebKit quirk (not a fusion/filter
+				// difference like the deviceorientation-vs-devicemotion choice above,
+				// a genuinely flipped axis convention between engines). The negation a
+				// few lines below was tuned against Chrome/Android, where it correctly
+				// fixes "tilt right -> moves left"; applying that same negation on iOS
+				// flips a CORRECT raw reading into a backwards one. Branch by platform
+				// so each gets the sign that actually matches physical tilt direction.
+				var _gyroIsIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream;
 				window.addEventListener('devicemotion', function(e) {
 					var acc = e.accelerationIncludingGravity;
 					if (!acc || acc.x === null || acc.x === undefined) return;
@@ -380,8 +384,11 @@ func _ready() -> void:
 					// POSITIVE value. Without the negation here, tilting right produced
 					// gyroDir = -1 (read as "move left") while every other control
 					// scheme (tap, keyboard, native gyro) treats +1 = right / -1 = left.
-					// Negating acc.x brings the web path in line with that convention.
-					var g = -(acc.x / 9.8) * 90.0;
+					// Negating acc.x brings the web path in line with that convention —
+					// EXCEPT on iOS, whose own acc.x already comes in with the opposite
+					// sign to begin with (see _gyroIsIOS comment above), so iOS skips
+					// the negation and uses the raw value directly.
+					var g = (_gyroIsIOS ? 1 : -1) * (acc.x / 9.8) * 90.0;
 					window._gyroRaw = g;
 					// Fast calibration: first 15 events, but only once the
 					// post-listener-start grace window (see _startGyroListener's
@@ -501,9 +508,14 @@ func _web_fetch_and_start_replay(session_id: String) -> void:
 	var http := HTTPRequest.new()
 	add_child(http)
 	var url := ApiConfig.base_url() + "/backend/replay/" + session_id
+	# BUG FIX: "Lambda capture at index 0 was freed" — Main.gd can be torn down
+	# (scene reload / rebuild) while this request is still in flight.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _headers, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			push_warning("[WEB_REPLAY] fetch failed: result=%d code=%d" % [result, code])
 			Toast.network_error("web_replay code=%d" % code)
@@ -942,12 +954,17 @@ func _sync_panels() -> void:
 		if panel.has_method("set_auth_token"):     panel.call("set_auth_token", token)
 		if panel.has_method("set_auth_attempted"): panel.call("set_auth_attempted", authed)
 
+	# Auth state may have just changed (sign-in / expiry) — refresh the VS
+	# badge so it appears right after login instead of waiting for the poll.
+	if is_instance_valid(_vs_badge_lbl):
+		_fetch_vs_badge()
+
 	_rebuild_settings_if_open()
 
 
 func _on_nimiq_ready(address: String, label: String, avatar_data_url: String, device_id: String) -> void:
 	nimiq_address   = address
-	nimiq_label     = label if label != "" else (address.left(9) + "..." + address.right(4) if address.length() > 13 else address)
+	nimiq_label     = label if label != "" else UITheme.short_address(address)
 	nimiq_avatar    = avatar_data_url
 	nimiq_device_id = device_id
 	print("[MAIN] Nimiq ready address=%s label=%s avatar=%s" % [
@@ -956,6 +973,15 @@ func _on_nimiq_ready(address: String, label: String, avatar_data_url: String, de
 	])
 	if avatar_data_url.begins_with("data:image/"):
 		_avatar_tex = _data_url_to_texture(avatar_data_url)
+	elif OS.has_feature("web") and _avatar_tex == null and address != "":
+		# BUG FIX ("my Nimiq avatar doesn't show in Settings after web login"):
+		# unlike Nimiq Pay (which injects a ready-made avatar data URL), the web
+		# Hub sign-in returns only the address — no avatar. So the real Nimiq
+		# identicon never gets generated and the Settings account card falls
+		# back to the colored-initial placeholder. Generate the real identicon
+		# from the address via the same Identicons bridge the leaderboard/VS
+		# avatars already use, then refresh any open UI.
+		_load_own_avatar_from_address_async(address)
 	_sync_panels()
 	# Defense-in-depth alongside _on_auth_success's own call — nimiq_ready
 	# always fires after poll()'s restore-wait resolves one way or another,
@@ -967,6 +993,31 @@ func _on_nimiq_ready(address: String, label: String, avatar_data_url: String, de
 func _on_auth_success(token: String, player_id: String) -> void:
 	print("[MAIN] Auth successful player=%s" % player_id.left(8))
 	_auth_token = token
+
+	# WEB (Hub) sign-in / restored web session identity fix.
+	# Unlike Nimiq Pay (which injects a friendly account label AND a ready-made
+	# avatar), the web Hub flow only ever gives us the address. On top of that,
+	# poll()'s early "not a mini-app" branch sets the bridge label to "Guest"
+	# and clears the address on web — so a signed-in web player's Settings card
+	# showed "Guest" with no avatar. Here (fires on both fresh web sign-in AND
+	# session restore) we backfill a short-address label + the real Nimiq
+	# identicon from the address whenever they're missing. Guarded so Nimiq Pay
+	# (which has a real label/avatar already) is never clobbered — and player_id
+	# on web IS the Nimiq address.
+	if OS.has_feature("web") and player_id != "":
+		var short_addr : String = UITheme.short_address(player_id)
+		if nimiq_address == "":
+			nimiq_address = player_id
+		if nimiq_label == "" or nimiq_label == "Guest":
+			nimiq_label = short_addr
+		if is_instance_valid(_nimiq_bridge):
+			if _nimiq_bridge.nimiq_address == "":
+				_nimiq_bridge.nimiq_address = player_id
+			if _nimiq_bridge.nimiq_label == "" or _nimiq_bridge.nimiq_label == "Guest":
+				_nimiq_bridge.nimiq_label = short_addr
+		if _avatar_tex == null:
+			_load_own_avatar_from_address_async(player_id)
+
 	_fetch_nickname(player_id, token)
 	_sync_panels()
 	_rebuild_settings_if_open()
@@ -1184,8 +1235,14 @@ func _fetch_streak_status() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 6.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — Main.gd (self) or this
+	# http node can be freed mid-flight (scene reload / panel rebuild on
+	# resize) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -1275,15 +1332,72 @@ func _on_auth_expired() -> void:
 	_rebuild_settings_if_open()
 
 
+## Show/hide the red VS-tab badge. count<=0 hides it; 10+ shows "9+".
+func _set_vs_badge(count: int) -> void:
+	if not is_instance_valid(_vs_badge_lbl):
+		return
+	if count <= 0:
+		_vs_badge_lbl.visible = false
+		return
+	_vs_badge_lbl.text = str(count) if count < 10 else "9+"
+	_vs_badge_lbl.visible = true
+
+
+## Poll the backend for how many VS matches are waiting on the player (opponent
+## joined, not finished, they haven't played their round yet) and update the
+## VS-tab badge. Silent no-op when signed out. Kicked off once on load and then
+## on a light repeating timer (see _start_vs_badge_polling).
+func _fetch_vs_badge() -> void:
+	var token : String = _auth_token
+	if token == "":
+		_set_vs_badge(0)
+		return
+	var http := HTTPRequest.new()
+	http.timeout = 6.0
+	add_child(http)
+	var _alive : WeakRef = weakref(self)
+	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
+		http.queue_free()
+		if _alive.get_ref() == null: return
+		if result != HTTPRequest.RESULT_SUCCESS or code != 200: return
+		var j := JSON.new()
+		if j.parse(body.get_string_from_utf8()) != OK: return
+		var d : Dictionary = j.get_data()
+		_set_vs_badge(int(d.get("count", 0)))
+	)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/pending-count"), ["Authorization: Bearer " + token])
+
+
+## Sets up (once) a repeating timer that refreshes the VS badge, plus an
+## immediate first fetch. Safe to call multiple times — reuses the timer.
+func _start_vs_badge_polling() -> void:
+	_fetch_vs_badge()
+	if is_instance_valid(_vs_badge_timer):
+		return
+	_vs_badge_timer = Timer.new()
+	_vs_badge_timer.wait_time = 30.0
+	_vs_badge_timer.one_shot = false
+	_vs_badge_timer.autostart = true
+	add_child(_vs_badge_timer)
+	_vs_badge_timer.timeout.connect(_fetch_vs_badge)
+
+
 ## Fetch nickname from backend and cache locally
 func _fetch_nickname(player_id: String, token: String) -> void:
 	if player_id == "" or token == "": return
 	var http := HTTPRequest.new()
 	http.timeout = 5.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — Main.gd (self) or this
+	# http node can be freed mid-flight (scene reload / panel rebuild on
+	# resize) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if code == 401: _on_auth_expired(); return
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200: return
 		var j := JSON.new()
@@ -1304,9 +1418,15 @@ func _set_nickname_async(nickname: String, token: String, on_done: Callable) -> 
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — Main.gd (self) or this
+	# http node can be freed mid-flight (scene reload / panel rebuild on
+	# resize) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			var msg := "error_%d" % code
 			if body.size() > 0:
@@ -1489,8 +1609,6 @@ func _process(_delta: float) -> void:
 	# If calibration screen is open, update the angle label
 	if is_instance_valid(_calib_layer):
 		_calib_tick()
-	if is_instance_valid(_vs_watch_ws) or _vs_watch_reconnecting:
-		_vs_watch_poll(_delta)
 
 
 ## Native mobile (Android/iOS) touch tracking
@@ -1521,7 +1639,7 @@ var _calib_saved_gm      : Node         = null
 var _calib_saved_player  : Node         = null
 var _calib_saved_started : bool         = false
 var _calib_saved_hud_vis : bool         = false
-var _replay_source       : String       = ""  # "game_over" | "leaderboard" | "stats" | "web" | "vs" | "vs_live"
+var _replay_source       : String       = ""  # "game_over" | "leaderboard" | "stats" | "web" | "vs"
 var _block_lb_replay     : bool         = false  # block late LB HTTP responses when play is pressed
 var _calib_gm            : Node2D       = null
 var _calib_real_player   : CharacterBody2D = null
@@ -1765,19 +1883,40 @@ func _ensure_gyro_js() -> void:
 		// iOS: request permission (non-iOS already started in _ready).
 		// Gated on DeviceMotionEvent now — see the latency-fix comment on
 		// _startGyroListener for why this switched from DeviceOrientationEvent.
+		//
+		// BUG FIX: this used to gate on a one-shot window._gyroPermAsked flag —
+		// once the player denied it once, no later Gyro-button press could
+		// ever re-prompt (the real native dialog just never fired again), so
+		// there was no way to recover short of a full page reload. Every call
+		// into this function now only ever happens from a real user gesture
+		// (the Gyro button's own press handler — see _refresh_ctrl_ui's call
+		// site in the Settings UI), which is exactly what iOS requires to
+		// show its native permission prompt again — so just ask fresh every
+		// time instead of once ever. window._gyroPermResult is the outcome
+		// GDScript polls for (see _ensure_gyro_js_and_await below): 'granted',
+		// 'denied', or null while still pending.
+		window._gyroPermResult = null;
 		if (typeof DeviceMotionEvent !== 'undefined' &&
 			typeof DeviceMotionEvent.requestPermission === 'function') {
-			if (!window._gyroPermAsked) {
-				window._gyroPermAsked = true;
-				DeviceMotionEvent.requestPermission().then(function(state) {
-					if (state === 'granted') window._startGyroListener();
-					else window._gyroPermDenied = true;
-				}).catch(function() {
+			DeviceMotionEvent.requestPermission().then(function(state) {
+				if (state === 'granted') {
+					window._gyroPermDenied = false;
+					window._startGyroListener();
+					window._gyroPermResult = 'granted';
+				} else {
 					window._gyroPermDenied = true;
-				});
-			}
+					window._gyroPermResult = 'denied';
+				}
+			}).catch(function() {
+				window._gyroPermDenied = true;
+				window._gyroPermResult = 'denied';
+			});
 		} else {
+			// No permission gate on this platform (Android/desktop) — starts
+			// immediately and is always effectively "granted".
+			window._gyroPermDenied = false;
 			window._startGyroListener();
+			window._gyroPermResult = 'granted';
 		}
 	""", true)
 	# Re-apply a previously-saved manual calibration (loaded from settings at
@@ -1786,6 +1925,26 @@ func _ensure_gyro_js() -> void:
 	# recalibrates again from scratch.
 	if _gyro_baseline != 0.0:
 		JavaScriptBridge.eval("if(window._setGyroBase) window._setGyroBase(%f);" % _gyro_baseline, true)
+
+
+## Calls _ensure_gyro_js() and waits for the real permission outcome —
+## instant on platforms with no permission gate (Android/desktop), or however
+## long the player takes to tap Allow/Don't Allow on iOS's native prompt.
+## Returns true if gyro is actually usable (granted, or no gate needed at
+## all), false if denied or the wait timed out. Used by the Gyro button in
+## Settings so it only commits to "gyro selected" once that's actually true
+## — see that button's pressed handler for the full bug-fix context.
+func _ensure_gyro_js_and_await() -> bool:
+	_ensure_gyro_js()
+	if not OS.has_feature("web"):
+		return true
+	for _i in range(150):   # up to 15s — plenty of time to tap the native dialog
+		var r = JavaScriptBridge.eval("window._gyroPermResult", true)
+		var s := str(r) if r != null else ""
+		if s == "granted": return true
+		if s == "denied": return false
+		await get_tree().create_timer(0.1).timeout
+	return false   # timed out with no answer — treat the same as denied
 
 ## Returns -1 / 0 / 1 direction; GameManager uses this value.
 func get_control_dir() -> int:
@@ -1908,14 +2067,27 @@ func _save_settings_flush() -> void:
 		"bg_selected":     _bg_selected,
 		"bg_auto":         _bg_auto,
 	}
-	JavaScriptBridge.eval("localStorage.setItem('nimjump_settings', '%s')" % JSON.stringify(d).replace("'", "\\'"), true)
+	# BUG FIX: same class of bug as GameManager.gd's _ls_set() — see that
+	# function's comment. Naive .replace("'", "\\'") escaping breaks the
+	# instant any nested value contains its own escaped quotes (JS's string-
+	# literal parser eats the backslash when it sees \" inside a JS string).
+	# None of THIS dictionary's fields are free-form text today, but base64
+	# makes the whole class of bug structurally impossible instead of relying
+	# on "no field happens to need escaping right now" staying true forever.
+	var settings_b64 := Marshalls.utf8_to_base64(JSON.stringify(d))
+	JavaScriptBridge.eval("localStorage.setItem('nimjump_settings', atob('%s'))" % settings_b64, true)
 
 
 func _load_settings() -> void:
 	if not OS.has_feature("web"): return
 	var raw_js : String = str(JavaScriptBridge.eval("localStorage.getItem('nimjump_settings') ?? ''", true))
 	if raw_js == "" or raw_js == "null": return
-	var result : Variant = JSON.parse_string(raw_js)
+	var j := JSON.new()
+	var err := j.parse(raw_js)
+	if err != OK:
+		push_warning("[Settings] failed to parse (line %d: %s) — raw(first 120)=%s" % [j.get_error_line(), j.get_error_message(), raw_js.left(120)])
+		return
+	var result : Variant = j.get_data()
 	if not result is Dictionary: return
 	var d : Dictionary = result
 	if d.has("control_mode"):     _control_mode     = str(d["control_mode"])
@@ -2365,12 +2537,30 @@ func _build_game() -> void:
 	restart_btn.custom_minimum_size = Vector2(0, int(_p(0.088)))
 	restart_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	restart_btn.pressed.connect(func():
+		# If the run that just ended was a VS match, don't drop the player back on
+		# the home menu — take them straight to that challenge's result screen in
+		# the VS tab. We do it by writing "?vs=<room_id>" into the URL before the
+		# reload so the existing deeplink handler (_check_vsroom_deeplink) opens the
+		# room detail on the fresh boot. Normal (non-VS) runs clear the query and
+		# land on home exactly as before.
+		# Use the id captured at show_game_over() time — _gm.vs_room_id is already
+		# cleared by the background LOCAL session by the time this is pressed.
+		# We DON'T navigate to a "?vs=" URL (the player asked to just return to the
+		# lobby and have it reopen the VS room in-app). Instead: stash the room on a
+		# process-lived static, do an in-scene reload_current_scene() (NOT a full
+		# page reload — the URL/page stays put), and _build_start_ui() consumes the
+		# static on the fresh boot to open that room's result screen. Empty for a
+		# non-VS run, so a normal "Play Again" just returns to the lobby as before.
+		_pending_vs_result_room = _last_go_vs_room_id
 		if OS.has_feature("web"):
+			# Clear any lingering "?vs=" from the URL so the deeplink handler doesn't
+			# also fire — the static var is the single source of truth here.
 			JavaScriptBridge.eval("history.replaceState(null,'',location.pathname)", true)
 		get_tree().reload_current_scene()
 	)
 	UITheme.apply_play_button(restart_btn)
 	go_btn_row.add_child(restart_btn)
+	_go_panel.set_meta("restart_btn", restart_btn)
 
 	# ── REPLAY button ────────────────────────────────────────────────
 	var replay_btn := Button.new()
@@ -2451,6 +2641,10 @@ func _on_gm_ready() -> void:
 	if is_instance_valid(_play_btn):
 		_play_btn.disabled = false
 		_play_btn.text = "PLAY"
+	# During a VS round's 3-2-1 the level is already built but the player must
+	# stay frozen at the start — _start_vs_round activates them itself on "GO".
+	if _vs_countdown_pending:
+		return
 	if _started and _player and _player.has_method("activate"):
 		if not _player.get("_initialized"):
 			print("[MAIN] calling activate()")
@@ -2717,10 +2911,9 @@ func _build_start_ui() -> void:
 		sel_pc.add_child(customize_btn)
 
 	# ── PLAY and Settings buttons ────────────────────
-	# VS button removed from this build (see _open_vs_panel/_build_vs_panel —
-	# code kept intact, just not linked to a menu button here, so VS can be
-	# re-enabled later by re-adding the button below without touching the
-	# panel/backend logic).
+	# VS is reachable via the bottom nav bar's "VS" tab (see _build_bottom_bar
+	# / _on_tab_pressed's "vs" case, and _open_vs_panel/_build_vs_panel for the
+	# panel itself) — no separate button needed here.
 	var btn_w       := _p(0.72)
 	var play_h      := int(_p(0.105))
 	var set_h       := int(_p(0.080))
@@ -2849,6 +3042,14 @@ func _build_start_ui() -> void:
 	_build_bottom_bar()
 	_build_quest_panel()
 	_check_vsroom_deeplink()
+	# Native "Play Again after a VS match" hand-off (web goes through the URL
+	# deeplink above). Consume it once so a later normal launch stays on home.
+	if _pending_vs_result_room != "":
+		var _vs_res_id := _pending_vs_result_room
+		_pending_vs_result_room = ""
+		_open_vs_panel()
+		if is_instance_valid(_vs_panel) and _vs_panel.has_method("open_room"):
+			_vs_panel.call("open_room", _vs_res_id)
 	_build_streak_badge()
 	# BUG FIX: "streak button sometimes just isn't there" — _build_streak_badge()
 	# always creates the badge HIDDEN (visible=false) and only _update_streak_
@@ -2913,11 +3114,15 @@ func _build_bottom_bar() -> void:
 		{"id": "quests",      "lucide": "zap",        "label": "Quests"},
 		{"id": "stats",       "lucide": "bar-chart-2", "label": "Statistics"},
 		{"id": "leaderboard", "lucide": "trophy",      "label": "Leaderboard"},
+		{"id": "vs",          "lucide": "gamepad-2",   "label": "VS"},
 	]
 	for t in tabs:
 		var btn := _make_tab_button(t.lucide, t.label, t.id)
 		_tab_btns[t.id] = btn
 		row.add_child(btn)
+
+	# Start the "it's your turn" VS badge (immediate fetch + 30s poll).
+	_start_vs_badge_polling()
 
 
 func _make_tab_button(lucide_name: String, label: String, tab_id: String) -> Button:
@@ -2962,6 +3167,13 @@ func _make_tab_button(lucide_name: String, label: String, tab_id: String) -> But
 	# Başlangıç rengi pasif (orta kahve) — _set_active_tab ile güncellenir
 	var ic := UITheme.lucide_icon(lucide_name, ic_size, Color(0.480, 0.340, 0.200))
 	ic.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# Carry the icon's tint on self_modulate (NOT modulate) for EVERY tab, so
+	# _set_tab_color's active/inactive coloring applies exactly once. Leaving the
+	# lucide_icon-set modulate in place would multiply with _set_tab_color's
+	# self_modulate and double-darken the icon (why the other tabs looked a
+	# different, darker shade than VS). modulate stays white; self_modulate tints.
+	ic.self_modulate = ic.modulate
+	ic.modulate = Color.WHITE
 	vbox.add_child(ic)
 	btn.set_meta("lucide_icon", ic)
 
@@ -2973,6 +3185,49 @@ func _make_tab_button(lucide_name: String, label: String, tab_id: String) -> But
 	vbox.add_child(lbl)
 	btn.set_meta("lucide_label", lbl)
 
+	# Notification badge — only the VS tab carries one. Small red pill that hugs
+	# the top-right corner OF THE ICON ITSELF (parented to `ic`, not the button)
+	# so the "1" always sits right beside the gamepad icon on every screen size,
+	# instead of drifting off in the button's far corner. Shows how many matches
+	# are waiting on the player ("it's your turn"); hidden when zero.
+	if tab_id == "vs":
+		# Icon tint already moved to self_modulate above (for all tabs), so the
+		# badge child added here is never affected by the tab coloring.
+		ic.clip_contents = false
+		var badge := Label.new()
+		badge.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		badge.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		badge.vertical_alignment   = VERTICAL_ALIGNMENT_CENTER
+		badge.z_index = 30
+		badge.clip_contents = false
+		var bstyle := StyleBoxFlat.new()
+		bstyle.bg_color = Color(0.850, 0.140, 0.140)  # alarm red
+		bstyle.set_corner_radius_all(int(ic_size * 0.5))
+		bstyle.content_margin_left   = int(ic_size * 0.18)
+		bstyle.content_margin_right  = int(ic_size * 0.18)
+		bstyle.content_margin_top    = int(ic_size * 0.02)
+		bstyle.content_margin_bottom = int(ic_size * 0.02)
+		badge.add_theme_stylebox_override("normal", bstyle)
+		UITheme.apply_label(badge, Color(1, 1, 1), int(ic_size * 0.5))
+		badge.add_theme_color_override("font_color", Color(1, 1, 1))
+		# Sit the badge's CENTER on the icon's top-right corner region so it
+		# hugs/overlaps the icon instead of floating detached above it. Anchor
+		# point is pulled slightly inside the icon (0.80, 0.20) and the badge
+		# grows out in both directions from there, centered on that point.
+		badge.anchor_left = 0.80
+		badge.anchor_right = 0.80
+		badge.anchor_top = 0.20
+		badge.anchor_bottom = 0.20
+		badge.grow_horizontal = Control.GROW_DIRECTION_BOTH
+		badge.grow_vertical    = Control.GROW_DIRECTION_BOTH
+		badge.offset_left = 0
+		badge.offset_right = 0
+		badge.offset_top = 0
+		badge.offset_bottom = 0
+		badge.visible = false
+		ic.add_child(badge)
+		_vs_badge_lbl = badge
+
 	btn.pressed.connect(func(): _on_tab_pressed(tab_id))
 	return btn
 
@@ -2982,7 +3237,11 @@ func _set_tab_color(tab_id: String, active_id: String) -> void:
 	var col := Color(0.780, 0.380, 0.120) if tab_id == active_id else Color(0.480, 0.340, 0.200)
 	if btn.has_meta("lucide_icon"):
 		var ic : TextureRect = btn.get_meta("lucide_icon")
-		if is_instance_valid(ic): ic.modulate = col
+		# self_modulate (not modulate): tints ONLY the icon's own texture, not
+		# its children. The VS notification badge is parented to the icon, so
+		# using modulate here would cascade the dim/active tab tint onto the
+		# badge too and wash out its red pill + white "1" (the "soluk" bug).
+		if is_instance_valid(ic): ic.self_modulate = col
 	if btn.has_meta("lucide_label"):
 		var lbl : Label = btn.get_meta("lucide_label")
 		if is_instance_valid(lbl): lbl.add_theme_color_override("font_color", col)
@@ -3005,15 +3264,20 @@ func _hide_other_panels(keep: String) -> void:
 	if keep != "quests"      and is_instance_valid(_quest_panel):      _quest_panel.hide_panel()
 	if keep != "leaderboard" and is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
 	if keep != "stats"       and is_instance_valid(_stats_panel):      _stats_panel.hide_panel()
+	if keep != "vs"          and is_instance_valid(_vs_panel):         _vs_panel.hide_panel()
 
 
 func _on_tab_pressed(tab_id: String) -> void:
+	# Any tab interaction is a good moment to refresh the VS badge (e.g. the
+	# player just closed the VS panel after playing a pending match).
+	_fetch_vs_badge()
 	# Pressing the same tab again closes it
 	if _active_tab == tab_id:
 		match tab_id:
 			"quests":      if is_instance_valid(_quest_panel):      _quest_panel.hide_panel()
 			"leaderboard": if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
 			"stats":       if is_instance_valid(_stats_panel):      _stats_panel.hide_panel()
+			"vs":          if is_instance_valid(_vs_panel):         _vs_panel.hide_panel()
 		_deactivate_tab()
 		return
 
@@ -3027,23 +3291,48 @@ func _on_tab_pressed(tab_id: String) -> void:
 			if is_instance_valid(_leaderboard_panel): _leaderboard_panel.show_panel()
 		"stats":
 			if is_instance_valid(_stats_panel):      _stats_panel.show_panel()
+		"vs":
+			# _open_vs_panel() lazily builds _vs_panel via _build_vs_panel() on
+			# first use (see that function) — same entry point the "?vsroom=<id>"
+			# deep-link handler already uses, just reached from the bottom nav
+			# bar now instead of only a shared link. It has its own _started
+			# guard (no-op mid-game), matching how the other tab buttons are
+			# only reachable from the lobby anyway.
+			_open_vs_panel()
 
 
-## Invite link support — "?vsroom=<id>" in the URL (see backend vsRoomInviteURL).
+## Invite link support — "?vs=<id>" in the URL (see backend vsRoomInviteURL).
 ## Someone who clicks a shared VS link lands here, gets the VS panel opened
 ## straight to that room's detail/join view instead of the empty room list.
+## Older links used "?vsroom=<id>" — still accepted for backward compatibility.
 func _check_vsroom_deeplink() -> void:
 	if not OS.has_feature("web"): return
 	var url_raw = JavaScriptBridge.eval("window.location.search", true)
 	if url_raw == null: return
 	var url_str := str(url_raw)
-	var idx := url_str.find("vsroom=")
-	if idx < 0: return
-	var room_id := url_str.substr(idx + 7).split("&")[0]
+	var room_id := _query_param(url_str, "vs")
+	if room_id == "":
+		room_id = _query_param(url_str, "vsroom")
+	print("[VSDEEPLINK] search=%s parsed_room_id=%s _started=%s" % [url_str, room_id, str(_started)])
 	if room_id == "": return
 	_open_vs_panel()
+	print("[VSDEEPLINK] after _open_vs_panel vs_panel_valid=%s" % str(is_instance_valid(_vs_panel)))
 	if is_instance_valid(_vs_panel) and _vs_panel.has_method("open_room"):
 		_vs_panel.call("open_room", room_id)
+
+
+## Extracts a query-param value from a "?a=1&b=2" search string. Matches the
+## key only as a whole param (preceded by '?' or '&'), so "vs" never
+## accidentally matches inside "vsroom" (or any other key).
+func _query_param(search: String, key: String) -> String:
+	var needle := key + "="
+	var idx := search.find(needle)
+	while idx >= 0:
+		var prev_ok := idx == 0 or search[idx - 1] == "?" or search[idx - 1] == "&"
+		if prev_ok:
+			return search.substr(idx + needle.length()).split("&")[0]
+		idx = search.find(needle, idx + 1)
+	return ""
 
 
 ## VS Rooms — async 1v1 challenge panel, opened from the main-menu VS button.
@@ -3092,310 +3381,12 @@ func _build_vs_panel() -> void:
 		_block_lb_replay = false
 		await _start_replay(seed, log, char_idx, "vs", player_seed, nick, address, gyro_active)
 	)
-	_vs_panel.connect("watch_requested", _watch_vs_live)
+	# Same tab-deactivate wiring quests/leaderboard/stats already have — without
+	# this, closing VS via its own in-panel close button (rather than tapping
+	# the bottom-bar "VS" tab again) left that tab looking permanently active.
+	_vs_panel.connect("closed", func(): _deactivate_tab())
+	_vs_panel.connect("connect_requested", _request_wallet_connect)
 	_sync_panels()
-
-
-# ═════════════════════════════════════════════════════════════════════════
-#  VS LIVE SPECTATING
-# ═════════════════════════════════════════════════════════════════════════
-# Called by VSPanel when the player presses "Watch Live" on a room that's
-# currently flagged `live` (see backend/handlers/vs_live.go). Rather than a
-# bespoke scoreboard view, this connects to /backend/vsroom/{id}/watch and
-# feeds the incoming raw input bytes straight into the SAME deterministic
-# replay player used by "Watch Replay" — see GameManager.gd's
-# live_start_watch/live_append/live_replace_log. The player/platforms/HUD
-# you see are the real game, just driven by a log that keeps growing
-# instead of being a fixed recording, and it naturally can't "seek" past
-# data that hasn't arrived yet since there's nothing there to decode.
-#
-# Robustness: if the spectator's OWN connection drops, this reconnects with
-# capped exponential backoff and swaps in the fresh backlog the server
-# always resends. If the PLAYING side's connection drops (their internet,
-# not ours), the server tells us via a `{"t":"status","playing":false}`
-# control message — we show a "Waiting for player..." banner and just
-# freeze on the last frame; if they reconnect, a `playing:true` message
-# clears the banner and play resumes seamlessly. Either way the viewer can
-# hit Exit at any time to bail back to the VS panel.
-
-func _watch_vs_live(room_id: String) -> void:
-	if _started: return
-	if is_instance_valid(_vs_panel): _vs_panel.call("hide_panel")
-
-	_vs_watch_room_id         = room_id
-	_vs_watch_started         = false
-	_vs_watch_reconnecting    = false
-	_vs_watch_reconnect_delay = 1.0
-
-	_block_lb_replay = false
-	_build_vs_watch_hud()
-	_vs_watch_set_banner("Connecting to live match...", true)
-	_vs_watch_fetch_and_connect()
-
-
-## Fetches the room fresh from the real HTTP API (rate-limited, Origin-
-## checked — see main.go's corsMiddleware) to get the current seed and a
-## short-lived signed watch_ticket (see backend/handlers/vs_live_security.go),
-## THEN opens the WebSocket with that ticket attached. Called before every
-## connection attempt, including reconnects — a stale ticket from an earlier
-## fetch would eventually expire and get rejected, so always fetching fresh
-## right before connecting sidesteps that entirely and also means a long
-## disconnect naturally re-syncs the seed/live-status too.
-func _vs_watch_fetch_and_connect() -> void:
-	var http := HTTPRequest.new()
-	add_child(http)
-	var url := ApiConfig.base_url() + "/backend/vsroom/" + _vs_watch_room_id.uri_encode()
-	http.request_completed.connect(ApiConfig.check_clock_skew)
-	http.request_completed.connect(func(result, code, _headers, body):
-		http.queue_free()
-		if _vs_watch_room_id == "": return   # exited while the request was in flight
-		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
-			_vs_watch_schedule_reconnect()
-			return
-		var j := JSON.new()
-		if j.parse(body.get_string_from_utf8()) != OK:
-			_vs_watch_schedule_reconnect()
-			return
-		var d : Dictionary = j.get_data()
-		var room : Dictionary = d.get("room", {})
-		var ticket : String = str(d.get("watch_ticket", ""))
-		var seed_val : int = int(str(room.get("seed", "0")))
-		if ticket == "" or seed_val == 0:
-			# Room isn't (or is no longer) live — the server only issues a
-			# ticket + real seed while someone's actually streaming. Nothing
-			# to watch right now; keep retrying with backoff in case the
-			# player is just about to start (or resumes after a drop).
-			_vs_watch_schedule_reconnect()
-			return
-		_vs_watch_seed_val    = seed_val
-		# Deterministic — the actual playing client derives its own visual/
-		# particle RNG the exact same way from the room seed (see
-		# _init_game_from_seed: `player_seed = game_seed ^ 0xDEADBEEF`), so
-		# the server doesn't need to send it separately.
-		_vs_watch_player_seed = seed_val ^ 0xDEADBEEF
-		_vs_watch_open_socket(ticket)
-	)
-	http.request(ApiConfig.sign_url(url))
-
-
-func _vs_watch_open_socket(ticket: String) -> void:
-	var base := ApiConfig.base_url()
-	var ws_base := base.replace("https://", "wss://").replace("http://", "ws://")
-	# Signed like every other /backend request — the WS upgrade starts as a
-	# plain HTTP GET before hijacking, so it goes through the exact same
-	# app-signature check in main.go's corsMiddleware as anything else.
-	var url := ApiConfig.sign_url("%s/backend/vsroom/%s/watch?ticket=%s" % [ws_base, _vs_watch_room_id.uri_encode(), ticket.uri_encode()])
-	_vs_watch_awaiting_initial_chunk = true
-	_vs_watch_ws = WebSocketPeer.new()
-	var err := _vs_watch_ws.connect_to_url(url)
-	if err != OK:
-		_vs_watch_ws = null
-		_vs_watch_schedule_reconnect()
-
-
-func _vs_watch_schedule_reconnect() -> void:
-	if _vs_watch_room_id == "": return   # already torn down (user exited)
-	_vs_watch_reconnecting = true
-	_vs_watch_set_banner("Connection lost — reconnecting...", true)
-	var delay := _vs_watch_reconnect_delay
-	_vs_watch_reconnect_delay = minf(_vs_watch_reconnect_delay * 1.7, _VS_WATCH_RECONNECT_MAX_DELAY)
-	await get_tree().create_timer(delay).timeout
-	if _vs_watch_room_id == "": return   # exited while we were waiting
-	_vs_watch_reconnecting = false
-	_vs_watch_fetch_and_connect()
-
-
-func _vs_watch_poll(_delta: float) -> void:
-	if _vs_watch_reconnecting: return
-	if not is_instance_valid(_vs_watch_ws): return
-	_vs_watch_ws.poll()
-	var state := _vs_watch_ws.get_ready_state()
-	if state == WebSocketPeer.STATE_OPEN:
-		while _vs_watch_ws.get_available_packet_count() > 0:
-			var was_string := _vs_watch_ws.was_string_packet()
-			var pkt : PackedByteArray = _vs_watch_ws.get_packet()
-			if was_string:
-				_vs_watch_handle_control(pkt.get_string_from_utf8())
-			else:
-				_vs_watch_handle_bytes(pkt)
-	elif state == WebSocketPeer.STATE_CLOSED:
-		_vs_watch_ws = null
-		# Distinguish "we intentionally closed it" (room id already cleared
-		# by _vs_watch_exit) from an actual drop worth reconnecting.
-		if _vs_watch_room_id != "":
-			_vs_watch_schedule_reconnect()
-
-
-func _vs_watch_handle_bytes(bytes: PackedByteArray) -> void:
-	if bytes.is_empty(): return
-	if _vs_watch_awaiting_initial_chunk:
-		_vs_watch_awaiting_initial_chunk = false
-		if not _vs_watch_started:
-			# Very first connection ever for this watch session — actually
-			# start the real replay player.
-			_vs_watch_started = true
-			_vs_watch_start_playback(bytes)
-		else:
-			# A RECONNECT's backlog — replace the whole log in place rather
-			# than appending, since this is a fresh copy of everything from
-			# the start, not new bytes since last time.
-			if is_instance_valid(_gm):
-				_gm.call("live_replace_log", bytes)
-	else:
-		if is_instance_valid(_gm):
-			_gm.call("live_append", bytes)
-
-
-## Kicks off the real replay player on the first chunk of data (which may be
-## the reconnect backlog too, if we're re-entering after our own socket
-## dropped and reconnected before the very first _start_replay call ever
-## happened — rare, but handled the same way either way).
-func _vs_watch_start_playback(initial_log: PackedByteArray) -> void:
-	_replay_source = "vs_live"
-	_enter_replay_ui_pre()
-	if _gm.is_connected("replay_finished", _exit_replay_ui):
-		_gm.disconnect("replay_finished", _exit_replay_ui)
-	_gm.call("set_replay_paused", true)
-	# Nickname "viewer" (not a custom "vs_live" string) — deliberately reuses
-	# the exact same GameManager code path every other spectated replay
-	# already uses (leaderboard/stats/vs replay-viewing): if the streamed
-	# player actually dies mid-round, GameManager freezes on that frame
-	# instead of clearing the scene/emitting replay_finished, which is
-	# exactly the behavior we want here too. _live_watch_mode (set right
-	# below) is the separate, additional flag that only affects what
-	# happens when input bytes simply run out (not a real death) — see the
-	# log-exhausted branch in _simulate_gm_tick.
-	_gm.call("start_replay_external", _vs_watch_seed_val, initial_log, 0, "viewer", _vs_watch_player_seed)
-	_gm.call("live_start_watch")   # must be after start_replay_external (which resets the flag)
-	_gm.call("set_replay_speed", 1.0)
-	await get_tree().process_frame
-	await _show_replay_countdown()
-	_gm.call("set_replay_paused", false)
-	_gm.call("live_mark_active")
-	# Deliberately NOT connecting replay_finished here — a live watch never
-	# "finishes" on its own (see the freeze-not-end branch in
-	# _simulate_gm_tick); the viewer always leaves via the Exit button.
-	_build_replay_bar()
-	_vs_watch_set_banner("", false)
-
-
-func _vs_watch_handle_control(raw: String) -> void:
-	var parsed = JSON.parse_string(raw)
-	if typeof(parsed) != TYPE_DICTIONARY: return
-	var d : Dictionary = parsed
-	match str(d.get("t", "")):
-		"viewers":
-			if is_instance_valid(_vs_watch_viewer_lbl):
-				var n : int = int(d.get("n", 0))
-				# No eye emoji here — same web tofu-box issue, and there's no
-				# bundled Lucide "eye" icon to swap it for (unlike the ones
-				# above that had a real substitute). Plain text is at least
-				# always readable everywhere.
-				_vs_watch_viewer_lbl.text = "%d watching" % n
-		"status":
-			var playing : bool = bool(d.get("playing", false))
-			if playing:
-				_vs_watch_set_banner("", false)
-			else:
-				_vs_watch_set_banner("Waiting for player to resume — their connection may have dropped...", true)
-		"live_start":
-			pass
-
-
-## Small always-on-top overlay: viewer count (top corner) + an optional
-## "waiting" banner. Built once per watch session, freed on exit.
-func _build_vs_watch_hud() -> void:
-	if is_instance_valid(_vs_watch_hud): _vs_watch_hud.queue_free()
-	_vs_watch_hud = CanvasLayer.new()
-	_vs_watch_hud.layer = 26   # above the replay bar (25)
-	add_child(_vs_watch_hud)
-
-	var root := Control.new()
-	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	root.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	_vs_watch_hud.add_child(root)
-
-	_vs_watch_viewer_lbl = Label.new()
-	_vs_watch_viewer_lbl.text = "— watching"
-	_vs_watch_viewer_lbl.anchor_left = 1.0; _vs_watch_viewer_lbl.anchor_right = 1.0
-	_vs_watch_viewer_lbl.offset_left  = -_p(0.32)
-	_vs_watch_viewer_lbl.offset_right = -_p(0.02)
-	_vs_watch_viewer_lbl.offset_top    = _p(0.02)
-	_vs_watch_viewer_lbl.offset_bottom = _p(0.07)
-	_vs_watch_viewer_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
-	UITheme.apply_label(_vs_watch_viewer_lbl, Color(1, 1, 1), int(_p(0.026)))
-	root.add_child(_vs_watch_viewer_lbl)
-
-	var exit_btn := Button.new()
-	exit_btn.text = "Exit"
-	exit_btn.anchor_left = 0.0; exit_btn.anchor_right = 0.0
-	exit_btn.offset_left  = _p(0.02)
-	exit_btn.offset_right = _p(0.20)
-	exit_btn.offset_top    = _p(0.02)
-	exit_btn.offset_bottom = _p(0.07)
-	exit_btn.pressed.connect(_vs_watch_exit)
-	root.add_child(exit_btn)
-
-	_vs_watch_banner = PanelContainer.new()
-	var bs := StyleBoxFlat.new()
-	bs.bg_color = Color(0, 0, 0, 0.72)
-	bs.set_corner_radius_all(int(_p(0.02)))
-	bs.content_margin_left   = _p(0.02)
-	bs.content_margin_right  = _p(0.02)
-	bs.content_margin_top    = _p(0.012)
-	bs.content_margin_bottom = _p(0.012)
-	_vs_watch_banner.add_theme_stylebox_override("panel", bs)
-	_vs_watch_banner.anchor_left = 0.5; _vs_watch_banner.anchor_right = 0.5
-	_vs_watch_banner.anchor_top  = 0.0; _vs_watch_banner.anchor_bottom = 0.0
-	_vs_watch_banner.offset_left   = -_p(0.42)
-	_vs_watch_banner.offset_right  =  _p(0.42)
-	_vs_watch_banner.offset_top    = _p(0.10)
-	_vs_watch_banner.offset_bottom = _p(0.16)
-	_vs_watch_banner_lbl = Label.new()
-	_vs_watch_banner_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	_vs_watch_banner_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	UITheme.apply_label(_vs_watch_banner_lbl, Color(1, 1, 1), int(_p(0.024)))
-	_vs_watch_banner.add_child(_vs_watch_banner_lbl)
-	_vs_watch_banner.visible = false
-	root.add_child(_vs_watch_banner)
-
-
-func _vs_watch_set_banner(text: String, visible_now: bool) -> void:
-	if not is_instance_valid(_vs_watch_banner_lbl): return
-	_vs_watch_banner_lbl.text = text
-	_vs_watch_banner.visible = visible_now and text != ""
-
-
-## Exit button — tears down the socket, GM live-watch flags, and HUD, then
-## returns to the VS panel showing this room's detail view.
-func _vs_watch_exit() -> void:
-	var room_id := _vs_watch_room_id
-	_vs_watch_room_id = ""   # signals pending reconnect attempts to stop
-	_vs_watch_reconnecting = false
-	if is_instance_valid(_vs_watch_ws):
-		_vs_watch_ws.close()
-	_vs_watch_ws = null
-	if is_instance_valid(_gm):
-		_gm.call("live_stop_watch")
-		if _gm.is_connected("replay_finished", _exit_replay_ui):
-			_gm.disconnect("replay_finished", _exit_replay_ui)
-		# stop_replay() is the same real teardown the normal replay-bar Exit
-		# button uses — halts simulation, clears the scene, resets replay
-		# state. Without this the live-watch GameManager could keep quietly
-		# ticking in the background after we've already navigated away.
-		_gm.call("stop_replay")
-	if is_instance_valid(_vs_watch_hud):
-		_vs_watch_hud.queue_free()
-		_vs_watch_hud = null
-	_vs_watch_viewer_lbl = null
-	_vs_watch_banner     = null
-	_vs_watch_banner_lbl = null
-	_vs_watch_started = false
-	_exit_replay_ui()
-	if is_instance_valid(_vs_panel):
-		_vs_panel.call("show_panel")
-		if _vs_panel.has_method("open_room") and room_id != "":
-			_vs_panel.call("open_room", room_id)
 
 
 ## Called by VSPanel when the player presses "Play" on their side of a room.
@@ -3409,6 +3400,16 @@ func _start_vs_round(room_id: String, role: String, seed_str: String) -> void:
 		if is_instance_valid(_nimiq_bridge) and not _nimiq_bridge.auth_verified:
 			_nimiq_bridge._do_sign_auth()
 		var _conn_s := _nimiq_bridge.connect("auth_success", func(_t, _p):
+			# GUARD: only start the VS round if THIS sign was the one the player's
+			# VS "Play" tap kicked off (non-silent). A passive/background auto-sign
+			# (silent=true, fired by NimiqBridge on its own in the lobby) that
+			# happens to resolve while this one-shot is armed must NOT launch an
+			# unrequested match — that's the "game started itself right after
+			# opening, without me pressing anything" bug. On a silent success just
+			# settle authed; the player's next real Play tap starts instantly.
+			if is_instance_valid(_nimiq_bridge) and bool(_nimiq_bridge.get("_silent_sign_attempt")):
+				print("[VS] auth_success was a background/silent sign — NOT auto-starting the VS round")
+				return
 			_start_vs_round(room_id, role, seed_str)
 		, CONNECT_ONE_SHOT)
 		return
@@ -3420,12 +3421,50 @@ func _start_vs_round(room_id: String, role: String, seed_str: String) -> void:
 	if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
 	if is_instance_valid(_vs_panel):          _vs_panel.hide_panel()
 
+	var seed_val : int = int(seed_str)
+	# SAFETY: a VS round MUST run the room's fixed seed. If it somehow arrived
+	# empty/0 (e.g. the room was rendered from a stale fetch before the seed was
+	# revealed), starting anyway would fall back to a random local seed and fail
+	# server-side with vs_room_seed_mismatch. Refuse instead and let the player
+	# reopen the room (a fresh fetch includes the seed once both sides have paid).
+	if seed_val == 0:
+		print("[VS] refusing to start — room seed missing/0 (stale fetch); reopen the room")
+		_started = false
+		var t := Toast.get_instance()
+		if t: t.show_toast("Couldn't load the match — reopen it and try again.", Toast.Kind.WARN)
+		return
+
 	if is_instance_valid(_gm):
 		_gm.set("vs_room_id", room_id)
 		_gm.set("vs_role",    role)
 
-	var seed_val : int = int(seed_str)
-	_do_start_game(seed_val)
+	# Update-mode guard (same as _do_start_game's own check).
+	if _update_active:
+		_started = false
+		var t0 := Toast.get_instance()
+		if t0: t0.show_toast(_update_message, Toast.Kind.WARN)
+		return
+
+	# Build the match level from the room's fixed seed FIRST — with the player
+	# held frozen — and ONLY THEN run the 3-2-1 over it, exactly like replays do
+	# (_start_replay). Previously the countdown ran over the lobby and the real
+	# level swapped in AFTER "1", which looked like the level "suddenly changed".
+	_vs_countdown_pending = true
+	if is_instance_valid(_ui_layer): _ui_layer.visible = false
+	if is_instance_valid(_ui_root):  _ui_root.modulate.a = 0.0   # hide lobby UI (countdown covers)
+	if is_instance_valid(_hud):      _hud.visible = true
+	if is_instance_valid(_player) and _player.has_method("reset_to_idle"):
+		_player.call("reset_to_idle")
+	if is_instance_valid(_gm):
+		_gm.set("_game_over", false)
+		_gm.call("_start_session", seed_val)   # builds level; frozen (see _on_gm_ready guard)
+	# One frame so the real level renders behind the countdown.
+	await get_tree().process_frame
+	await _show_replay_countdown()
+	# GO — release the player into the live run.
+	_vs_countdown_pending = false
+	if is_instance_valid(_player) and _player.has_method("activate"):
+		_player.activate()
 
 
 func _build_quest_panel() -> void:
@@ -3438,6 +3477,7 @@ func _build_quest_panel() -> void:
 	# token _sync_panels() ile gelecek
 	# closed: panel X or outside click — just reset tab color
 	_quest_panel.connect("closed", func(): _deactivate_tab())
+	_quest_panel.connect("connect_requested", _request_wallet_connect)
 
 	_leaderboard_panel = CanvasLayer.new()
 	_leaderboard_panel.set_script(load("res://scripts/LeaderboardPanel.gd"))
@@ -3464,24 +3504,7 @@ func _build_quest_panel() -> void:
 		var own_name := _player_nickname if _player_nickname != "" else "You"
 		await _start_replay(seed, log, char_idx, "stats", player_seed, own_name, nimiq_address, gyro_active)
 	)
-	_stats_panel.connect("connect_requested", func():
-		if not is_instance_valid(_nimiq_bridge): return
-		if _nimiq_bridge.nimiq_address != "":
-			_nimiq_bridge._do_sign_auth()
-		else:
-			# BUG FIX: if there's genuinely no wallet provider (not running
-			# inside Nimiq Pay), the retried _poll() below just times out
-			# silently after 15s with zero feedback — same "Connect Wallet
-			# looks broken" gap as NimiqJS.request_account's no_provider case
-			# (see NimiqJS.gd), just via this panel's separate poll-based
-			# path instead. Same install popup, checked up front instead of
-			# waiting out a doomed 15s poll first.
-			if OS.has_feature("web") and bool(JavaScriptBridge.eval("!!window._nimiqProviderMissing", true)):
-				JavaScriptBridge.eval("if(window._showNimiqInstallPopup) window._showNimiqInstallPopup();", true)
-				return
-			_nimiq_bridge._poll_started = false
-			_nimiq_bridge._poll()
-	)
+	_stats_panel.connect("connect_requested", _request_wallet_connect)
 
 	# Streak panel — opened by tapping the lobby streak badge, not part of
 	# the bottom tab bar (see _on_streak_badge_input / _open_streak_panel).
@@ -3559,6 +3582,13 @@ func _build_settings_popup() -> void:
 	var dim := ColorRect.new()
 	dim.color = Color(0.0, 0.0, 0.0, 0.55)
 	_anchored(dim, Control.PRESET_FULL_RECT)
+	# Tap outside the settings card (on the dim) to close — consistent with the
+	# other panels that all close on an outside tap.
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	dim.gui_input.connect(func(e):
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+			_close_settings()
+	)
 	_settings_popup.add_child(dim)
 	_settings_dim    = dim
 	_settings_closing = false
@@ -4061,11 +4091,28 @@ func _build_settings_popup() -> void:
 	)
 	gyro_btn.pressed.connect(func():
 		if _control_mode == "gyro": return
-		_control_mode = "gyro"
 		# Requesting permission here happens on a real user tap (this button
 		# press), which is required for iOS Safari's
 		# DeviceOrientationEvent.requestPermission() gate to succeed at all.
-		_ensure_gyro_js()
+		#
+		# BUG FIX: this used to set _control_mode = "gyro" and refresh the UI
+		# to show Gyro as "selected" IMMEDIATELY, before the (async) permission
+		# prompt had even resolved. A denial left Gyro showing as selected
+		# forever — and since _control_mode was already "gyro", the guard
+		# above made a second press on this same button a silent no-op, so
+		# there was no way to ever retry short of a full page reload. Now
+		# waits for the real outcome first: only commits to gyro mode if it's
+		# actually usable, otherwise reverts to (and visibly shows) Tap, so a
+		# second press genuinely re-prompts instead of doing nothing.
+		gyro_btn.disabled = true
+		var usable := await _ensure_gyro_js_and_await()
+		if is_instance_valid(gyro_btn): gyro_btn.disabled = false
+		if usable:
+			_control_mode = "gyro"
+		else:
+			_control_mode = "tap"
+			var t := Toast.get_instance()
+			if t: t.show_toast("Motion access denied — enable it in your browser/device settings to use Gyro.", Toast.Kind.WARN)
 		_refresh_ctrl_ui.call()
 		_save_settings()
 	)
@@ -4236,7 +4283,13 @@ func _build_settings_popup() -> void:
 		info_col.add_child(name_row)
 
 		var lbl_lbl := Label.new()
-		var _eff_label : String = nimiq_label if nimiq_label != "" else (_bridge_pid.left(9) + "..." if _bridge_pid.length() > 9 else _bridge_pid)
+		# Never show the "Guest" sentinel for a connected account — treat it like
+		# an empty label and fall back to the short address (web Hub sign-in only
+		# gives us the address, and poll() parks the label at "Guest" on web).
+		var _addr_src : String = nimiq_address if nimiq_address != "" else _bridge_pid
+		var _short_addr : String = UITheme.short_address(_addr_src)
+		var _has_label : bool = nimiq_label != "" and nimiq_label != "Guest"
+		var _eff_label : String = nimiq_label if _has_label else _short_addr
 		var _display_preview : String = _player_nickname if _player_nickname != "" else _eff_label
 		lbl_lbl.text = _display_preview
 		lbl_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -4358,8 +4411,18 @@ func _build_settings_popup() -> void:
 				# Address already known — skip poll, go straight to sign
 				if _nimiq_bridge.nimiq_address != "":
 					_nimiq_bridge._do_sign_auth()
+				elif OS.has_feature("web") and not bool(JavaScriptBridge.eval(
+					"window._nimiqInsidePayNow ? window._nimiqInsidePayNow() : !!window._nimiqProviderMissing", true)):
+					# Confirmed NOT inside Nimiq Pay (see _ensure_wallet_then_sign()'s
+					# doc comment — window._nimiqInsidePayNow() answers this
+					# instantly instead of waiting up to ~15s for
+					# window._nimiqProviderMissing alone) — window._nimiqAddress
+					# will never get set, so polling for it would just time out.
+					# This button press is the fresh user gesture the Hub API
+					# popup needs (see NimiqJS.gd's start_hub_sign() doc comment).
+					_nimiq_bridge.do_web_sign_auth()
 				else:
-					# No address yet — full poll needed
+					# Confirmed inside Nimiq Pay — full poll needed
 					_nimiq_bridge._poll_started = false
 					_nimiq_bridge._poll()
 				# Re-enable button after a short delay; settings rebuild on auth_success signal
@@ -4447,6 +4510,13 @@ func _open_settings() -> void:
 	_build_settings_popup()
 
 	_settings_popup.visible    = true
+	# BUG FIX ("panel pops in from the top-left corner") — same root cause as
+	# VSPanel.gd's show_panel(): this is a PRESET_FULL_RECT node, and scale
+	# animates around pivot_offset, which defaults to (0,0) — the top-left
+	# of the whole screen, not the center of the visible popup sitting
+	# inside it. See VSPanel.gd's show_panel() doc comment for the full
+	# explanation.
+	_settings_popup.pivot_offset = _settings_popup.size * 0.5
 	_settings_popup.modulate.a = 0.0
 	_settings_popup.scale      = Vector2(0.90, 0.90)
 	var tw := create_tween()
@@ -4529,14 +4599,19 @@ func _open_nick_overlay() -> void:
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	_nick_overlay.add_child(dim)
 
-	# Kart: ekranın üst %5-%55 aralığında sabit — klavye açıldığında
-	# viewport küçüldüğünde bile panel görünür kalır.
-	var pw  := _p(0.88)
+	# Card: AUTO-HEIGHT (hugs its content) and pinned to the upper-centre of the
+	# screen, instead of being stretched to a fixed 50% slice (which left a big
+	# empty gap on tall screens and could overflow on short ones). Upper-anchored
+	# rather than dead-centre so the on-screen keyboard (bottom of the screen)
+	# can't cover it. Width is capped so it never runs absurdly wide on desktop.
+	var _vp := get_viewport().get_visible_rect().size
+	var _panel_w : float = minf(_vp.x * 0.90, _vp.y * 0.85)
 	var pc  := PanelContainer.new()
-	pc.anchor_left   = 0.06; pc.anchor_right  = 0.94
-	pc.anchor_top    = 0.05; pc.anchor_bottom = 0.55
-	pc.offset_left   = 0.0;  pc.offset_right  = 0.0
-	pc.offset_top    = 0.0;  pc.offset_bottom = 0.0
+	pc.anchor_left = 0.5; pc.anchor_right = 0.5
+	pc.anchor_top  = 0.12; pc.anchor_bottom = 0.12
+	pc.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	pc.grow_vertical   = Control.GROW_DIRECTION_END   # grow downward from the top anchor
+	pc.custom_minimum_size = Vector2(_panel_w, 0)     # height follows content
 	var pc_st := StyleBoxFlat.new()
 	pc_st.bg_color = OV_BG
 	pc_st.border_color = OV_BORDER
@@ -4545,9 +4620,11 @@ func _open_nick_overlay() -> void:
 	pc_st.shadow_color = Color(0,0,0,0.3)
 	pc_st.shadow_size  = 12
 	pc.add_theme_stylebox_override("panel", pc_st)
-	pc.modulate.a = 0.0   # fades/scales in below — was popping in instantly with no animation
-	pc.scale      = Vector2(0.92, 0.92)
 	_nick_overlay.add_child(pc)
+	# Scale/fade-in from the centre — correct pivot is set just before the tween
+	# below, once content is in and the auto-height layout is resolved.
+	pc.modulate.a = 0.0
+	pc.scale      = Vector2(0.92, 0.92)
 
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", int(_p(0.018)))
@@ -4773,11 +4850,17 @@ func _build_onboarding_overlay() -> void:
 	_onboarding_overlay.add_child(dim)
 
 	var pc := PanelContainer.new()
-	pc.anchor_left   = 0.08; pc.anchor_right  = 0.92
-	# A bit taller than before (was 0.16-0.76) — a 5th info row was added
-	# below, so the panel gets a little extra headroom to stay comfortably
-	# clear of both the title above and the confirm button below.
-	pc.anchor_top    = 0.13; pc.anchor_bottom = 0.80
+	# Auto-height, centred both ways: the panel hugs its own content instead of
+	# being stretched to a fixed slice of the screen (which left a big awkward
+	# empty gap in the middle, especially on wide/landscape screens). Width is
+	# capped so lines don't run absurdly long on a wide viewport.
+	var _vp := get_viewport().get_visible_rect().size
+	var _panel_w : float = minf(_vp.x * 0.88, _vp.y * 0.95)
+	pc.anchor_left = 0.5; pc.anchor_right = 0.5
+	pc.anchor_top  = 0.5; pc.anchor_bottom = 0.5
+	pc.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	pc.grow_vertical   = Control.GROW_DIRECTION_BOTH
+	pc.custom_minimum_size = Vector2(_panel_w, 0)   # height follows content
 	var pc_st := StyleBoxFlat.new()
 	pc_st.bg_color = OB_BG
 	pc_st.border_color = OB_BORDER
@@ -4786,9 +4869,12 @@ func _build_onboarding_overlay() -> void:
 	pc_st.shadow_color = Color(0, 0, 0, 0.3)
 	pc_st.shadow_size  = 12
 	pc.add_theme_stylebox_override("panel", pc_st)
-	pc.modulate.a = 0.0   # fades/scales in below, matches nick overlay's entrance
-	pc.scale      = Vector2(0.92, 0.92)
 	_onboarding_overlay.add_child(pc)
+	# Scale/fade-in from the CENTRE. pc.size isn't valid yet (content not added,
+	# auto-height not resolved), so the correct centre pivot is set just before
+	# the tween below once the layout minimum is known.
+	pc.modulate.a = 0.0
+	pc.scale      = Vector2(0.92, 0.92)
 
 	var vb := VBoxContainer.new()
 	vb.add_theme_constant_override("separation", int(_p(0.020)))
@@ -4842,17 +4928,13 @@ func _build_onboarding_overlay() -> void:
 		UITheme.apply_label(txt, OB_MID, int(_p(0.028)))
 		hb.add_child(txt)
 
-	# UX FIX: VBoxContainer top-aligns children by default when nothing has
-	# an EXPAND_FILL flag — since `inner` is stretched to fill the whole
-	# panel height (via the MarginContainer/PanelContainer chain above it),
-	# the title+rows+button were all clumping together near the TOP, leaving
-	# a dead gap between the button and the panel's bottom edge instead of
-	# the button actually sitting at the bottom. This spacer eats that
-	# leftover space itself, so the button lands flush against the bottom
-	# regardless of screen height / how many info rows are above it.
-	var spacer := Control.new()
-	spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
-	inner.add_child(spacer)
+	# Small gap before the button, then the button right under the rows — the
+	# panel now hugs its content (no fixed height), so there's no empty middle
+	# to push the button down into. A little top margin keeps it from crowding
+	# the last info row.
+	var gap := Control.new()
+	gap.custom_minimum_size = Vector2(0, int(_p(0.012)))
+	inner.add_child(gap)
 
 	var got_it := Button.new()
 	got_it.text = "Got it — let's play!"
@@ -4860,6 +4942,11 @@ func _build_onboarding_overlay() -> void:
 	UITheme.apply_play_button(got_it)
 	got_it.pressed.connect(_dismiss_onboarding)
 	inner.add_child(got_it)
+
+	# Now that all content is in, the panel's real size is known — pivot on its
+	# centre so the scale-in grows from the middle, not a corner.
+	var _pcmin := pc.get_combined_minimum_size()
+	pc.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
 
 	var ov_tw := create_tween()
 	if ov_tw:
@@ -4882,7 +4969,22 @@ func _check_pending_submissions() -> void:
 	if not OS.has_feature("web"):
 		return
 	var raw = JavaScriptBridge.eval("localStorage.getItem('nj_pending_submissions') || '[]'", true)
-	var parsed = JSON.parse_string(str(raw))
+	var raw_str := str(raw)
+	var j := JSON.new()
+	var err := j.parse(raw_str)
+	if err != OK:
+		# SELF-HEAL: this key can only end up corrupted from an entry written
+		# by an OLD build (pre-base64-encoding fix in GameManager._ls_set —
+		# see that function's comment for the nested-JSON-escaping bug this
+		# came from). New writes can no longer produce this. An unparseable
+		# queue is unrecoverable and would otherwise re-warn on every single
+		# page load forever (GameManager's own _ls_get already treats it as
+		# empty, but never clears the key — it only gets overwritten on the
+		# next _pending_save). Clear it here immediately instead of waiting.
+		push_warning("[PendingSubmissions] failed to parse (line %d: %s) — raw(first 120)=%s — clearing corrupted queue" % [j.get_error_line(), j.get_error_message(), raw_str.left(120)])
+		JavaScriptBridge.eval("localStorage.removeItem('nj_pending_submissions')", true)
+		return
+	var parsed : Variant = j.get_data()
 	var count := 0
 	if parsed is Array:
 		count = parsed.size()
@@ -5159,6 +5261,15 @@ func _on_play_pressed() -> void:
 		# On success start game, on error/rejection reset — user can press play again
 		var _conn_s := _nimiq_bridge.connect("auth_success", func(_t, _p):
 			_play_waiting_for_auth = false
+			# GUARD: same protection as the VS path — only continue into the game
+			# if THIS auth_success came from the Play tap's own (non-silent) sign.
+			# A passive/background auto-sign (silent) resolving while we're armed
+			# must not auto-start an unrequested match ("game started itself right
+			# after opening"). On a silent success just stay authed in the lobby;
+			# the next real Play tap starts instantly.
+			if is_instance_valid(_nimiq_bridge) and bool(_nimiq_bridge.get("_silent_sign_attempt")):
+				print("[MAIN] auth_success was a background/silent sign — NOT auto-starting, staying in lobby")
+				return
 			_on_play_pressed()   # auth received, continue normal flow
 		, CONNECT_ONE_SHOT)
 		var _conn_f := _nimiq_bridge.connect("auth_failed", func(_r):
@@ -5201,18 +5312,66 @@ func _on_play_pressed() -> void:
 ## never even called), and is the real fix for a first-time player (does the
 ## actual gesture-linked connect() this time, called directly from the Play
 ## tap instead of an unrelated background timer).
+## Shared "Connect Wallet" handler — wired to every panel's connect_requested
+## signal (Stats, VS, Quest). Routes to the correct sign-in path: the real
+## Nimiq Pay SDK when a provider exists / we're inside Nimiq Pay, otherwise the
+## Nimiq Hub API web popup. Called directly from a button's pressed handler so
+## the Hub popup keeps its fresh user gesture (see NimiqJS.start_hub_sign()).
+func _request_wallet_connect() -> void:
+	if not is_instance_valid(_nimiq_bridge): return
+	if _nimiq_bridge.nimiq_address != "":
+		_nimiq_bridge._do_sign_auth()
+		return
+	# Confirmed NOT inside Nimiq Pay → the Hub API web sign-in is the only path
+	# that can work here (window.nimiq never gets set outside Nimiq Pay). Uses
+	# window._nimiqInsidePayNow() for an instant answer instead of waiting up to
+	# ~15s for window._nimiqProviderMissing — see _ensure_wallet_then_sign().
+	if OS.has_feature("web") and not bool(JavaScriptBridge.eval(
+		"window._nimiqInsidePayNow ? window._nimiqInsidePayNow() : !!window._nimiqProviderMissing", true)):
+		_nimiq_bridge.do_web_sign_auth()
+		return
+	# Inside Nimiq Pay — retry the poll.
+	_nimiq_bridge._poll_started = false
+	_nimiq_bridge._poll()
+
+
 func _ensure_wallet_then_sign() -> void:
 	# Only take the extra request_account() detour if there's an actual
-	# Nimiq provider to connect to. In a normal browser (not inside Nimiq
-	# Pay), window.nimiq never gets set at all and _initNimiq() flags this
-	# definitively via window._nimiqProviderMissing — skip the detour
-	# entirely in that case so a plain-browser player's Play press behaves
-	# EXACTLY as before this fix (straight to _do_sign_auth(), which fails
-	# fast with no_provider and starts them as a guest), instead of taking
-	# on any extra risk/delay from a call that can't possibly succeed anyway.
+	# Nimiq provider (window.nimiq, the mini-app SDK) to connect to.
+	#
+	# BUG FIX: this used to read ONLY window._nimiqProviderMissing, which
+	# index.html's _initNimiq() never sets until its OWN async handshake
+	# actually finishes rejecting — a fixed 3.5s startup delay, PLUS
+	# sdk.init()'s own internal 10s timeout, PLUS an unpkg module fetch,
+	# worst case ~15s+. A player who taps Play quickly (completely normal)
+	# hit this check while it was still `undefined` (reads as `false`), so a
+	# real WEB browser got treated as "not yet confirmed missing, assume
+	# still might be Nimiq Pay" — took the mini-app-SDK detour below (which
+	# can never succeed outside Nimiq Pay), burned its own several seconds of
+	# internal timeouts, and fell through to a guest/no-wallet start without
+	# ever reaching the Hub API popup at all. See index.html's
+	# window._nimiqInsidePayNow() doc comment for the full explanation —
+	# it additionally checks window.nimiqPay (injected synchronously by
+	# Nimiq Pay's own WebView host) so a genuine Nimiq Pay session is known
+	# immediately, with no dependency on _initNimiq()'s slow async result.
 	var provider_confirmed_missing := false
 	if OS.has_feature("web"):
-		provider_confirmed_missing = bool(JavaScriptBridge.eval("!!window._nimiqProviderMissing", true))
+		provider_confirmed_missing = not bool(JavaScriptBridge.eval(
+			"window._nimiqInsidePayNow ? window._nimiqInsidePayNow() : !!window._nimiqProviderMissing", true))
+
+	# Confirmed NOT inside Nimiq Pay — the mini-app SDK path above can never
+	# work here (window.nimiq never gets set), so route straight to the
+	# Nimiq Hub API web sign-in instead of falling through to
+	# _do_sign_auth()'s guaranteed no_provider/guest fallback. This call sits
+	# directly inside the Play tap's own handler (see this function's own
+	# call site in _on_play_pressed), so the Hub API popup still has the
+	# fresh user gesture it needs — see NimiqJS.gd's start_hub_sign() doc
+	# comment for why that matters.
+	if OS.has_feature("web") and provider_confirmed_missing:
+		if is_instance_valid(_nimiq_bridge) and not _nimiq_bridge.auth_verified:
+			_nimiq_bridge.do_web_sign_auth()
+		return
+
 	if OS.has_feature("web") and nimiq_address == "" and not provider_confirmed_missing:
 		# Shortened from 20s -> 8s: the 6s force-sign-in watchdog in
 		# _on_play_pressed() already takes over past that point, so letting
@@ -5261,9 +5420,15 @@ func _check_server_status() -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — Main.gd (self) or this
+	# http node can be freed mid-flight (scene reload / panel rebuild on
+	# resize) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
 			return  # offline/unreachable — keep last known state, don't flip anything
 		var j := JSON.new()
@@ -5309,7 +5474,14 @@ func _do_start_game(forced_seed: int = 0) -> void:
 			# Otherwise call _start_session to get a fresh session.
 			var platforms_ready : bool = _gm.get("game_seed") != 0 and _gm.get("_platforms") != null and (_gm.get("_platforms") as Array).size() > 0
 			var is_recording    : bool = _gm.get("_replay_mode") == 1  # ReplayMode.RECORDING
-			if platforms_ready and is_recording and _player and _player.has_method("activate"):
+			# CRITICAL (VS seed bug): a forced_seed means this is a VS round that
+			# MUST run the room's exact fixed seed — both players play the same
+			# one. The "activate the already-running lobby session" shortcut below
+			# reuses whatever RANDOM seed the lobby session was created with,
+			# ignoring forced_seed entirely — which made VS rounds play a random
+			# level and fail server-side with vs_room_seed_mismatch. So when a
+			# forced_seed is present, ALWAYS start a fresh session with it.
+			if forced_seed == 0 and platforms_ready and is_recording and _player and _player.has_method("activate"):
 				_player.activate()
 			else:
 				print("[MAIN] platforms not ready or not recording — calling _start_session")
@@ -5399,6 +5571,14 @@ func show_game_over(p_score: int, p_best: int, p_stats: Dictionary = {}) -> void
 			(sv[2] as Label).text = str(_coin)
 	if is_instance_valid(_go_stats_lbl):
 		_go_stats_lbl.text = ""
+	# After a VS match the primary button returns to that challenge's result
+	# screen rather than restarting a run (you can't replay a wagered VS round),
+	# so relabel it. Normal runs keep "PLAY AGAIN".
+	# Capture the VS room id NOW (still valid) so "View Result" has it even after
+	# the post-game LOCAL session clears _gm.vs_room_id.
+	_last_go_vs_room_id = str(_gm.get("vs_room_id")) if _gm != null and _gm.get("vs_room_id") != null else ""
+	if is_instance_valid(_go_panel) and _go_panel.has_meta("restart_btn"):
+		(_go_panel.get_meta("restart_btn") as Button).text = "VIEW RESULT" if _last_go_vs_room_id != "" else "PLAY AGAIN"
 	_show_go_panel()
 
 func update_score_display(p_score: int) -> void:
@@ -5474,6 +5654,13 @@ func _show_go_panel() -> void:
 
 	# Opening animation
 	if is_instance_valid(_go_panel):
+		# BUG FIX ("pops in from the top-left corner") — _go_panel auto-sizes
+		# to its content (SIZE_SHRINK_CENTER inside a full-rect container), so
+		# by the time a game actually ends its size has already settled from
+		# being laid out on a previous run — reading it here to center the
+		# scale pivot is reliable. See VSPanel.gd's show_panel() doc comment
+		# for the full explanation of why this was growing from the corner.
+		_go_panel.pivot_offset = _go_panel.size * 0.5
 		_go_panel.modulate.a = 0.0
 		_go_panel.scale      = Vector2(0.88, 0.88)
 		var tw := create_tween()
@@ -5513,9 +5700,23 @@ func _do_claim() -> void:
 	var req := HTTPRequest.new()
 	add_child(req)
 	var url := BACKEND_URL + "/api/sessions/%s/claim" % _session_id
+	# BUG FIX: "Lambda capture at index 0 was freed" — Main.gd (self) can be
+	# freed mid-flight (scene reload / panel rebuild on resize) before the
+	# response lands, and this callback touches several self members below.
+	var _alive : WeakRef = weakref(self)
 	req.request_completed.connect(func(result: int, code: int, _h: PackedStringArray, body: PackedByteArray):
+		if not is_instance_valid(req): return
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
-			var parsed : Variant = JSON.parse_string(body.get_string_from_utf8())
+			var body_str := body.get_string_from_utf8()
+			var j := JSON.new()
+			var err := j.parse(body_str)
+			if err != OK:
+				push_warning("[ClaimResponse] failed to parse (line %d: %s) — raw(first 120)=%s" % [j.get_error_line(), j.get_error_message(), body_str.left(120)])
+				_claim_status.text  = "Claim failed"
+				_claim_btn.disabled = false
+				return
+			var parsed : Variant = j.get_data()
 			if parsed and parsed.has("claim_token"):
 				_claim_done        = true
 				_claim_btn.visible = false
@@ -5786,6 +5987,7 @@ func _enter_replay_ui_pre() -> void:
 	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.visible = false
 	if is_instance_valid(_quest_panel):       _quest_panel.visible       = false
 	if is_instance_valid(_stats_panel):       _stats_panel.visible       = false
+	if is_instance_valid(_vs_panel):          _vs_panel.visible          = false
 	if is_instance_valid(_settings_popup):    _settings_popup.visible    = false
 	if is_instance_valid(_ui_layer):          _ui_layer.visible          = false
 	if is_instance_valid(_hud):               _hud.visible               = true
@@ -5829,6 +6031,12 @@ func _show_replay_countdown() -> void:
 	img_rect.mouse_filter  = Control.MOUSE_FILTER_IGNORE
 	root.add_child(img_rect)
 
+	# BUG FIX (pops in off-center) — img_rect's own local top-left corner
+	# isn't its visual center even though its anchors/offsets center IT on
+	# screen; scale animates around pivot_offset (default (0,0)). Size is
+	# fixed/known from the explicit offsets set above, so this is safe to
+	# compute once here rather than per-loop-iteration.
+	img_rect.pivot_offset = img_rect.size * 0.5
 	for path in DIGIT_PATHS:
 		if not ResourceLoader.exists(path): continue
 		img_rect.texture  = load(path)
@@ -5954,8 +6162,7 @@ func _build_replay_watch_badge(bar_h: float) -> void:
 	if not is_instance_valid(_replay_bar): return
 	var disp := _replay_watch_name
 	if (disp == "" or disp == "null") and _replay_watch_address != "":
-		disp = (_replay_watch_address.left(6) + ".." + _replay_watch_address.right(3)) \
-			if _replay_watch_address.length() > 9 else _replay_watch_address
+		disp = UITheme.short_address(_replay_watch_address)
 	if disp == "": return
 	# Keep it short — this is a tiny corner chip, not a name plate.
 	if disp.length() > 12: disp = disp.left(11) + "…"
@@ -6124,6 +6331,71 @@ func _load_watch_avatar_async(circle: TextureRect, letter_lbl: Label, address: S
 		if result == "" or result == "null" or result == "undefined":
 			return  # fetch failed — leave the colored-circle+letter fallback as the final state
 		_apply_watch_avatar_png(circle, letter_lbl, result)
+		return
+
+
+## Fetches the player's OWN real Nimiq identicon from their address (web only)
+## and stores it in _avatar_tex, then refreshes any UI that shows it — see
+## _on_nimiq_ready()'s call site for why (web Hub login provides no avatar).
+## Same Identicons-bridge fetch pattern as _load_watch_avatar_async(), but the
+## result populates the shared _avatar_tex instead of one specific circle.
+var _own_avatar_fetch_started := false
+func _load_own_avatar_from_address_async(address: String) -> void:
+	if not OS.has_feature("web"): return
+	if address == "" or address == "null" or address == "undefined": return
+	if _own_avatar_fetch_started: return
+	_own_avatar_fetch_started = true
+	var key := "ownavatar_" + address.left(8).validate_node_name()
+	var size := 128
+
+	# Wait (max ~3s) for the Identicons CDN module to finish loading.
+	for _w in 30:
+		var ready = JavaScriptBridge.eval("window._nimiqIconsReady === true", true)
+		if ready: break
+		await get_tree().create_timer(0.1).timeout
+
+	var js_code := (
+		"(function(){"
+		+ "if(!window._nimiqPending) window._nimiqPending = {};"
+		+ "window._nimiqPending['" + key + "'] = null;"
+		+ "if(typeof window.getNimiqAvatar !== 'function'){"
+		+ "  window._nimiqPending['" + key + "'] = ''; return;"
+		+ "}"
+		+ "window.getNimiqAvatar('" + address + "')"
+		+ "  .then(function(svgData){"
+		+ "    if(!svgData){ window._nimiqPending['" + key + "'] = ''; return; }"
+		+ "    var img = new Image();"
+		+ "    img.onload = function(){"
+		+ "      try {"
+		+ "        var c = document.createElement('canvas');"
+		+ "        c.width = " + str(size) + "; c.height = " + str(size) + ";"
+		+ "        c.getContext('2d').drawImage(img, 0, 0, " + str(size) + ", " + str(size) + ");"
+		+ "        window._nimiqPending['" + key + "'] = c.toDataURL('image/png');"
+		+ "      } catch(e){ window._nimiqPending['" + key + "'] = ''; }"
+		+ "    };"
+		+ "    img.onerror = function(){ window._nimiqPending['" + key + "'] = ''; };"
+		+ "    img.src = svgData;"
+		+ "  })"
+		+ "  .catch(function(e){ window._nimiqPending['" + key + "'] = ''; });"
+		+ "})();"
+	)
+	JavaScriptBridge.eval(js_code, true)
+	for _i in 50:
+		await get_tree().create_timer(0.1).timeout
+		var raw = JavaScriptBridge.eval("window._nimiqPending['%s']" % key, true)
+		if raw == null: continue
+		var result := str(raw)
+		if result == "" or result == "null" or result == "undefined":
+			_own_avatar_fetch_started = false  # allow a later retry (e.g. next login)
+			return  # fetch failed — keep the colored-initial fallback
+		var tex := _data_url_to_texture(result)
+		if tex != null:
+			_avatar_tex = tex
+			# Refresh anywhere the avatar is shown: the (rebuilt) Settings
+			# account card and the lobby avatar card if present.
+			_rebuild_settings_if_open()
+			if is_instance_valid(_avatar_card):
+				_build_avatar_card()
 		return
 
 

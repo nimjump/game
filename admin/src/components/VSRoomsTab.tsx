@@ -1,8 +1,22 @@
 "use client";
 import { useEffect, useState, useCallback } from "react";
-import { fetchVSRooms, sweepVSRooms, reconcileVSPayments, cancelVSRoomAdmin, type VSRoom } from "@/lib/api";
+import { fetchVSRooms, sweepVSRooms, reconcileVSPayments, cancelVSRoomAdmin, resolveVSRoomAdmin, reopenVSRoomAdmin, type VSRoom } from "@/lib/api";
+import NimiqAvatar from "./NimiqAvatar";
+import PlayerDetailModal from "./PlayerDetailModal";
 
 function nim(n?: number) { return (n ?? 0).toFixed(4); }
+// Shortened Nimiq address for display: "NQ12 3…d2".
+function shortAddr(id?: string) {
+  if (!id) return "";
+  const a = id.trim();
+  return a.length > 11 ? `${a.slice(0, 6)}…${a.slice(-3)}` : a;
+}
+// What to show for a player: their real nickname, or the short address if they
+// never set one (backend default is the literal "Player").
+function playerLabel(nickname?: string, id?: string) {
+  if (nickname && nickname !== "Player" && nickname !== "null") return nickname;
+  return shortAddr(id) || nickname || "—";
+}
 function fmt(ts?: number) {
   if (!ts) return "—";
   // Pinned to UTC+3 — see AnalyticsTab.tsx's fmt() for why.
@@ -26,6 +40,7 @@ const STATUS_COLORS: Record<string, string> = {
   expired_payout:         "#4caf50",
   expired_refunded:       "#e0a030",
   cancelled:              "var(--text-muted)",
+  manual_review:          "var(--red)",
 };
 
 function StatusBadge({ status }: { status: string }) {
@@ -60,12 +75,41 @@ export default function VSRoomsTab() {
   const [sweeping, setSweeping] = useState(false);
   const [reconciling, setReconciling] = useState(false);
   const [cancelling, setCancelling] = useState<string | null>(null);
+  const [acting, setActing] = useState<string | null>(null);
+  const [detailPlayer, setDetailPlayer] = useState<string | null>(null);
+
+  async function doResolve(r: VSRoom, outcome: "creator" | "opponent" | "tie") {
+    const who = outcome === "creator" ? playerLabel(r.creator_nickname, r.creator_id) : outcome === "opponent" ? playerLabel(r.opponent_nickname, r.opponent_id) : "a tie (split)";
+    if (!confirm(`Resolve room ${r.id} as ${outcome === "tie" ? "TIE (split the pot)" : `WIN for ${who}`} and pay it out now?`)) return;
+    setActing(r.id);
+    try {
+      await resolveVSRoomAdmin(r.id, outcome);
+      await Promise.all([load(offset), loadStats()]);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Resolve failed");
+    } finally {
+      setActing(null);
+    }
+  }
+
+  async function doReopen(r: VSRoom) {
+    if (!confirm(`Reopen room ${r.id} for a clean rematch? Both scores are wiped, a fresh level (seed) is issued, and the 24h play window restarts. Nobody is paid — both keep their entry.`)) return;
+    setActing(r.id);
+    try {
+      await reopenVSRoomAdmin(r.id);
+      await Promise.all([load(offset), loadStats()]);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : "Reopen failed");
+    } finally {
+      setActing(null);
+    }
+  }
 
   async function doCancel(r: VSRoom) {
     const matched = !!r.opponent_id;
     const refunds: string[] = [];
-    if (r.creator_paid) refunds.push(`${nim(r.entry_nim)} NIM to ${r.creator_nickname}`);
-    if (matched && r.opponent_paid) refunds.push(`${nim(r.entry_nim)} NIM to ${r.opponent_nickname}`);
+    if (r.creator_paid) refunds.push(`${nim(r.entry_nim)} NIM to ${playerLabel(r.creator_nickname, r.creator_id)}`);
+    if (matched && r.opponent_paid) refunds.push(`${nim(r.entry_nim)} NIM to ${playerLabel(r.opponent_nickname, r.opponent_id)}`);
     const amountTxt = refunds.length ? ` and refund ${refunds.join(" + ")}` : "";
     const warn = matched ? " This room is already matched — this is a forced dispute resolution, use with care." : "";
     if (!confirm(`Close room ${r.id}${amountTxt}?${warn}`)) return;
@@ -210,29 +254,41 @@ export default function VSRoomsTab() {
                 <td style={{ padding: "10px 14px", fontFamily: "monospace", fontSize: 12 }}>
                   {r.id}
                   {r.is_private && <span style={{ marginLeft: 6, fontSize: 10, color: "var(--text-muted)", textTransform: "uppercase" }}>private</span>}
-                  {r.live && (
-                    <span style={{
-                      marginLeft: 6, fontSize: 10, fontWeight: 700, color: "#fff",
-                      background: "var(--red, #d32f2f)", borderRadius: 4, padding: "1px 6px",
-                      textTransform: "uppercase", letterSpacing: "0.03em",
-                    }} title="Someone is actively playing this round right now — streaming live">
-                      ● live
-                    </span>
-                  )}
                 </td>
                 <td style={{ padding: "10px 14px" }}>{r.entry_nim > 0 ? `${nim(r.entry_nim)} NIM` : "Free"}</td>
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>
-                  {r.creator_nickname}
+                  <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <NimiqAvatar address={r.creator_id} size={24} />
+                    <span onClick={() => r.creator_id && setDetailPlayer(r.creator_id)}
+                      title={`${r.creator_id} — click for details`}
+                      style={{ fontFamily: "monospace", cursor: "pointer", textDecoration: "underline dotted" }}>
+                      {playerLabel(r.creator_nickname, r.creator_id)}
+                    </span>
+                  </span>
                   {r.entry_nim > 0 && <span style={{ color: r.creator_paid ? "#4caf50" : "var(--text-muted)", marginLeft: 6 }}>{r.creator_paid ? "paid" : "unpaid"}</span>}
                   {r.creator_score != null && <span style={{ color: "var(--text-muted)", marginLeft: 6 }}>score {r.creator_score}</span>}
                 </td>
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>
-                  {r.opponent_nickname || <span style={{ color: "var(--text-muted)" }}>—</span>}
+                  {r.opponent_id
+                    ? <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                        <NimiqAvatar address={r.opponent_id} size={24} />
+                        <span onClick={() => setDetailPlayer(r.opponent_id!)}
+                          title={`${r.opponent_id} — click for details`}
+                          style={{ fontFamily: "monospace", cursor: "pointer", textDecoration: "underline dotted" }}>
+                          {playerLabel(r.opponent_nickname, r.opponent_id)}
+                        </span>
+                      </span>
+                    : <span style={{ color: "var(--text-muted)" }}>—</span>}
                   {r.opponent_id && r.entry_nim > 0 && <span style={{ color: r.opponent_paid ? "#4caf50" : "var(--text-muted)", marginLeft: 6 }}>{r.opponent_paid ? "paid" : "unpaid"}</span>}
                   {r.opponent_score != null && <span style={{ color: "var(--text-muted)", marginLeft: 6 }}>score {r.opponent_score}</span>}
                 </td>
                 <td style={{ padding: "10px 14px" }}>
                   <StatusBadge status={r.status} />
+                  {r.needs_review && (
+                    <div style={{ fontSize: 10, color: "var(--red)", marginTop: 2, fontWeight: 600 }} title={r.review_reason}>
+                      ⚠ NEEDS REVIEW{r.review_reason ? ` — ${r.review_reason}` : ""}
+                    </div>
+                  )}
                   {(r.creator_forfeit_requested || r.opponent_forfeit_requested) && (
                     <div style={{ fontSize: 10, color: "var(--red)", marginTop: 2, textTransform: "uppercase" }} title="A player has asked to bail out of this match — it only cancels once BOTH sides request it">
                       forfeit: {[r.creator_forfeit_requested && "creator", r.opponent_forfeit_requested && "opponent"].filter(Boolean).join(" + ")}
@@ -242,7 +298,7 @@ export default function VSRoomsTab() {
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>{timeLeft(r.expires_at, r.status)}</td>
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>
                   {r.winner_id ? (
-                    <span>{r.winner_id === r.creator_id ? r.creator_nickname : r.opponent_nickname} · {nim(r.payout_nim)} NIM</span>
+                    <span>{r.winner_id === r.creator_id ? playerLabel(r.creator_nickname, r.creator_id) : playerLabel(r.opponent_nickname, r.opponent_id)} · {nim(r.payout_nim)} NIM</span>
                   ) : r.status === "completed" ? (
                     <span>split · {nim(r.payout_nim)} NIM each</span>
                   ) : r.status === "expired_refunded" ? (
@@ -252,17 +308,49 @@ export default function VSRoomsTab() {
                 <td style={{ padding: "10px 14px", fontSize: 12, color: "var(--text-muted)" }}>{fmt(r.created_at)}</td>
                 <td style={{ padding: "10px 14px" }}>
                   {!["completed", "expired_payout", "expired_refunded", "cancelled"].includes(r.status) && (
-                    <button
-                      onClick={() => doCancel(r)}
-                      className="btn"
-                      style={{ fontSize: 11, padding: "3px 8px", background: "var(--red)" }}
-                      disabled={cancelling === r.id}
-                      title={r.opponent_id
-                        ? "Already matched — force-close and refund whoever paid in (dispute resolution)"
-                        : "Nobody has joined this room — close it and refund the creator if they paid"}
-                    >
-                      {cancelling === r.id ? "Closing…" : r.opponent_id ? "Force Close & Refund" : "Close & Refund"}
-                    </button>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                      {/* Dispute resolution — available on any funded, matched room
+                          (both paid), most important for NEEDS REVIEW ones. */}
+                      {r.opponent_id && r.creator_paid && r.opponent_paid && (
+                        <>
+                          <button onClick={() => doResolve(r, "creator")} className="btn"
+                            style={{ fontSize: 11, padding: "3px 8px", background: "#2e7d32" }}
+                            disabled={acting === r.id}
+                            title={`Declare the creator (${r.creator_id}) the winner and pay out the pot`}>
+                            {playerLabel(r.creator_nickname, r.creator_id)} wins
+                          </button>
+                          <button onClick={() => doResolve(r, "opponent")} className="btn"
+                            style={{ fontSize: 11, padding: "3px 8px", background: "#2e7d32" }}
+                            disabled={acting === r.id}
+                            title={`Declare the opponent (${r.opponent_id}) the winner and pay out the pot`}>
+                            {playerLabel(r.opponent_nickname, r.opponent_id)} wins
+                          </button>
+                          <button onClick={() => doResolve(r, "tie")} className="btn"
+                            style={{ fontSize: 11, padding: "3px 8px", background: "#b8860b" }}
+                            disabled={acting === r.id}
+                            title="Declare a tie — split the pot evenly">
+                            Tie
+                          </button>
+                          <button onClick={() => doReopen(r)} className="btn"
+                            style={{ fontSize: 11, padding: "3px 8px", background: "#1565c0" }}
+                            disabled={acting === r.id}
+                            title="Wipe scores + fresh seed + reset play window so both replay cleanly (no payout)">
+                            Reopen / Replay
+                          </button>
+                        </>
+                      )}
+                      <button
+                        onClick={() => doCancel(r)}
+                        className="btn"
+                        style={{ fontSize: 11, padding: "3px 8px", background: "var(--red)" }}
+                        disabled={cancelling === r.id}
+                        title={r.opponent_id
+                          ? "Already matched — force-close and refund whoever paid in (dispute resolution)"
+                          : "Nobody has joined this room — close it and refund the creator if they paid"}
+                      >
+                        {cancelling === r.id ? "Closing…" : r.opponent_id ? "Force Close & Refund" : "Close & Refund"}
+                      </button>
+                    </div>
                   )}
                 </td>
               </tr>
@@ -273,6 +361,10 @@ export default function VSRoomsTab() {
           </tbody>
         </table>
       </div>
+
+      {detailPlayer && (
+        <PlayerDetailModal playerID={detailPlayer} onClose={() => setDetailPlayer(null)} />
+      )}
     </div>
   );
 }

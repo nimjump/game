@@ -38,8 +38,8 @@ const CONFIG_FILE_NAME := "config.cfg"
 #  Örnek:  const PROD_BASE := "https://api.nimjump.io"
 #  Örnek:  const PROD_BASE := "http://1.2.3.4:8080"
 # ════════════════════════════════════════════════════════════════════════
-const PROD_BASE     := "https://backbone.zetashare.com"   # <-- backend API URL'i
-const PROD_GAME_URL := "https://nimjump.zetashare.com"     # <-- oyunun public URL'i (share/replay/VS invite linkleri)
+const PROD_BASE     := "https://msgstr-inspections-skirts-registered.trycloudflare.com"   # <-- backend API URL'i
+const PROD_GAME_URL := "https://traveler-specifies-pharmacy-prototype.trycloudflare.com"     # <-- oyunun public URL'i (share/replay/VS invite linkleri)
 
 # Local-dev-only last-resort values. These are intentionally NOT "the"
 # production backend — real deployments must set NIMJUMP_API_BASE / --api=
@@ -92,6 +92,12 @@ func _resolve_game_url() -> String:
 		ls = ls.strip_edges()
 		if ls != "":
 			return _trim_slash(ls)
+		# Dev-tunnel injection — see _resolve()'s NJ_API_BASE comment. Same
+		# mechanism for the FRONTEND (game) tunnel URL, read before the
+		# compiled-in PROD_GAME_URL so a stale build still shares correct links.
+		var nj_game : String = str(JavaScriptBridge.eval("window.NJ_GAME_URL_BASE || ''", true)).strip_edges()
+		if nj_game != "" and nj_game != "null":
+			return _trim_slash(nj_game)
 		if prod != "":
 			return _trim_slash(prod)
 		var origin : String = str(JavaScriptBridge.eval(
@@ -171,6 +177,18 @@ func _resolve() -> String:
 		ls = ls.strip_edges()
 		if ls != "":
 			return _trim_slash(ls)
+		# Dev-tunnel injection: devtools/start-dev-tunnels.js sets
+		# window.NJ_API_BASE fresh into index.html on EVERY serve (see its
+		# injectApiBase()). Read here at runtime — BEFORE the compiled-in
+		# PROD_BASE const — so even a STALE exported build (e.g. when Godot CLI
+		# isn't on PATH and devtools can't re-export) still targets the CURRENT
+		# run's backend tunnel, whose *.trycloudflare.com hostname changes every
+		# single run. Without this the client keeps hitting a dead PREVIOUS
+		# tunnel (530 / "no ACAO header" CORS-looking failure). Never set in a
+		# real production deploy, so this is a no-op there.
+		var nj_api : String = str(JavaScriptBridge.eval("window.NJ_API_BASE || ''", true)).strip_edges()
+		if nj_api != "" and nj_api != "null":
+			return _trim_slash(nj_api)
 		if PROD_BASE.strip_edges() != "":
 			return _trim_slash(PROD_BASE)
 		var origin : String = str(JavaScriptBridge.eval(
@@ -426,6 +444,64 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 	else:
 		DisplayServer.clipboard_set(full)
 		Toast.get_instance().show_toast("Copied to clipboard!", Toast.Kind.SUCCESS)
+
+
+## Share a plain link (VS invite, etc.) via the Web Share API's native share
+## sheet, falling back to clipboard copy when share isn't available (desktop,
+## some browsers). Same robust copy path as share_score (execCommand first,
+## then async Clipboard API) so it works inside restrictive WebViews too.
+## MUST be called synchronously from a button's pressed handler — navigator.
+## share() needs the user-activation window, exactly like the Hub popup.
+func share_link(text: String, url: String) -> void:
+	url = url.strip_edges()
+	var full := text
+	if url != "" and not (url in text):
+		full = (text + "\n" + url).strip_edges()
+	if full.strip_edges() == "":
+		full = url
+	if OS.has_feature("web"):
+		var toast_cb := JavaScriptBridge.create_callback(_on_share_toast)
+		JavaScriptBridge.get_interface("window")._nj_toast_cb = toast_cb
+		var js := """
+			(function(){
+				var url = %s, text = %s, full = %s;
+				function showToast(m){ try{ window._nj_toast_cb(m); }catch(e){} }
+				function execCommandCopy(){
+					var ta=null;
+					try{
+						ta=document.createElement('textarea'); ta.value=full; ta.setAttribute('readonly','');
+						ta.style.position='fixed'; ta.style.top='-9999px'; ta.style.left='-9999px'; ta.style.fontSize='16px';
+						document.body.appendChild(ta);
+						if(/ipad|iphone|ipod/i.test(navigator.userAgent)){
+							var r=document.createRange(); r.selectNodeContents(ta);
+							var s=window.getSelection(); s.removeAllRanges(); s.addRange(r); ta.setSelectionRange(0,999999);
+						} else { ta.focus(); ta.select(); }
+						return document.execCommand('copy');
+					}catch(e){ return false; } finally { if(ta&&ta.parentNode) ta.parentNode.removeChild(ta); }
+				}
+				function tryClipboard(){
+					if(execCommandCopy()){ showToast('Invite link copied!'); return; }
+					if(navigator.clipboard&&navigator.clipboard.writeText){
+						navigator.clipboard.writeText(full).then(function(){ showToast('Invite link copied!'); })
+							.catch(function(){ showToast('Could not copy — long-press the link to copy.'); });
+					} else { showToast('Could not copy — long-press the link to copy.'); }
+				}
+				try{
+					if(navigator.share){
+						navigator.share({ title:'NimJump VS', text:text, url:url }).then(function(){ showToast('Shared!'); })
+							.catch(function(e){
+								if(e && e.name==='AbortError'){ showToast('Share cancelled'); return; }
+								tryClipboard();
+							});
+					} else { tryClipboard(); }
+				}catch(e){ tryClipboard(); }
+			})();
+		""" % [JSON.stringify(url), JSON.stringify(text), JSON.stringify(full)]
+		JavaScriptBridge.eval(js, true)
+	else:
+		DisplayServer.clipboard_set(full)
+		var t := Toast.get_instance()
+		if t: t.show_toast("Invite link copied!", Toast.Kind.SUCCESS)
 
 
 func _on_share_toast(args: Array) -> void:

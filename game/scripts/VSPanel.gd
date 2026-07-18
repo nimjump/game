@@ -7,16 +7,12 @@ extends CanvasLayer
 ## machine): create room (pay if entry>0) → play your round (fixed seed) →
 ## share invite link → opponent joins, pays, plays → whoever finishes last
 ## (or the 24h sweep) settles the pot. The room list/detail views here are
-## just HTTP polling. The one exception is live spectating: while a
-## participant is actively playing their round, the room is flagged `live`
-## (see backend/handlers/vs_live.go) and a "Watch Live" button appears,
-## emitting watch_requested so Main.gd can open the actual WebSocket-backed
-## spectator view (VSSpectator.gd).
+## just HTTP polling.
 
 signal closed
+signal connect_requested   # emitted when user taps Connect in the not-signed-in state
 signal play_requested(room_id: String, role: String, seed: String)
 signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int, address: String, gyro_active: bool)
-signal watch_requested(room_id: String)
 
 var BACKEND_URL : String = ApiConfig.base_url()
 const UITheme    := preload("res://scripts/UITheme.gd")
@@ -36,6 +32,33 @@ var _has_wallet     : bool   = false
 var _panel_ctrl : Control
 var _view_root  : Control       # swapped between list view and detail view
 var _anim_tween : Tween = null
+var _entry_apply_key : Callable = Callable()  # keypad key handler; physical
+                                              # keyboard input is routed here too
+var _entry_close     : Callable = Callable()  # closes the keypad sheet (Enter key)
+var _entry_sheet_open := false                # true while the keypad sheet is open
+
+
+# Physical-keyboard support for the entry-fee keypad (desktop): while the sheet
+# is open, number keys type into it, Backspace deletes, Enter confirms/closes —
+# exactly like tapping the on-screen keys.
+func _input(event: InputEvent) -> void:
+	if not _entry_sheet_open or not _entry_apply_key.is_valid():
+		return
+	if not (event is InputEventKey and event.pressed and not event.echo):
+		return
+	# NOTE: this script extends CanvasLayer (not Control), so accept_event() —
+	# a Control-only method — is unavailable. Mark the key handled via the
+	# viewport instead so it doesn't leak to the game underneath.
+	var vp := get_viewport()
+	var kc : int = event.keycode
+	if kc == KEY_BACKSPACE or kc == KEY_DELETE:
+		_entry_apply_key.call("back"); vp.set_input_as_handled()
+	elif kc >= KEY_0 and kc <= KEY_9:
+		_entry_apply_key.call(str(kc - KEY_0)); vp.set_input_as_handled()
+	elif kc >= KEY_KP_0 and kc <= KEY_KP_9:
+		_entry_apply_key.call(str(kc - KEY_KP_0)); vp.set_input_as_handled()
+	elif (kc == KEY_ENTER or kc == KEY_KP_ENTER) and _entry_close.is_valid():
+		_entry_close.call(); vp.set_input_as_handled()
 var _entry_sheet_root : Control = null  # bottom-docked custom-amount keypad
 										 # overlay — lives directly under
 										 # _panel_ctrl (not _view_root), so it
@@ -47,13 +70,20 @@ var _entry_sheet_root : Control = null  # bottom-docked custom-amount keypad
 										 # since it's outside _view_root's
 										 # normal child-clearing sweep.
 
-const _MINE_PAGE_SIZE := 20
+const _MINE_PAGE_SIZE := 5
+const _OPEN_PAGE_SIZE := 5   # public "Open Challenges" browse list — 5 per page
 
 var _rooms_cache : Array = []
 var _current_room : Dictionary = {}
 var _detail_timer : Timer = null
 var _pending_open_room_id : String = ""   # deep-link target, applied once auth is ready
-var _avatar_tex_cache : Dictionary = {}   # address+size key → ImageTexture (mirrors LeaderboardPanel)
+var _viewing_room_id : String = ""        # room whose detail is on screen (set BEFORE its
+                                          # fetch resolves) so late auth/player-id syncs don't
+                                          # re-render the list on top of an opening detail view
+var _avatar_tex_cache : Dictionary = {}   # address+size key → fallback ImageTexture
+var _nimiq_avatar_cache : Dictionary = {} # address+size key → REAL loaded identicon ImageTexture
+                                          # (so a poll-driven re-render reuses it instead of
+                                          # flashing the fallback + re-loading it every 4s)
 
 
 ## BUG FIX: Dictionary.get(key, default) only falls back to `default` when
@@ -71,11 +101,48 @@ func _as_array(v) -> Array:
 ## Best-effort display name for a player: nickname if set, otherwise a
 ## shortened wallet address — same fallback convention as LeaderboardPanel.
 func _display_name(nickname: String, address: String) -> String:
-	if nickname != "" and nickname != "null":
-		return nickname
-	if address.length() > 9:
-		return address.left(6) + ".." + address.right(3)
-	return address if address != "" else "Player"
+	# Single source of truth — see UITheme.display_name (nickname if real, else
+	# the shared short-address form). Kept as a thin wrapper so existing call
+	# sites in this panel don't all have to change.
+	return UITheme.display_name(nickname, address)
+
+
+## Shareable invite link built from the CLIENT's own resolved game URL
+## (ApiConfig.game_url — window.NJ_GAME_URL_BASE or the compiled prod URL), so
+## it always points at wherever the game is ACTUALLY served, obeying the same
+## global game-URL rule everything else uses — instead of the backend's
+## possibly-stale GAME_URL env fallback (which was hard-defaulting to nimjump.io).
+## Falls back to the backend's invite_url only if the short code is missing.
+func _room_invite_url(r: Dictionary) -> String:
+	var base := ApiConfig.game_url().strip_edges()
+	while base.ends_with("/"):
+		base = base.substr(0, base.length() - 1)
+	var short_code := str(r.get("short_code", ""))
+	if base != "" and short_code != "":
+		return base + "?vs=" + short_code
+	# Fallback: the backend invite_url carries the correct "?vs=CODE" query, but
+	# its HOST is the backend's GAME_URL env default (nimjump.io) — swap that host
+	# for the client's own resolved game URL so the link never leaks nimjump.io.
+	var backend_url := str(r.get("invite_url", ""))
+	if base != "":
+		var q := backend_url.find("?")
+		if q >= 0:
+			return base + backend_url.substr(q)
+		return base
+	return backend_url
+
+
+## Copy the invite URL to the clipboard (web-aware) and toast a confirmation.
+func _copy_invite_link(url: String) -> void:
+	if url == "":
+		return
+	if OS.has_feature("web"):
+		var js := "try{navigator.clipboard.writeText(%s);}catch(e){}" % JSON.stringify(url)
+		JavaScriptBridge.eval(js, true)
+	else:
+		DisplayServer.clipboard_set(url)
+	var t := Toast.get_instance()
+	if t: t.show_toast("Invite link copied!", Toast.Kind.SUCCESS)
 
 
 func setup(player_id: String) -> void:
@@ -85,11 +152,22 @@ func setup(player_id: String) -> void:
 
 
 func set_auth_token(token: String) -> void:
+	var got_token := _auth_token == "" and token != ""
 	_auth_token = token
 	if token != "" and _pending_open_room_id != "":
 		var rid := _pending_open_room_id
 		_pending_open_room_id = ""
+		print("[VSDEEPLINK] set_auth_token consuming pending id=%s visible=%s" % [rid, str(visible)])
 		_show_room_detail(rid)
+		return
+	# Just became authed while the panel is open on the "connect" prompt — swap
+	# it out for the real list NOW. This is the right moment (not set_player_id):
+	# _sync_panels calls set_player_id first, THEN set_auth_token, and the "my
+	# matches" fetch needs the token — so re-rendering here guarantees it's
+	# present. Guarded to the list view (_current_room empty) so a mid-session
+	# token refresh while viewing a room detail never kicks the user out.
+	if got_token and _player_id != "" and is_instance_valid(_view_root) and visible and _current_room.is_empty() and _viewing_room_id == "":
+		_show_room_list()
 
 func set_auth_attempted(v: bool) -> void:
 	_auth_attempted = v
@@ -98,12 +176,19 @@ func set_has_wallet(v: bool) -> void:
 	_has_wallet = v
 
 func set_player_id(player_id: String) -> void:
+	var became_connected := _player_id == "" and player_id != ""
 	_player_id = player_id
+	# Only re-render here if we ALREADY have a token (account switch mid-session);
+	# the normal connect case re-renders in set_auth_token once the token lands
+	# (see there for why that's the correct moment).
+	if became_connected and _auth_token != "" and is_instance_valid(_view_root) and visible and _current_room.is_empty() and _viewing_room_id == "":
+		_show_room_list()
 
 
 ## Called by Main._check_vsroom_deeplink() — jump straight to a room's detail
 ## view once the panel is open (waits for auth if needed).
 func open_room(room_id: String) -> void:
+	print("[VSDEEPLINK] open_room id=%s auth=%s player=%s visible=%s" % [room_id, str(_auth_token != ""), str(_player_id != ""), str(visible)])
 	if _auth_token == "":
 		_pending_open_room_id = room_id
 		return
@@ -115,6 +200,17 @@ func show_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
 	show()
 	if is_instance_valid(_panel_ctrl):
+		# BUG FIX ("panel pops in from the top-left corner"): _panel_ctrl is a
+		# PRESET_FULL_RECT node (spans the whole screen — the actual visible
+		# dialog is a centered child of it), and Control scale animates around
+		# pivot_offset, which defaults to (0,0) — the top-left of that
+		# full-screen rect, not the center of the visible dialog sitting
+		# inside it. Scaling from 0.92→1.0 around that corner makes the
+		# on-screen dialog visibly grow from/shrink toward the top-left of
+		# the SCREEN instead of its own center. Setting pivot_offset to the
+		# rect's own center fixes this — same fix applied identically in
+		# QuestPanel/LeaderboardPanel/StatsPanel/StreakPanel/CustomizePanel.
+		_panel_ctrl.pivot_offset = _panel_ctrl.size * 0.5
 		_panel_ctrl.modulate.a = 0.0
 		_panel_ctrl.scale      = Vector2(0.92, 0.92)
 		_anim_tween = create_tween()
@@ -143,6 +239,7 @@ func hide_panel() -> void:
 # ── UI shell ─────────────────────────────────────────────────────────────────
 var _title_lbl : Label
 var _back_btn  : Button
+var _header_icon : Control   # the "target" icon; hidden in detail view (back btn takes its place)
 
 func _build_ui() -> void:
 	var vp  := get_viewport()
@@ -162,7 +259,11 @@ func _build_ui() -> void:
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed:
+		# Close only on a real LEFT click on the backdrop — NOT on wheel scroll.
+		# On desktop the mouse wheel fires InputEventMouseButton (WHEEL_UP/DOWN,
+		# pressed=true) too, so the old "any button pressed" check slammed the
+		# panel shut the moment the user tried to scroll ("scrolladım UI kapandı").
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
 	)
 	_panel_ctrl.add_child(dim)
@@ -194,15 +295,30 @@ func _build_ui() -> void:
 	hdr.add_theme_constant_override("separation", int(ref * 0.012))
 	hdr_mc.add_child(hdr)
 
+	# Back button — was a faint translucent "<" that read as barely-there.
+	# Now a solid, properly-sized button with a real chevron icon so it's an
+	# obvious tap target, sitting symmetrically opposite the close X.
+	var back_sz    := int(ref * 0.092)
+	var back_ic_sz := int(back_sz * 0.70)   # match the close X's icon weight
 	_back_btn = Button.new()
-	_back_btn.text = "<"
-	_back_btn.custom_minimum_size = Vector2(int(ref * 0.06), int(ref * 0.06))
+	_back_btn.custom_minimum_size = Vector2(back_sz, back_sz)
 	_back_btn.visible = false
-	_warm_btn(_back_btn, 8)
+	# Match the close (X) button's vivid-orange style so the two header controls
+	# read as a clean symmetric pair, instead of the muddy dull-brown square the
+	# back button used to be.
+	_close_btn_style(_back_btn, 8)
 	_back_btn.pressed.connect(_show_room_list)
+	var back_center := CenterContainer.new()
+	back_center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	back_center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_back_btn.add_child(back_center)
+	var back_icon := UITheme.lucide_icon("arrow-left", back_ic_sz, Color(0.980, 0.955, 0.910))
+	back_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	back_center.add_child(back_icon)
 	hdr.add_child(_back_btn)
 
-	hdr.add_child(UITheme.lucide_icon("target", int(ref * 0.038), _COL_ICON))
+	_header_icon = UITheme.lucide_icon("target", int(ref * 0.038), _COL_ICON)
+	hdr.add_child(_header_icon)
 
 	_title_lbl = Label.new()
 	_title_lbl.text = "VS"
@@ -263,6 +379,30 @@ func _mpad(h: int, v: int) -> MarginContainer:
 	return mc
 
 
+## Secondary "Load more" / small-action style — on-theme: the game's pixel font
+## (like every other button), a soft warm-cream fill with a thin warm border,
+## and dark-brown text. Reads as a real, tidy secondary button that matches the
+## panel's cards instead of the off-theme default-font outline it was before.
+func _load_more_btn_style(btn: Button) -> void:
+	var _border := Color(0.700, 0.520, 0.340, 0.55)
+	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new()
+	for s in [sn, sh, sp]:
+		s.set_corner_radius_all(10)
+		s.set_border_width_all(1)
+		s.border_color = _border
+	sn.bg_color = Color(0.968, 0.930, 0.858)
+	sh.bg_color = Color(0.940, 0.892, 0.808)
+	sp.bg_color = Color(0.905, 0.850, 0.760)
+	btn.add_theme_stylebox_override("normal",  sn)
+	btn.add_theme_stylebox_override("hover",   sh)
+	btn.add_theme_stylebox_override("pressed", sp)
+	UITheme._apply_pixel_font(btn)
+	btn.add_theme_color_override("font_color",         _COL_TEXT_DARK)
+	btn.add_theme_color_override("font_hover_color",   _COL_TEXT_DARK)
+	btn.add_theme_color_override("font_pressed_color", _COL_TEXT_DARK)
+	btn.flat = false
+
+
 func _warm_btn(btn: Button, corner: int) -> void:
 	var st := StyleBoxFlat.new()
 	st.bg_color = Color(0.700, 0.520, 0.340, 0.20)
@@ -273,6 +413,22 @@ func _warm_btn(btn: Button, corner: int) -> void:
 	btn.add_theme_stylebox_override("normal", st)
 	btn.add_theme_stylebox_override("hover",  st_h)
 	btn.add_theme_stylebox_override("pressed", st_h)
+	btn.flat = false
+
+
+## Solid warm-brown back-button style — clearly visible (unlike the old
+## translucent _warm_btn tone) but calmer than the vivid orange close X, so
+## the two header buttons read as "secondary back" vs "primary close".
+func _back_btn_style(btn: Button, corner: int) -> void:
+	var sn := StyleBoxFlat.new(); var sh := StyleBoxFlat.new(); var sp := StyleBoxFlat.new()
+	for s in [sn, sh, sp]:
+		s.set_corner_radius_all(corner)
+	sn.bg_color = Color(0.700, 0.520, 0.340)
+	sh.bg_color = Color(0.760, 0.580, 0.400)
+	sp.bg_color = Color(0.620, 0.450, 0.290)
+	btn.add_theme_stylebox_override("normal",  sn)
+	btn.add_theme_stylebox_override("hover",   sh)
+	btn.add_theme_stylebox_override("pressed", sp)
 	btn.flat = false
 
 
@@ -300,6 +456,10 @@ func _ref() -> float:
 
 
 func _clear_view() -> void:
+	# The keypad sheet (and its key handlers) belong to the view being torn down.
+	_entry_sheet_open = false
+	_entry_apply_key = Callable()
+	_entry_close = Callable()
 	for c in _view_root.get_children():
 		c.queue_free()
 	if is_instance_valid(_detail_timer):
@@ -330,17 +490,52 @@ func _make_nim_icon(size: int) -> TextureRect:
 # ── LIST VIEW ────────────────────────────────────────────────────────────────
 func _show_room_list() -> void:
 	_current_room = {}
+	_viewing_room_id = ""
 	_back_btn.visible = false
+	if is_instance_valid(_header_icon): _header_icon.visible = true
 	_title_lbl.text = "VS"
 	_clear_view()
 	var ref := _ref()
 
 	if _player_id == "":
+		# Same "not signed in" scheme as the Statistics panel: a single centered
+		# line in mid-brown + the standard warm Connect Wallet button (no icon).
+		var box := VBoxContainer.new()
+		box.alignment = BoxContainer.ALIGNMENT_CENTER
+		box.add_theme_constant_override("separation", int(ref * 0.020))
+		box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		_view_root.add_child(box)
+
 		var lbl := Label.new()
-		lbl.text = "Connect your wallet to use VS."
+		lbl.text = "Connect your wallet to play VS matches"
 		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		UITheme.apply_label(lbl, _COL_TEXT_MID, int(ref * 0.030))
-		_view_root.add_child(lbl)
+		box.add_child(lbl)
+
+		var conn_btn := Button.new()
+		conn_btn.text = "Connect Wallet"
+		conn_btn.custom_minimum_size = Vector2(ref * 0.55, ref * 0.080)
+		conn_btn.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		conn_btn.add_theme_font_size_override("font_size", int(ref * 0.034))
+		# Solid-orange primary button, IDENTICAL to the Statistics/Quests panels'
+		# Connect Wallet button (VSPanel's own _warm_btn is a faint translucent
+		# tan tone used for secondary controls, which is why this one looked
+		# washed-out and different before — inline the shared orange scheme).
+		var _cn := StyleBoxFlat.new(); var _ch := StyleBoxFlat.new(); var _cp := StyleBoxFlat.new()
+		for _s in [_cn, _ch, _cp]:
+			_s.set_corner_radius_all(8)
+		_cn.bg_color = Color(0.780, 0.380, 0.120)
+		_ch.bg_color = Color(0.820, 0.450, 0.160)
+		_cp.bg_color = Color(0.640, 0.300, 0.080)
+		conn_btn.add_theme_stylebox_override("normal",  _cn)
+		conn_btn.add_theme_stylebox_override("hover",   _ch)
+		conn_btn.add_theme_stylebox_override("pressed", _cp)
+		conn_btn.add_theme_color_override("font_color",         Color(0.957, 0.898, 0.800))
+		conn_btn.add_theme_color_override("font_hover_color",   Color(1.0, 1.0, 1.0))
+		conn_btn.add_theme_color_override("font_pressed_color", Color(0.957, 0.898, 0.800))
+		conn_btn.pressed.connect(func(): emit_signal("connect_requested"))
+		box.add_child(conn_btn)
 		return
 
 	# ── Create room card ──
@@ -375,6 +570,10 @@ func _show_room_list() -> void:
 	# default (100) instead of 0/"Free".
 	var entry_val := [100.0]  # boxed in a 1-element array so the button
 							   # callbacks below can mutate it by reference
+	# Boxed reference to the "Pay X NIM" button so refresh_custom_display (defined
+	# before the button is built) can keep its amount in sync live — this is what
+	# fixes the button trailing a keystroke behind / stuck on the old value.
+	var pay_btn_box := [null]
 
 	# Amount entry — a bottom-docked keypad sheet (like a real on-screen
 	# keyboard sliding up and covering the bottom of the screen) rather than
@@ -416,8 +615,15 @@ func _show_room_list() -> void:
 	# device aspect ratio.
 	var sheet_hidden_off := ref * 3.0
 	var sheet := PanelContainer.new()
+	# Bottom-anchored AUTO-HEIGHT: the sheet hugs its own content and sits flush
+	# on the bottom edge, instead of being stretched to a fixed 56% of the screen
+	# (which left a big empty gap under the keypad on tall screens, since the
+	# content is sized from `ref`, not screen height). grow BEGIN makes it extend
+	# upward from the bottom by exactly the content height. The slide animation
+	# (offset_top/offset_bottom → 0 open, sheet_hidden_off closed) is unchanged.
 	sheet.anchor_left = 0.0; sheet.anchor_right = 1.0
-	sheet.anchor_top  = 0.44; sheet.anchor_bottom = 1.0
+	sheet.anchor_top  = 1.0; sheet.anchor_bottom = 1.0
+	sheet.grow_vertical = Control.GROW_DIRECTION_BEGIN
 	sheet.offset_left = 0; sheet.offset_right = 0
 	sheet.offset_top  = sheet_hidden_off; sheet.offset_bottom = sheet_hidden_off
 	var sheet_st := StyleBoxFlat.new()
@@ -555,6 +761,9 @@ func _show_room_list() -> void:
 			var trimmed := ("%.2f" % entry_val[0]).rstrip("0").rstrip(".")
 			field_amount_lbl.text = "%s NIM" % trimmed
 			field_hint_lbl.text = "Tap to change"
+		# Keep the primary "Pay X NIM" button's amount in sync with what's typed.
+		if pay_btn_box[0] != null and is_instance_valid(pay_btn_box[0]) and not pay_btn_box[0].disabled:
+			pay_btn_box[0].text = "Pay %.2f NIM" % entry_val[0]
 
 	# Keypad — square-ish keys via a fixed ref-relative size on both axes
 	# (rather than only setting a height and letting the grid's column-fill
@@ -575,6 +784,28 @@ func _show_room_list() -> void:
 	# is 3 columns, and without it "0"/"back" would be stranded alone on a
 	# lopsided last row) — and unlike ".", it's actually useful for a NIM
 	# amount pad: one tap gets you to 100/500/1000 instead of two.
+	# Shared key handler — used by BOTH the on-screen keypad buttons and the
+	# physical keyboard (see _input). `k` is a digit "0".."9", "00", or "back".
+	var apply_key := func(k: String):
+		if k == "back":
+			if custom_buf[0].length() > 0:
+				custom_buf[0] = custom_buf[0].substr(0, custom_buf[0].length() - 1)
+		elif k == "00":
+			# "00" only makes sense once there's already a nonzero leading digit.
+			if custom_buf[0] != "" and custom_buf[0] != "0":
+				custom_buf[0] += "00"
+		else:
+			# Avoid a useless leading "0" (typing 5 after 0 → "5" not "05").
+			if custom_buf[0] == "0":
+				custom_buf[0] = k
+			else:
+				custom_buf[0] += k
+		# entry_val must be recomputed BEFORE refresh — the field's "X NIM" text
+		# is built from entry_val, so refreshing first would trail one keystroke.
+		entry_val[0] = maxf(custom_buf[0].to_float(), 0.0)
+		refresh_custom_display.call()
+	_entry_apply_key = apply_key   # let physical-keyboard _input reach it
+
 	var keypad_keys := ["1", "2", "3", "4", "5", "6", "7", "8", "9", "00", "0", "back"]
 	for key in keypad_keys:
 		var kbtn := Button.new()
@@ -607,31 +838,7 @@ func _show_room_list() -> void:
 			kbtn.add_theme_color_override("font_color",         _COL_TEXT_DARK)
 			kbtn.add_theme_color_override("font_hover_color",   _COL_TEXT_DARK)
 			kbtn.add_theme_color_override("font_pressed_color", _COL_TEXT_DARK)
-		kbtn.pressed.connect(func():
-			if key == "back":
-				if custom_buf[0].length() > 0:
-					custom_buf[0] = custom_buf[0].substr(0, custom_buf[0].length() - 1)
-			elif key == "00":
-				# No-op on an empty/zero pad — "00" only makes sense once
-				# there's already a nonzero leading digit typed.
-				if custom_buf[0] != "" and custom_buf[0] != "0":
-					custom_buf[0] += "00"
-			else:
-				# Avoid a useless leading "0" (e.g. tapping 5 after 0 → "5" not "05")
-				if custom_buf[0] == "0":
-					custom_buf[0] = key
-				else:
-					custom_buf[0] += key
-			# BUG FIX: entry_val must be recomputed BEFORE refresh_custom_display
-			# runs — the closed field's "X NIM" text is built from entry_val,
-			# not from custom_buf directly, so calling refresh first read the
-			# previous keystroke's value and always trailed one digit behind
-			# the live keypad display (e.g. typing "223" showed "22 NIM" on
-			# the field behind the sheet while the sheet itself already read
-			# "223").
-			entry_val[0] = maxf(custom_buf[0].to_float(), 0.0)
-			refresh_custom_display.call()
-		)
+		kbtn.pressed.connect(func(): apply_key.call(key))
 
 	# Boxed Tween reference (same boxed-array trick as entry_val/custom_buf
 	# above) so open/close can kill an in-flight slide animation before
@@ -643,6 +850,7 @@ func _show_room_list() -> void:
 		sheet_tween[0] = null
 
 	open_entry_sheet = func():
+		_entry_sheet_open = true
 		kill_sheet_tween.call()
 		sheet_dim.mouse_filter = Control.MOUSE_FILTER_STOP
 		var t := create_tween()
@@ -657,6 +865,7 @@ func _show_room_list() -> void:
 		# THE MOMENT close is requested, don't wait for the slide-down
 		# animation to finish — otherwise a fast double-tap outside the sheet
 		# could get eaten by a scrim that's still technically "closing."
+		_entry_sheet_open = false
 		sheet_dim.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		kill_sheet_tween.call()
 		var t := create_tween()
@@ -665,12 +874,13 @@ func _show_room_list() -> void:
 		t.tween_property(sheet_dim, "modulate:a", 0.0, 0.18).set_trans(Tween.TRANS_QUAD)
 		t.tween_property(sheet, "offset_top",    sheet_hidden_off, 0.20).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
 		t.tween_property(sheet, "offset_bottom", sheet_hidden_off, 0.20).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+	_entry_close = close_entry_sheet   # let the Enter key (see _input) close it
 	done_btn.pressed.connect(func(): close_entry_sheet.call())
 	# Tapping the dim scrim behind the sheet dismisses it too, same as tapping
 	# outside a real on-screen keyboard — it just closes, it doesn't discard
 	# whatever amount was already typed.
 	sheet_dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed:
+		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			close_entry_sheet.call()
 	)
 
@@ -805,7 +1015,7 @@ func _show_room_list() -> void:
 	# Same height as Main.gd's Settings/PLAY-family buttons (ref * 0.080),
 	# instead of this panel's own slightly-off ref * 0.07.
 	var create_btn := Button.new()
-	create_btn.text = "Create Room"
+	create_btn.text = "Pay %.2f NIM" % entry_val[0]
 	create_btn.custom_minimum_size.y = int(ref * 0.080)
 	# Solid orange — same accent/style as the sheet's Done button and every
 	# other primary action across the game (_close_btn_style), instead of
@@ -817,6 +1027,8 @@ func _show_room_list() -> void:
 	create_btn.add_theme_color_override("font_hover_color",   Color(0.957, 0.898, 0.800))
 	create_btn.add_theme_color_override("font_pressed_color", Color(0.957, 0.898, 0.800))
 	cv.add_child(create_btn)
+	pay_btn_box[0] = create_btn
+	refresh_custom_display.call()   # sync the button's amount to the live value now
 	create_btn.pressed.connect(func():
 		var amt : float = entry_val[0]
 		# No free rooms — refuse to even try below the minimum instead of
@@ -828,10 +1040,32 @@ func _show_room_list() -> void:
 			return
 		create_btn.disabled = true
 		create_btn.text = "Creating..."
-		_create_room(amt, private_check.button_pressed, func(ok: bool):
-			create_btn.disabled = false
-			create_btn.text = "Create Room"
-			if ok: _show_room_list()
+		_create_room(amt, private_check.button_pressed, func(ok: bool, room: Dictionary):
+			if not ok:
+				create_btn.disabled = false
+				create_btn.text = "Pay %.2f NIM" % entry_val[0]
+				return
+			var room_id := str(room.get("id", ""))
+			# "Create takes the payment right away" flow: instead of dropping the
+			# player back on the room list to hunt for a Pay button later, open
+			# the wallet payment IMMEDIATELY here. _create_room's HTTP round trip
+			# (~300ms) is well within the browser's ~5s transient-activation
+			# window from this Create tap, so the Hub-checkout popup on web still
+			# opens correctly (same as the web sign-in flow, which also fetches a
+			# challenge async and THEN opens its popup). _do_pay reads pay_to /
+			# pay_memo from _current_room, so seed it from the create response.
+			_current_room = room
+			if room_id != "" and room.get("pay_to", "") != "":
+				_do_pay(room_id, "creator", amt, create_btn)
+			else:
+				# Couldn't get pay info for some reason — fall back to the detail
+				# screen (its own Pay button) rather than silently doing nothing.
+				create_btn.disabled = false
+				create_btn.text = "Pay %.2f NIM" % entry_val[0]
+				if room_id != "":
+					_show_room_detail(room_id)
+				else:
+					_show_room_list()
 		)
 	)
 
@@ -848,25 +1082,44 @@ func _show_room_list() -> void:
 	UITheme.apply_label(oc_lbl, _COL_TEXT_DARK, int(ref * 0.030))
 	oc_row.add_child(oc_lbl)
 
+	# BUG FIX ("empty/rows appeared at the very bottom, under My Matches"): the
+	# open-challenges list is fetched async, but the "My VS Matches" section
+	# below is added SYNCHRONOUSLY right after this — so by the time the fetch
+	# resolved, appending straight to _view_root landed AFTER My Matches. Put
+	# the results in their own container placed here (right under this header),
+	# exactly like the mine_rows_container pattern below, so they always land
+	# in the correct spot regardless of fetch timing.
+	var open_rows_container := VBoxContainer.new()
+	open_rows_container.add_theme_constant_override("separation", int(ref * 0.010))
+	_view_root.add_child(open_rows_container)
+
 	var open_loading_lbl := Label.new()
 	open_loading_lbl.text = "Loading..."
 	open_loading_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	UITheme.apply_label(open_loading_lbl, _COL_TEXT_MID, int(ref * 0.026))
-	_view_root.add_child(open_loading_lbl)
+	open_rows_container.add_child(open_loading_lbl)
 
-	_fetch_open(func(rooms: Array):
-		if not is_instance_valid(open_loading_lbl): return
-		open_loading_lbl.queue_free()
+	# Capture a WEAKREF of the container (not the node itself): a ?vs= deeplink
+	# can tear this list view down (via _clear_view) while the fetch is still in
+	# flight, and a lambda that directly captured the now-freed container would
+	# error "Lambda capture was freed" the moment the response lands.
+	var _open_c_ref: WeakRef = weakref(open_rows_container)
+	_fetch_open(0, func(rooms: Array, total: int):
+		var oc = _open_c_ref.get_ref()
+		if oc == null: return
+		for c in oc.get_children():
+			c.queue_free()
 		if rooms.is_empty():
 			var oe_lbl := Label.new()
 			oe_lbl.text = "No open public challenges right now."
 			oe_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 			UITheme.apply_label(oe_lbl, _COL_TEXT_MID, int(ref * 0.024))
-			_view_root.add_child(oe_lbl)
+			oc.add_child(oe_lbl)
 			UITheme.set_scroll_passthrough(_view_root)
 			return
 		for r in rooms:
-			_view_root.add_child(_make_room_row(r, ref))
+			oc.add_child(_make_room_row(r, ref))
+		_add_open_load_more_if_needed(oc, rooms.size(), total, ref)
 		UITheme.set_scroll_passthrough(_view_root)
 	)
 
@@ -893,9 +1146,31 @@ func _show_room_list() -> void:
 	mine_rows_container.add_theme_constant_override("separation", int(ref * 0.012))
 	_view_root.add_child(mine_rows_container)
 
+	# Weakref captures — same deeplink teardown race as _fetch_open above.
+	var _load_ref: WeakRef = weakref(loading_lbl)
+	var _mine_c_ref: WeakRef = weakref(mine_rows_container)
 	_fetch_mine(0, func(rooms: Array, total: int):
-		if not is_instance_valid(loading_lbl): return
-		loading_lbl.queue_free()
+		var ll = _load_ref.get_ref()
+		var mc = _mine_c_ref.get_ref()
+		if mc == null: return
+		if ll != null: ll.queue_free()
+		# Re-order so matches waiting on ME ("Your turn to play/pay") sit above
+		# ones waiting on the opponent, finished matches last. Decorate with the
+		# server index so same-rank matches keep the server's order (sort_custom
+		# isn't stable on its own).
+		var _decorated : Array = []
+		for _i in rooms.size():
+			_decorated.append({"r": rooms[_i], "i": _i})
+		_decorated.sort_custom(func(a, b):
+			var ra : int = _mine_sort_rank(a["r"])
+			var rb : int = _mine_sort_rank(b["r"])
+			if ra != rb: return ra < rb
+			return a["i"] < b["i"]
+		)
+		var _sorted : Array = []
+		for _d in _decorated:
+			_sorted.append(_d["r"])
+		rooms = _sorted
 		_rooms_cache = rooms
 		if rooms.is_empty():
 			var empty_lbl := Label.new()
@@ -907,9 +1182,8 @@ func _show_room_list() -> void:
 			UITheme.set_scroll_passthrough(_view_root)
 			return
 		for r in rooms:
-			mine_rows_container.add_child(_make_room_row(r, ref))
-		if not is_instance_valid(mine_rows_container): return
-		_add_load_more_if_needed(mine_rows_container, rooms.size(), total, ref)
+			mc.add_child(_make_room_row(r, ref))
+		_add_load_more_if_needed(mc, rooms.size(), total, ref)
 		UITheme.set_scroll_passthrough(_view_root)
 	)
 
@@ -917,8 +1191,9 @@ func _show_room_list() -> void:
 func _make_card() -> PanelContainer:
 	var card := PanelContainer.new()
 	var st := StyleBoxFlat.new()
-	st.bg_color     = Color(1.0, 0.98, 0.94, 0.9)
-	st.border_color = Color(0.700, 0.520, 0.340, 0.5)
+	# Same card scheme as the Statistics panel (bg + solid warm border).
+	st.bg_color     = Color(0.940, 0.878, 0.776)
+	st.border_color = Color(0.700, 0.520, 0.340)
 	st.set_border_width_all(2)
 	st.set_corner_radius_all(10)
 	st.content_margin_left = 14; st.content_margin_right = 14
@@ -927,12 +1202,235 @@ func _make_card() -> PanelContainer:
 	return card
 
 
+## Small rounded "chip" showing a room's status — used in list rows (and the
+## detail view) so statuses read as tidy badges instead of loose gray text.
+## Terminal states stay muted; anything still in progress gets the warm accent.
+func _make_status_pill(r: Dictionary, ref: float) -> Control:
+	var status := str(r.get("status", ""))
+	var bg : Color
+	var col : Color
+	if _is_terminal(status):
+		# Colour the finished pill by OUTCOME (like the rest of the UI uses real
+		# colour) instead of a washed-out grey: green when you won, soft red when
+		# you lost, neutral for a tie / refund / cancel.
+		var winner := str(r.get("winner_id", ""))
+		if winner != "" and winner == _player_id:
+			bg  = Color(0.800, 0.905, 0.740)   # win — soft green
+			col = Color(0.150, 0.420, 0.160)
+		elif winner != "" and winner != _player_id and _player_id != "":
+			bg  = Color(0.955, 0.840, 0.800)   # loss — soft red
+			col = Color(0.620, 0.240, 0.180)
+		else:
+			bg  = Color(0.905, 0.865, 0.785)   # tie / refunded / cancelled
+			col = _COL_TEXT_DARK
+	else:
+		bg  = Color(0.980, 0.910, 0.820)
+		col = _COL_ICON
+	var pill := PanelContainer.new()
+	pill.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
+	var st := StyleBoxFlat.new()
+	st.bg_color = bg
+	st.set_corner_radius_all(int(ref * 0.024))
+	st.content_margin_left  = int(ref * 0.020); st.content_margin_right  = int(ref * 0.020)
+	st.content_margin_top   = int(ref * 0.006); st.content_margin_bottom = int(ref * 0.006)
+	pill.add_theme_stylebox_override("panel", st)
+	var lbl := Label.new()
+	lbl.text = _status_text(r)
+	UITheme.apply_label(lbl, col, int(ref * 0.020))
+	pill.add_child(lbl)
+	return pill
+
+
+## A muted flat-top hexagon (matching the Nimiq avatar silhouette) with a "?"
+## in the centre — the empty opponent-slot placeholder. Drawn rather than a
+## rounded square so it reads as "a player will go here", same shape as avatars.
+func _make_hex_placeholder(size: int) -> TextureRect:
+	var img := Image.create(size, size, false, Image.FORMAT_RGBA8)
+	var cx := size * 0.5
+	var cy := size * 0.5
+	var r  := size * 0.5
+	var hh := r * 0.8660254            # r * sqrt(3)/2 (flat top/bottom edge)
+	var k  := 1.7320508                 # sqrt(3)
+	var fill := Color(0.885, 0.840, 0.760)
+	for y in size:
+		for x in size:
+			var dx : float = abs(x - cx + 0.5)
+			var dy : float = abs(y - cy + 0.5)
+			if dy <= hh and (k * dx + dy) <= (k * r):
+				img.set_pixel(x, y, fill)
+	_draw_letter(img, "?", maxi(2, size / 8), Color(0.480, 0.340, 0.200))
+	var tr := TextureRect.new()
+	tr.texture = ImageTexture.create_from_image(img)
+	tr.custom_minimum_size = Vector2(size, size)
+	tr.expand_mode  = TextureRect.EXPAND_IGNORE_SIZE
+	tr.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	return tr
+
+
+## One player's card in the detail "You  VS  Opponent" row. `waiting` renders
+## the empty-slot placeholder (? hexagon + "Waiting for player" + dots).
+func _make_vs_player_card(ref: float, addr: String, display: String, badge: String, score, waiting: bool, border_col: Color = Color(0.700, 0.520, 0.340, 0.35)) -> Control:
+	# ~0.8× the previous size (cards were too big) — all inner dimensions scaled.
+	var card := PanelContainer.new()
+	card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var outcome := border_col != Color(0.700, 0.520, 0.340, 0.35)   # a real win/loss/tie tint
+	var st := StyleBoxFlat.new()
+	# Faintly tint the card bg toward the outcome colour so the whole card reads
+	# green/red/gold, not just the border. Subtle.
+	st.bg_color = Color(0.968, 0.930, 0.858).lerp(Color(border_col.r, border_col.g, border_col.b), 0.10) if outcome else Color(0.968, 0.930, 0.858)
+	st.border_color = border_col
+	st.set_border_width_all(2 if outcome else 1)
+	st.set_corner_radius_all(int(ref * 0.026))
+	st.content_margin_left = int(ref * 0.012);  st.content_margin_right  = int(ref * 0.012)
+	st.content_margin_top  = int(ref * 0.017);  st.content_margin_bottom = int(ref * 0.017)
+	card.add_theme_stylebox_override("panel", st)
+	var vb := VBoxContainer.new()
+	vb.alignment = BoxContainer.ALIGNMENT_CENTER
+	vb.add_theme_constant_override("separation", int(ref * 0.008))
+	card.add_child(vb)
+
+	var av_center := CenterContainer.new()
+	av_center.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	vb.add_child(av_center)
+	var av_sz := int(ref * 0.108)
+	if waiting:
+		av_center.add_child(_make_hex_placeholder(av_sz))
+	else:
+		av_center.add_child(_make_nimiq_avatar(addr, av_sz))
+
+	var name_lbl := Label.new()
+	name_lbl.text = display
+	name_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	name_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	name_lbl.clip_text = true
+	UITheme.apply_label(name_lbl, _COL_TEXT_DARK, int(ref * 0.024))
+	vb.add_child(name_lbl)
+
+	# Third line: score (if played) > HOST/badge pill > waiting dots.
+	if score != null:
+		var sc := Label.new()
+		sc.text = "%d" % int(score)
+		sc.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		sc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(sc, _COL_ICON, int(ref * 0.026))
+		vb.add_child(sc)
+	elif waiting:
+		var dots := Label.new()
+		dots.text = "•  •  •"
+		dots.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		dots.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(dots, Color(0.760, 0.660, 0.540), int(ref * 0.018))
+		vb.add_child(dots)
+	elif badge != "":
+		var bc := CenterContainer.new()
+		bc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		vb.add_child(bc)
+		var bp := PanelContainer.new()
+		var bst := StyleBoxFlat.new()
+		bst.bg_color = Color(0.980, 0.910, 0.820)
+		bst.set_corner_radius_all(int(ref * 0.016))
+		bst.content_margin_left = int(ref * 0.012); bst.content_margin_right = int(ref * 0.012)
+		bst.content_margin_top  = int(ref * 0.002); bst.content_margin_bottom = int(ref * 0.002)
+		bp.add_theme_stylebox_override("panel", bst)
+		var bl := Label.new()
+		bl.text = badge
+		UITheme.apply_label(bl, _COL_ICON, int(ref * 0.016))
+		bp.add_child(bl)
+		bc.add_child(bp)
+	return card
+
+
+## Outcome-based border colour for a player's card: green if this player won,
+## red if they lost, gold on a tie / refund / cancel, and the neutral warm
+## border while the match is still unresolved.
+func _card_outcome_border(r: Dictionary, pid: String) -> Color:
+	var status := str(r.get("status", ""))
+	match status:
+		"completed", "expired_payout":
+			var winner := str(r.get("winner_id", ""))
+			if winner == "":
+				return Color(0.850, 0.620, 0.150)   # tie — gold
+			if pid != "" and winner == pid:
+				return Color(0.300, 0.620, 0.280)   # win — green
+			return Color(0.800, 0.320, 0.260)       # loss — red
+		"expired_refunded", "cancelled":
+			return Color(0.850, 0.620, 0.150)        # gold
+	return Color(0.700, 0.520, 0.340, 0.35)          # unresolved — neutral
+
+
+## The three-up prize breakdown strip (Prize pool / Winner gets / Entry fee).
+func _make_prize_row(ref: float, entry: float) -> Control:
+	var card := PanelContainer.new()
+	card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var st := StyleBoxFlat.new()
+	st.bg_color = Color(0.960, 0.918, 0.838)
+	st.set_corner_radius_all(int(ref * 0.024))
+	st.content_margin_left = int(ref * 0.006); st.content_margin_right = int(ref * 0.006)
+	st.content_margin_top  = int(ref * 0.016); st.content_margin_bottom = int(ref * 0.016)
+	card.add_theme_stylebox_override("panel", st)
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	card.add_child(row)
+	var pot := entry * 2.0
+	var win := pot * 0.95
+	var cells := [
+		["hexagon", "PRIZE POOL",  "%.2f NIM" % pot, _COL_TEXT_DARK],
+		["trophy",  "WINNER GETS", "%.2f NIM" % win, Color(0.150, 0.520, 0.180)],
+		["hexagon", "ENTRY FEE",   "%.2f NIM" % entry, _COL_TEXT_DARK],
+	]
+	for i in cells.size():
+		var c = cells[i]
+		var cell := VBoxContainer.new()
+		cell.alignment = BoxContainer.ALIGNMENT_CENTER
+		cell.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		cell.add_theme_constant_override("separation", int(ref * 0.004))
+		row.add_child(cell)
+		var ic_row := HBoxContainer.new()
+		ic_row.alignment = BoxContainer.ALIGNMENT_CENTER
+		ic_row.add_theme_constant_override("separation", int(ref * 0.006))
+		cell.add_child(ic_row)
+		if c[0] == "hexagon":
+			ic_row.add_child(_make_nim_icon(int(ref * 0.026)))
+		else:
+			ic_row.add_child(UITheme.lucide_icon(c[0], int(ref * 0.026), _COL_ICON))
+		var t := Label.new()
+		t.text = c[1]
+		UITheme.apply_label(t, _COL_TEXT_MID, int(ref * 0.017))
+		ic_row.add_child(t)
+		var v := Label.new()
+		v.text = c[2]
+		v.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		v.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(v, c[3], int(ref * 0.026))
+		cell.add_child(v)
+		if i < cells.size() - 1:
+			var divider := ColorRect.new()
+			divider.color = Color(0.700, 0.560, 0.400, 0.35)
+			divider.custom_minimum_size = Vector2(1, int(ref * 0.05))
+			divider.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+			row.add_child(divider)
+	return card
+
+
 func _make_room_row(r: Dictionary, ref: float) -> Control:
 	var card := _make_card()
-	card.mouse_filter = Control.MOUSE_FILTER_STOP
+	# PASS (not STOP) so a drag STARTING on a row still scrolls the list — the
+	# event also reaches the ScrollContainer. We only open the room on a real
+	# TAP: press + release at (almost) the same spot. If the finger moved, it was
+	# a scroll gesture, so we DON'T open anything. (Screen-space distance via
+	# global_position, so list scrolling under the finger doesn't fool it.)
+	card.mouse_filter = Control.MOUSE_FILTER_PASS
+	var press_gpos := [Vector2.ZERO]
+	var armed := [false]
 	card.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
-			_show_room_detail(str(r.get("id", "")))
+		if e is InputEventMouseButton and e.button_index == MOUSE_BUTTON_LEFT:
+			if e.pressed:
+				press_gpos[0] = e.global_position
+				armed[0] = true
+			elif armed[0]:
+				armed[0] = false
+				if e.global_position.distance_to(press_gpos[0]) < ref * 0.045:
+					_show_room_detail(str(r.get("id", "")))
 	)
 
 	var row := HBoxContainer.new()
@@ -946,8 +1444,11 @@ func _make_room_row(r: Dictionary, ref: float) -> Control:
 	var other_name := _display_name(opp_nick, opp_addr) if is_creator else _display_name(str(r.get("creator_nickname", "")), str(r.get("creator_id", "")))
 	var vs_label := "vs %s" % (other_name if (is_creator and opp_addr != "") or not is_creator else "(open)")
 
-	if other_addr != "":
-		row.add_child(_make_nimiq_avatar(other_addr, int(ref * 0.044)))
+	# Always show an avatar: the other player's if there is one, otherwise the
+	# creator's own (an open room I made still shows a face, not a blank gap).
+	var avatar_addr := other_addr if other_addr != "" else str(r.get("creator_id", ""))
+	if avatar_addr != "":
+		row.add_child(_make_nimiq_avatar(avatar_addr, int(ref * 0.052)))
 
 	var info := VBoxContainer.new()
 	info.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -964,7 +1465,7 @@ func _make_room_row(r: Dictionary, ref: float) -> Control:
 	if entry <= 0:
 		var free_lbl := Label.new()
 		free_lbl.text = "Free"
-		UITheme.apply_label(free_lbl, _COL_TEXT_DARK, int(ref * 0.026))
+		UITheme.apply_label(free_lbl, _COL_ICON, int(ref * 0.026))
 		top_row.add_child(free_lbl)
 	else:
 		var entry_icon_wrap := CenterContainer.new()
@@ -972,51 +1473,78 @@ func _make_room_row(r: Dictionary, ref: float) -> Control:
 		entry_icon_wrap.add_child(_make_nim_icon(int(ref * 0.028)))
 		var entry_amt_lbl := Label.new()
 		entry_amt_lbl.text = "%.2f" % entry
-		UITheme.apply_label(entry_amt_lbl, _COL_TEXT_DARK, int(ref * 0.026))
+		# Accent the amount so the stake pops out of the row at a glance.
+		UITheme.apply_label(entry_amt_lbl, _COL_ICON, int(ref * 0.026))
 		top_row.add_child(entry_amt_lbl)
 
-	if bool(r.get("live", false)):
-		top_row.add_child(_make_live_badge(ref))
-
-	var status_lbl := Label.new()
-	status_lbl.text = _status_text(r)
-	UITheme.apply_label(status_lbl, _COL_TEXT_MID, int(ref * 0.022))
-	info.add_child(status_lbl)
+	# Status as a rounded chip (left-aligned) instead of loose gray text.
+	var status_wrap := HBoxContainer.new()
+	status_wrap.add_child(_make_status_pill(r, ref))
+	info.add_child(status_wrap)
 
 	row.add_child(UITheme.lucide_icon("arrow-right", int(ref * 0.024), _COL_TEXT_MID))
 	return card
 
 
-## Small red "● LIVE" pill — shown wherever a room is currently being
-## streamed by whoever's playing their round (see `live` field, populated
-## server-side from backend/handlers/vs_live.go's in-memory relay state).
-func _make_live_badge(ref: float) -> Control:
-	var wrap := PanelContainer.new()
-	var sb := StyleBoxFlat.new()
-	sb.bg_color = Color(0.85, 0.15, 0.15, 1.0)
-	sb.set_corner_radius_all(int(ref * 0.02))
-	sb.content_margin_left   = ref * 0.014
-	sb.content_margin_right  = ref * 0.014
-	sb.content_margin_top    = ref * 0.004
-	sb.content_margin_bottom = ref * 0.004
-	wrap.add_theme_stylebox_override("panel", sb)
-	var lbl := Label.new()
-	lbl.text = "● LIVE"
-	UITheme.apply_label(lbl, Color(1, 1, 1), int(ref * 0.02))
-	wrap.add_child(lbl)
-	return wrap
+## Sort rank for the "My VS Matches" list — lower floats to the top. Anything
+## that needs ME to act ("Your turn…") ranks above matches that are waiting on
+## the other player, which in turn rank above finished/terminal matches. Derived
+## from _status_text so it always matches the label the player actually sees.
+func _mine_sort_rank(r: Dictionary) -> int:
+	var t := _status_text(r)
+	if t.begins_with("Your turn"):      return 0   # my move (pay or play)
+	if t.begins_with("Finishing"):      return 1   # both played, settling
+	if t == "Match in progress":        return 2
+	if t.begins_with("Waiting"):        return 3   # on the opponent
+	return 4                                        # completed / expired / cancelled / review
 
 
 func _status_text(r: Dictionary) -> String:
 	var status : String = str(r.get("status", ""))
 	var is_creator : bool = str(r.get("creator_id", "")) == _player_id
 	var is_opponent : bool = str(r.get("opponent_id", "")) == _player_id and _player_id != ""
+	# Pay-to-join pending payer's own view: they must still pay to commit.
+	if bool(r.get("viewer_is_pending_opponent", false)):
+		return "Your turn to pay"
 	match status:
-		"awaiting_creator_pay":  return "Your turn to pay" if is_creator else "Waiting for creator's payment"
-		"awaiting_creator_play": return "Your turn to play" if is_creator else "Waiting for creator to play"
+		"awaiting_creator_pay":  return "Your turn to pay" if is_creator else "Waiting for an opponent to join"
 		"waiting_opponent":      return "Waiting for an opponent to join"
-		"awaiting_opponent_pay": return "Your turn to pay" if is_opponent else "Waiting for opponent's payment"
-		"awaiting_opponent_play":return "Your turn to play" if is_opponent else "Waiting for opponent to play"
+		# An opponent who hasn't paid yet is NOT considered joined — paying IS
+		# joining. So the creator just sees "waiting for an opponent" (never a
+		# "waiting for opponent's payment" limbo). Only the opponent themselves
+		# sees their own "your turn to pay" action.
+		"awaiting_opponent_pay": return "Your turn to pay" if is_opponent else "Waiting for an opponent to join"
+		"awaiting_creator_play", "awaiting_opponent_play":
+			# NEW FLOW: nobody plays until the opponent has joined AND (paid
+			# rooms) both have paid. So FIRST check the match is actually ready;
+			# only then does "your turn to play" make sense. This also keeps the
+			# label correct against an older backend that might still leave a
+			# freshly-paid room in awaiting_creator_play with no opponent yet.
+			if is_creator or is_opponent:
+				var opp_id := str(r.get("opponent_id", ""))
+				var entry := float(r.get("entry_nim", 0.0))
+				var my_paid := bool(r.get("creator_paid" if is_creator else "opponent_paid", false))
+				var other_paid := bool(r.get("opponent_paid" if is_creator else "creator_paid", false))
+				if opp_id == "":
+					return "Waiting for an opponent to join"
+				if entry > 0 and not (my_paid and other_paid):
+					# Unpaid opponent = not really joined; creator keeps seeing the
+					# neutral "waiting for an opponent to join" (no pay-limbo).
+					return "Waiting for an opponent to join" if my_paid else "Your turn to pay"
+				var mine = r.get("creator_score" if is_creator else "opponent_score")
+				var theirs = r.get("opponent_score" if is_creator else "creator_score")
+				# Count a side as "played" from the moment it SUBMITTED (played_at),
+				# not only once the server has finished verifying + recording the
+				# score — otherwise my own run, mid server-side replay check, still
+				# reads as "Your turn to play".
+				var i_played : bool = mine != null or int(r.get("creator_played_at" if is_creator else "opponent_played_at", 0)) > 0
+				var they_played : bool = theirs != null or int(r.get("opponent_played_at" if is_creator else "creator_played_at", 0)) > 0
+				if not i_played:
+					return "Your turn to play"
+				elif not they_played:
+					return "Waiting for opponent to play"
+				return "Finishing up…"
+			return "Match in progress"
 		"completed":
 			var winner : String = str(r.get("winner_id", ""))
 			if winner == "": return "Completed — tie"
@@ -1026,6 +1554,7 @@ func _status_text(r: Dictionary) -> String:
 			return "Expired — you won by forfeit" if w2 == _player_id else "Expired — opponent won by forfeit"
 		"expired_refunded":      return "Expired — refunded"
 		"cancelled":             return "Cancelled"
+		"manual_review":         return "Under review — an admin is checking this match"
 	return status
 
 
@@ -1076,7 +1605,10 @@ func _notify_status_change(old_r: Dictionary, new_r: Dictionary) -> void:
 
 # ── DETAIL VIEW ──────────────────────────────────────────────────────────────
 func _show_room_detail(room_id: String) -> void:
+	_viewing_room_id = room_id   # mark BEFORE the async fetch so a late auth/player
+	                             # sync can't re-render the list over this view
 	_back_btn.visible = true
+	if is_instance_valid(_header_icon): _header_icon.visible = false  # back btn replaces it — no clutter
 	_title_lbl.text = "Match"
 	_clear_view()
 	var ref := _ref()
@@ -1087,9 +1619,14 @@ func _show_room_detail(room_id: String) -> void:
 	UITheme.apply_label(loading_lbl, _COL_TEXT_MID, int(ref * 0.026))
 	_view_root.add_child(loading_lbl)
 
+	# Weakref the loading label so a fast navigate-away (or deeplink teardown)
+	# mid-fetch can't trigger "Lambda capture was freed".
+	var _load_ref: WeakRef = weakref(loading_lbl)
 	_fetch_room(room_id, func(ok: bool, room: Dictionary):
-		if not is_instance_valid(loading_lbl): return
-		loading_lbl.queue_free()
+		print("[VSDEEPLINK] _show_room_detail fetch id=%s ok=%s status=%s" % [room_id, str(ok), str(room.get("status", "?"))])
+		var ll = _load_ref.get_ref()
+		if ll == null: return
+		ll.queue_free()
 		if not ok:
 			var err_lbl := Label.new()
 			err_lbl.text = "Could not load this room (it may have expired)."
@@ -1099,6 +1636,10 @@ func _show_room_detail(room_id: String) -> void:
 			UITheme.set_scroll_passthrough(_view_root)
 			return
 		_current_room = room
+		# room_id may have been a short ?vs= code (invite deeplink); from here on
+		# use the room's resolved internal id so the poll's re-fetch + identity
+		# check work regardless of which one we opened with.
+		var canonical_id := str(room.get("id", room_id))
 		_render_room_detail(room, ref)
 		UITheme.set_scroll_passthrough(_view_root)
 		# Poll while anything is still pending — cheap HTTP GET every 4s.
@@ -1108,8 +1649,8 @@ func _show_room_detail(room_id: String) -> void:
 			_detail_timer.autostart = true
 			add_child(_detail_timer)
 			_detail_timer.timeout.connect(func():
-				_fetch_room(room_id, func(ok2: bool, room2: Dictionary):
-					if ok2 and _current_room.get("id", "") == room_id:
+				_fetch_room(canonical_id, func(ok2: bool, room2: Dictionary):
+					if ok2 and _current_room.get("id", "") == canonical_id:
 						_notify_status_change(_current_room, room2)
 						_current_room = room2
 						_clear_view()
@@ -1121,13 +1662,20 @@ func _show_room_detail(room_id: String) -> void:
 
 
 func _is_terminal(status: String) -> bool:
-	return status in ["completed", "expired_payout", "expired_refunded", "cancelled"]
+	# manual_review is treated as terminal on the client (no play/pay/cancel
+	# actions) — it's frozen until an admin resolves it, nothing the player can do.
+	return status in ["completed", "expired_payout", "expired_refunded", "cancelled", "manual_review"]
 
 
 func _render_room_detail(r: Dictionary, ref: float) -> void:
 	var room_id : String = str(r.get("id", ""))
 	var is_creator : bool = str(r.get("creator_id", "")) == _player_id
-	var is_opponent : bool = str(r.get("opponent_id", "")) == _player_id and _player_id != ""
+	# Pay-to-join: a paid room's opponent isn't committed (opponent_id set) until
+	# they've paid. The server flags the pending payer's OWN view with
+	# viewer_is_pending_opponent so they still see their Pay button here, even
+	# though opponent_id is still empty and nobody else sees them as joined.
+	var is_pending_opp : bool = bool(r.get("viewer_is_pending_opponent", false))
+	var is_opponent : bool = (str(r.get("opponent_id", "")) == _player_id and _player_id != "") or is_pending_opp
 	var entry : float = float(r.get("entry_nim", 0.0))
 
 	# Neither participant yet — this is someone arriving via the invite link
@@ -1135,49 +1683,84 @@ func _render_room_detail(r: Dictionary, ref: float) -> void:
 	# normal pay/play flow (which needs opponent_id set first).
 	if not is_creator and not is_opponent:
 		var open_for_join : bool = r.get("opponent_id", "") == "" and not _is_terminal(str(r.get("status", "")))
+		var jcreator_addr := str(r.get("creator_id", ""))
 		var jcard := _make_card()
 		_view_root.add_child(jcard)
 		var jv := VBoxContainer.new()
-		jv.add_theme_constant_override("separation", int(ref * 0.012))
+		jv.add_theme_constant_override("separation", int(ref * 0.018))
 		jcard.add_child(jv)
-		var jhdr := HBoxContainer.new()
-		jhdr.add_theme_constant_override("separation", int(ref * 0.012))
-		jv.add_child(jhdr)
-		var jcreator_addr := str(r.get("creator_id", ""))
-		if jcreator_addr != "":
-			jhdr.add_child(_make_nimiq_avatar(jcreator_addr, int(ref * 0.05)))
-		var jt := Label.new()
-		jt.text = "%s challenged you" % _display_name(str(r.get("creator_nickname", "")), jcreator_addr)
-		UITheme.apply_label(jt, _COL_TEXT_DARK, int(ref * 0.028))
-		jhdr.add_child(jt)
-		var je_row := HBoxContainer.new()
-		je_row.add_theme_constant_override("separation", int(ref * 0.006))
-		jv.add_child(je_row)
+
+		# ── Pot / entry header (same as the match detail) ─────────────────
+		var jpot := VBoxContainer.new()
+		jpot.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		jpot.add_theme_constant_override("separation", int(ref * 0.004))
+		jv.add_child(jpot)
 		if entry <= 0:
-			var je := Label.new()
-			je.text = "Entry: Free"
-			UITheme.apply_label(je, _COL_TEXT_MID, int(ref * 0.024))
-			je_row.add_child(je)
+			var jfree := Label.new()
+			jfree.text = "Free match"
+			jfree.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			UITheme.apply_label(jfree, _COL_TEXT_DARK, int(ref * 0.038))
+			jpot.add_child(jfree)
 		else:
-			var je_pre := Label.new()
-			je_pre.text = "Entry: "
-			UITheme.apply_label(je_pre, _COL_ICON, int(ref * 0.024))
-			je_row.add_child(je_pre)
-			je_row.add_child(_make_nim_icon(int(ref * 0.026)))
-			var je_amt := Label.new()
-			je_amt.text = "%.2f (winner takes 95%% of the pot)" % entry
-			je_amt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-			UITheme.apply_label(je_amt, _COL_ICON, int(ref * 0.024))
-			je_row.add_child(je_amt)
+			var jamt_row := HBoxContainer.new()
+			jamt_row.alignment = BoxContainer.ALIGNMENT_CENTER
+			jamt_row.add_theme_constant_override("separation", int(ref * 0.008))
+			jpot.add_child(jamt_row)
+			jamt_row.add_child(_make_nim_icon(int(ref * 0.044)))
+			var jamt := Label.new()
+			jamt.text = "%.2f NIM" % entry
+			UITheme.apply_label(jamt, _COL_TEXT_DARK, int(ref * 0.046))
+			jamt_row.add_child(jamt)
+			var jsub := Label.new()
+			jsub.text = "Entry fee: %d NIM  ·  Winner takes 95%% of the %.2f NIM pot" % [int(entry), entry * 2.0]
+			jsub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			jsub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			UITheme.apply_label(jsub, _COL_TEXT_MID, int(ref * 0.022))
+			jpot.add_child(jsub)
+
+		# ── "X challenged you" (centered) ─────────────────────────────────
+		var jchal := Label.new()
+		jchal.text = "%s challenged you" % _display_name(str(r.get("creator_nickname", "")), jcreator_addr)
+		jchal.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		jchal.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		jchal.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(jchal, _COL_ICON, int(ref * 0.024))
+		jv.add_child(jchal)
+
+		# ── Player cards: You  VS  Challenger(HOST) ───────────────────────
+		var jcards := HBoxContainer.new()
+		jcards.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		jcards.alignment = BoxContainer.ALIGNMENT_CENTER
+		jcards.add_theme_constant_override("separation", int(ref * 0.014))
+		jv.add_child(jcards)
+		jcards.add_child(_make_vs_player_card(ref, _player_id, "You", "", null, _player_id == ""))
+		var jvs := Label.new()
+		jvs.text = "VS"
+		jvs.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		UITheme.apply_label(jvs, _COL_ICON, int(ref * 0.042))
+		jcards.add_child(jvs)
+		jcards.add_child(_make_vs_player_card(ref, jcreator_addr, _display_name(str(r.get("creator_nickname", "")), jcreator_addr), "HOST", null, jcreator_addr == ""))
+
+		# ── Prize breakdown ───────────────────────────────────────────────
+		if entry > 0:
+			jv.add_child(_make_prize_row(ref, entry))
+
 		if not open_for_join:
 			var jf := Label.new()
 			jf.text = "This challenge is no longer open."
+			jf.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 			UITheme.apply_label(jf, _COL_TEXT_MID, int(ref * 0.024))
 			jv.add_child(jf)
 			return
+
+		# Pay-to-join: there is NO separate "accept then pay" step and no free
+		# match — joining a challenge IS paying for it. One tap joins (reserves the
+		# slot + returns pay_to/pay_memo) and immediately opens the wallet for the
+		# entry fee.
 		var join_btn := Button.new()
-		join_btn.text = "Accept Challenge"
-		join_btn.custom_minimum_size.y = int(ref * 0.07)
+		var _join_label : String = "Pay %.2f NIM" % entry
+		join_btn.text = _join_label
+		join_btn.custom_minimum_size.y = int(ref * 0.078)
 		UITheme.apply_play_button(join_btn)
 		jv.add_child(join_btn)
 		join_btn.pressed.connect(func():
@@ -1187,15 +1770,17 @@ func _render_room_detail(r: Dictionary, ref: float) -> void:
 			join_btn.disabled = true
 			join_btn.text = "Joining..."
 			_join_room(room_id, func(ok: bool, room2: Dictionary):
-				if ok:
-					_current_room = room2
-					_clear_view()
-					_render_room_detail(room2, ref)
-					UITheme.set_scroll_passthrough(_view_root)
-				else:
+				if not ok:
 					join_btn.disabled = false
-					join_btn.text = "Accept Challenge"
+					join_btn.text = _join_label
 					_show_toast_err("Could not join — the room may be full or expired.")
+					return
+				# Slot reserved + pay_to/pay_memo in hand → straight to the wallet.
+				# _do_pay re-renders the room on confirm (or refunds and bounces us
+				# back to the list if someone else paid first).
+				_current_room = room2
+				join_btn.text = "Waiting for wallet..."
+				_do_pay(room_id, "opponent", entry, join_btn)
 			)
 		)
 		return
@@ -1209,172 +1794,321 @@ func _render_room_detail(r: Dictionary, ref: float) -> void:
 	var card := _make_card()
 	_view_root.add_child(card)
 	var cv := VBoxContainer.new()
-	cv.add_theme_constant_override("separation", int(ref * 0.012))
+	cv.add_theme_constant_override("separation", int(ref * 0.018))
 	card.add_child(cv)
 
-	var entry_row := HBoxContainer.new()
-	entry_row.add_theme_constant_override("separation", int(ref * 0.006))
-	cv.add_child(entry_row)
+	# ── Pot / entry (centered, prominent) ──────────────────────────────────
+	var pot_box := VBoxContainer.new()
+	pot_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	pot_box.add_theme_constant_override("separation", int(ref * 0.004))
+	cv.add_child(pot_box)
 	if entry <= 0:
-		var entry_lbl := Label.new()
-		entry_lbl.text = "Entry: Free"
-		UITheme.apply_label(entry_lbl, _COL_TEXT_DARK, int(ref * 0.026))
-		entry_row.add_child(entry_lbl)
+		var free_lbl := Label.new()
+		free_lbl.text = "Free match"
+		free_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		UITheme.apply_label(free_lbl, _COL_TEXT_DARK, int(ref * 0.038))
+		pot_box.add_child(free_lbl)
 	else:
-		var entry_pre := Label.new()
-		entry_pre.text = "Entry: "
-		UITheme.apply_label(entry_pre, _COL_ICON, int(ref * 0.026))
-		entry_row.add_child(entry_pre)
-		entry_row.add_child(_make_nim_icon(int(ref * 0.028)))
-		var entry_amt := Label.new()
-		entry_amt.text = "%.2f each (winner takes 95%% of the pot)" % entry
-		entry_amt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-		UITheme.apply_label(entry_amt, _COL_ICON, int(ref * 0.026))
-		entry_row.add_child(entry_amt)
+		var amt_row := HBoxContainer.new()
+		amt_row.alignment = BoxContainer.ALIGNMENT_CENTER
+		amt_row.add_theme_constant_override("separation", int(ref * 0.008))
+		pot_box.add_child(amt_row)
+		amt_row.add_child(_make_nim_icon(int(ref * 0.044)))
+		var amt_lbl := Label.new()
+		amt_lbl.text = "%.2f NIM" % entry
+		UITheme.apply_label(amt_lbl, _COL_TEXT_DARK, int(ref * 0.046))
+		amt_row.add_child(amt_lbl)
+		var pot_sub := Label.new()
+		pot_sub.text = "Entry fee: %d NIM  ·  Winner takes 95%% of the %.2f NIM pot" % [int(entry), entry * 2.0]
+		pot_sub.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		pot_sub.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		UITheme.apply_label(pot_sub, _COL_TEXT_MID, int(ref * 0.022))
+		pot_box.add_child(pot_sub)
 
-	var status_lbl := Label.new()
-	status_lbl.text = _status_text(r)
-	UITheme.apply_label(status_lbl, _COL_ICON, int(ref * 0.026))
-	cv.add_child(status_lbl)
+	# ── Status chip (centered) ─────────────────────────────────────────────
+	var status_center := HBoxContainer.new()
+	status_center.alignment = BoxContainer.ALIGNMENT_CENTER
+	status_center.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	status_center.add_child(_make_status_pill(r, ref))
+	cv.add_child(status_center)
 
-	if bool(r.get("live", false)):
-		var watch_row := HBoxContainer.new()
-		watch_row.add_theme_constant_override("separation", int(ref * 0.010))
-		cv.add_child(watch_row)
-		watch_row.add_child(_make_live_badge(ref))
-		var watch_btn := Button.new()
-		watch_btn.text = "Watch Live"
-		watch_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		_warm_btn(watch_btn, 8)
-		watch_row.add_child(watch_btn)
-		watch_btn.pressed.connect(func():
-			watch_requested.emit(room_id)
-		)
+	# ── Public / Private ───────────────────────────────────────────────────
+	# Private rooms are invite-link-only (never in the public browse list);
+	# public rooms are open for anyone to join. Show which this is.
+	var vis_lbl := Label.new()
+	var _is_priv : bool = bool(r.get("is_private", false))
+	# Only advertise "invite-only / anyone can join" while the room is actually
+	# still open to join; on a matched or finished room that hint is stale, so
+	# just label it Private/Public.
+	var _still_open : bool = str(r.get("status", "")) == "waiting_opponent" and str(r.get("opponent_id", "")) == ""
+	if _still_open:
+		vis_lbl.text = "Private room · invite-only" if _is_priv else "Public room · anyone can join"
+	else:
+		vis_lbl.text = "Private room" if _is_priv else "Public room"
+	vis_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	vis_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	UITheme.apply_label(vis_lbl, _COL_TEXT_MID, int(ref * 0.020))
+	cv.add_child(vis_lbl)
 
-	var my_txt : String = str(my_score) if my_score != null else "—"
-	var opp_txt : String = str(opp_score) if opp_score != null else "—"
+	# ── Player cards: You  VS  Opponent ───────────────────────────────────
 	var opp_addr2 : String = str(r.get("opponent_id" if is_creator else "creator_id", ""))
 
-	var scores_row := HBoxContainer.new()
-	scores_row.add_theme_constant_override("separation", int(ref * 0.020))
-	cv.add_child(scores_row)
+	var cards_row := HBoxContainer.new()
+	cards_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	cards_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	cards_row.add_theme_constant_override("separation", int(ref * 0.014))
+	cv.add_child(cards_row)
 
-	var me_box := HBoxContainer.new()
-	me_box.add_theme_constant_override("separation", int(ref * 0.008))
-	if _player_id != "":
-		me_box.add_child(_make_nimiq_avatar(_player_id, int(ref * 0.04)))
-	var me_lbl := Label.new()
-	me_lbl.text = "You: %s" % my_txt
-	UITheme.apply_label(me_lbl, _COL_TEXT_MID, int(ref * 0.024))
-	me_box.add_child(me_lbl)
-	scores_row.add_child(me_box)
+	var you_badge := "HOST" if is_creator else ""
+	cards_row.add_child(_make_vs_player_card(ref, _player_id, "You", you_badge, my_score, false, _card_outcome_border(r, _player_id)))
 
-	var opp_box := HBoxContainer.new()
-	opp_box.add_theme_constant_override("separation", int(ref * 0.008))
-	if opp_addr2 != "":
-		opp_box.add_child(_make_nimiq_avatar(opp_addr2, int(ref * 0.04)))
-	var opp_lbl := Label.new()
-	opp_lbl.text = "%s: %s" % [_display_name(opp_nick, opp_addr2), opp_txt]
-	UITheme.apply_label(opp_lbl, _COL_TEXT_MID, int(ref * 0.024))
-	opp_box.add_child(opp_lbl)
-	scores_row.add_child(opp_box)
+	var vs_lbl := Label.new()
+	vs_lbl.text = "VS"
+	vs_lbl.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	UITheme.apply_label(vs_lbl, _COL_ICON, int(ref * 0.042))
+	cards_row.add_child(vs_lbl)
+
+	var opp_waiting : bool = opp_addr2 == ""
+	var opp_disp := _display_name(opp_nick, opp_addr2) if not opp_waiting else "Waiting for player"
+	# The opponent card's outcome uses the OTHER side's win/loss (an empty slot
+	# stays neutral).
+	var opp_border := _card_outcome_border(r, opp_addr2) if not opp_waiting else Color(0.700, 0.520, 0.340, 0.35)
+	cards_row.add_child(_make_vs_player_card(ref, opp_addr2, opp_disp, "", opp_score, opp_waiting, opp_border))
+
+	# ── Prize breakdown strip (paid rooms only) ────────────────────────────
+	if entry > 0:
+		cv.add_child(_make_prize_row(ref, entry))
 
 	if not _is_terminal(str(r.get("status", ""))):
 		var exp_lbl := Label.new()
 		var still_waiting_for_join : bool = str(r.get("status", "")) == "waiting_opponent"
 		var prefix := "Invite link valid for: " if still_waiting_for_join else "Time left to play: "
 		exp_lbl.text = prefix + _time_left_text(int(r.get("expires_at", 0)))
-		UITheme.apply_label(exp_lbl, _COL_TEXT_MID, int(ref * 0.022))
+		exp_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+		exp_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(exp_lbl, _COL_TEXT_MID, int(ref * 0.020))
 		cv.add_child(exp_lbl)
 
 	# Invite link — only useful while still waiting for an opponent
 	if is_creator and r.get("opponent_id", "") == "" and not _is_terminal(str(r.get("status", ""))):
+		var inv_hdr := Label.new()
+		inv_hdr.text = "Invite a friend"
+		UITheme.apply_label(inv_hdr, _COL_TEXT_DARK, int(ref * 0.028))
+		cv.add_child(inv_hdr)
+		var inv_desc := Label.new()
+		inv_desc.text = "Share the link below to invite players to your room."
+		inv_desc.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		inv_desc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(inv_desc, _COL_TEXT_MID, int(ref * 0.020))
+		cv.add_child(inv_desc)
 		var invite_row := HBoxContainer.new()
 		invite_row.add_theme_constant_override("separation", int(ref * 0.010))
 		cv.add_child(invite_row)
 		var invite_edit := LineEdit.new()
-		invite_edit.text = str(r.get("invite_url", ""))
+		invite_edit.text = _room_invite_url(r)
 		invite_edit.editable = false
 		invite_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		invite_edit.size_flags_vertical = Control.SIZE_FILL
+		invite_edit.custom_minimum_size.y = int(ref * 0.062)
+		invite_edit.add_theme_font_size_override("font_size", int(ref * 0.022))
+		# A non-editable LineEdit renders its text in the faded "uneditable"
+		# colour by default — force a readable dark tone (this was the "URL is
+		# all washed out" complaint), and give it a clear white field so it
+		# doesn't look disabled.
+		invite_edit.add_theme_color_override("font_uneditable_color", _COL_TEXT_DARK)
+		invite_edit.add_theme_color_override("font_color", _COL_TEXT_DARK)
+		var edit_st := StyleBoxFlat.new()
+		edit_st.bg_color = Color(1.0, 1.0, 1.0, 0.9)
+		edit_st.border_color = Color(0.700, 0.520, 0.340, 0.6)
+		edit_st.set_border_width_all(1)
+		edit_st.set_corner_radius_all(8)
+		edit_st.content_margin_left = int(ref * 0.014); edit_st.content_margin_right = int(ref * 0.014)
+		invite_edit.add_theme_stylebox_override("normal",   edit_st)
+		invite_edit.add_theme_stylebox_override("read_only", edit_st)
 		invite_row.add_child(invite_edit)
+		# Small "Copy" button (outlined) sitting on the link row — copies the URL
+		# to the clipboard. The big orange "Share Invite Link" below is the
+		# primary action (native share sheet on mobile).
 		var copy_btn := Button.new()
 		copy_btn.text = "Copy"
-		_warm_btn(copy_btn, 8)
+		copy_btn.add_theme_font_size_override("font_size", int(ref * 0.024))
+		copy_btn.custom_minimum_size = Vector2(int(ref * 0.20), int(ref * 0.062))
+		_load_more_btn_style(copy_btn)
 		copy_btn.pressed.connect(func():
-			DisplayServer.clipboard_set(str(r.get("invite_url", "")))
-			var t := Toast.get_instance()
-			if t: t.show_toast("Invite link copied", Toast.Kind.INFO)
+			_copy_invite_link(_room_invite_url(r))
 		)
 		invite_row.add_child(copy_btn)
 
-	# ── Action button ──
-	var already_played : bool = my_score != null
-	if not already_played:
-		var action_btn := Button.new()
-		action_btn.custom_minimum_size.y = int(ref * 0.07)
-		UITheme.apply_play_button(action_btn)
-		cv.add_child(action_btn)
-		if entry > 0 and not my_paid:
-			action_btn.text = "Pay %.2f NIM" % entry
-			action_btn.pressed.connect(func(): _do_pay(room_id, my_role, entry, action_btn))
-		else:
-			action_btn.text = "Play"
-			action_btn.pressed.connect(func():
-				hide_panel()
-				play_requested.emit(room_id, my_role, str(r.get("seed", "")))
+		# "or" divider between the copy row and the primary Share button.
+		var or_row := HBoxContainer.new()
+		or_row.alignment = BoxContainer.ALIGNMENT_CENTER
+		or_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		or_row.add_theme_constant_override("separation", int(ref * 0.012))
+		cv.add_child(or_row)
+		var line_l := ColorRect.new()
+		line_l.color = Color(0.700, 0.560, 0.400, 0.35)
+		line_l.custom_minimum_size.y = 1
+		line_l.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		line_l.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		or_row.add_child(line_l)
+		var or_lbl := Label.new()
+		or_lbl.text = "or"
+		UITheme.apply_label(or_lbl, _COL_TEXT_MID, int(ref * 0.020))
+		or_row.add_child(or_lbl)
+		var line_r := ColorRect.new()
+		line_r.color = Color(0.700, 0.560, 0.400, 0.35)
+		line_r.custom_minimum_size.y = 1
+		line_r.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		line_r.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		or_row.add_child(line_r)
+
+		var share_btn := Button.new()
+		share_btn.text = "Share Invite Link"
+		share_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		share_btn.custom_minimum_size.y = int(ref * 0.072)
+		UITheme.apply_play_button(share_btn)
+		share_btn.pressed.connect(func():
+			# Native share sheet first (mobile), clipboard fallback (desktop / no
+			# Web Share support) — see ApiConfig.share_link.
+			ApiConfig.share_link("Join my NimJump VS match!", _room_invite_url(r))
+		)
+		cv.add_child(share_btn)
+
+		# Cancel — only offered while the backend will actually allow it: no
+		# opponent yet AND the creator hasn't paid (a paid room is committed and
+		# refunds via expiry, not cancel — see backend CancelVSRoom). Asks for
+		# confirmation via the same dialog the "open tx" flow uses.
+		# Always offered while you're alone in the room (no opponent has joined) —
+		# whether or not you've paid. If you paid, cancelling refunds your entry
+		# (backend CancelVSRoom); if not, it just closes the room.
+		var _creator_paid : bool = bool(r.get("creator_paid", false))
+		if true:
+			var cancel_btn := Button.new()
+			cancel_btn.text = "Cancel match & refund" if (entry > 0 and _creator_paid) else "Cancel match"
+			cancel_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			cancel_btn.custom_minimum_size.y = int(ref * 0.058)
+			# Solid button in the same weight/shape as our other primary buttons
+			# (Share / Pay), just tinted red to signal it's destructive — cream
+			# text, real fill, not the washed-out ghost outline it was before.
+			var _cn := StyleBoxFlat.new(); var _ch := StyleBoxFlat.new(); var _cp := StyleBoxFlat.new()
+			for s in [_cn, _ch, _cp]:
+				s.set_corner_radius_all(8)
+			_cn.bg_color = Color(0.780, 0.300, 0.230)
+			_ch.bg_color = Color(0.840, 0.360, 0.280)
+			_cp.bg_color = Color(0.660, 0.240, 0.180)
+			cancel_btn.add_theme_stylebox_override("normal",  _cn)
+			cancel_btn.add_theme_stylebox_override("hover",   _ch)
+			cancel_btn.add_theme_stylebox_override("pressed", _cp)
+			cancel_btn.add_theme_color_override("font_color",         Color(0.980, 0.955, 0.910))
+			cancel_btn.add_theme_color_override("font_hover_color",   Color(1.0, 1.0, 1.0))
+			cancel_btn.add_theme_color_override("font_pressed_color", Color(0.980, 0.955, 0.910))
+			cv.add_child(cancel_btn)
+			var _cancel_body := ("This closes the match before anyone joins and refunds your %d NIM entry. This can't be undone." % int(entry)) if (entry > 0 and _creator_paid) else "This closes the match before anyone joins. This can't be undone."
+			cancel_btn.pressed.connect(func():
+				UITheme.confirm_action(self, "Cancel match?",
+					_cancel_body,
+					"Yes, cancel", ref, func():
+						_cancel_room(room_id, func(ok: bool):
+							if ok:
+								var t := Toast.get_instance()
+								if t: t.show_toast("Match cancelled — refunded" if (entry > 0 and _creator_paid) else "Match cancelled", Toast.Kind.INFO)
+								_show_room_list()
+							else:
+								_show_toast_err("Could not cancel — someone may be joining right now.")
+						)
+				)
 			)
+
+	# ── Action button ──
+	# NEW FLOW: nobody can play until the opponent has joined AND (paid rooms)
+	# both sides have paid — mirrors the backend readiness gate in
+	# UpdateVSRoomScore. So after paying, the creator sees a "waiting for
+	# opponent" message (not Play) until a real opponent is locked in.
+	# Paying IS joining: an opponent who hasn't paid is NOT a real participant
+	# yet, so from the creator's side the slot still counts as empty. `opp_id`
+	# here is the *effective* (committed) opponent — present only once they've
+	# actually paid (or it's a free room). This is what removes the entire
+	# "waiting for your opponent to pay" limbo.
+	var opp_id_raw : String = str(r.get("opponent_id", ""))
+	var other_paid : bool = bool(r.get("opponent_paid" if is_creator else "creator_paid", false))
+	var opp_committed : bool = opp_id_raw != "" and (entry <= 0 or other_paid)
+	var opp_id : String = opp_id_raw if opp_committed else ""
+	var match_ready : bool = opp_committed and (entry <= 0 or (my_paid and other_paid))
+	# "Already played" must NOT rely on my_score alone: the server only records
+	# the VS score AFTER it re-simulates the replay (and never, if the match got
+	# flagged into manual review). During that window my_score is still null, so
+	# gate on the played-at marker the backend now stamps the instant a run is
+	# submitted — otherwise the room would offer "Play" again on a match I already
+	# played (and could let me play it twice).
+	var my_played_at : int = int(r.get("creator_played_at" if is_creator else "opponent_played_at", 0))
+	var already_played : bool = my_score != null or my_played_at > 0
+	if not already_played:
+		if entry > 0 and not my_paid:
+			var pay_btn := Button.new()
+			pay_btn.custom_minimum_size.y = int(ref * 0.07)
+			UITheme.apply_play_button(pay_btn)
+			cv.add_child(pay_btn)
+			pay_btn.text = "Pay %.2f NIM" % entry
+			pay_btn.pressed.connect(func(): _do_pay(room_id, my_role, entry, pay_btn))
+		elif match_ready:
+			var play_btn := Button.new()
+			play_btn.custom_minimum_size.y = int(ref * 0.07)
+			UITheme.apply_play_button(play_btn)
+			cv.add_child(play_btn)
+			play_btn.text = "Play"
+			play_btn.pressed.connect(func():
+				# CLAIM the single play attempt on the server FIRST. Only once the
+				# server confirms (200) — locking this side as played — does the
+				# round start. If the claim can't reach the server (offline), the
+				# round simply never begins, so nothing is lost and you can retry
+				# when back online. This is what makes replaying impossible: after a
+				# successful claim, even a later dropped score-submit can't hand you
+				# a fresh attempt, because "played" is already committed server-side.
+				play_btn.disabled = true
+				play_btn.text = "Starting…"
+				_start_play(room_id, func(ok: bool, room2: Dictionary, code: int, err: String):
+					if ok:
+						# Use the seed the server just returned (authoritative).
+						var srv_seed : String = str(room2.get("seed", r.get("seed", "")))
+						hide_panel()
+						play_requested.emit(room_id, my_role, srv_seed)
+						return
+					if code == 409 and err == "already_played":
+						# We already used our attempt (double-tap, or a retry after a
+						# lost response). Never start a second run — just refresh to
+						# the result/waiting view.
+						_show_toast_err("You've already played this match.")
+						_show_room_detail(room_id)
+						return
+					# Transport failure or anything else — do NOT start the round.
+					play_btn.disabled = false
+					play_btn.text = "Play"
+					_show_toast_err("Couldn't start the match — check your connection and try again.")
+				)
+			)
+		elif not _is_terminal(str(r.get("status", ""))):
+			# Paid, waiting for a real (paid) opponent to join. There is no
+			# "waiting for opponent to pay" state — an unpaid opponent doesn't
+			# count as joined, so this is always just "waiting to join".
+			var wait_lbl := Label.new()
+			wait_lbl.text = "Waiting for an opponent to join…"
+			wait_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+			wait_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+			wait_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+			UITheme.apply_label(wait_lbl, _COL_TEXT_MID, int(ref * 0.024))
+			cv.add_child(wait_lbl)
 	elif not _is_terminal(str(r.get("status", ""))):
 		var waiting_lbl := Label.new()
-		waiting_lbl.text = "Waiting for the other side..."
+		waiting_lbl.text = "Waiting for the other side…"
 		waiting_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		UITheme.apply_label(waiting_lbl, _COL_TEXT_MID, int(ref * 0.024))
 		cv.add_child(waiting_lbl)
 
-	# ── Mutual forfeit — only once matched (opponent_id set) and not already
-	# terminal. Requesting it doesn't end the match by itself; it only takes
-	# effect once BOTH sides have asked to bail, so it's always safe to offer.
-	if r.get("opponent_id", "") != "" and not _is_terminal(str(r.get("status", ""))):
-		var my_forfeited : bool = bool(r.get("creator_forfeit_requested" if is_creator else "opponent_forfeit_requested", false))
-		var opp_forfeited : bool = bool(r.get("opponent_forfeit_requested" if is_creator else "creator_forfeit_requested", false))
-		if my_forfeited:
-			var ff_wait_lbl := Label.new()
-			ff_wait_lbl.text = "Waiting for %s to also agree to end this match early..." % _display_name(opp_nick, opp_addr2)
-			ff_wait_lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-			ff_wait_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-			UITheme.apply_label(ff_wait_lbl, _COL_TEXT_MID, int(ref * 0.022))
-			cv.add_child(ff_wait_lbl)
-		else:
-			var ff_btn := Button.new()
-			ff_btn.text = "%s wants to end early — agree?" % _display_name(opp_nick, opp_addr2) if opp_forfeited else "Forfeit / End Match Early"
-			ff_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			_warm_btn(ff_btn, 8)
-			cv.add_child(ff_btn)
-			ff_btn.pressed.connect(func():
-				var confirm_txt := "Both of you have to agree — this refunds any entry fee paid, no fee taken. Continue?"
-				# Simple confirm-via-second-tap pattern would need extra UI; keep it
-				# a single tap here (mirrors how Pay/Play are single-tap elsewhere in
-				# this panel) but make the label itself carry the "this is mutual"
-				# framing so it's never a surprise one-tap forfeit.
-				ff_btn.disabled = true
-				ff_btn.text = "..."
-				_request_forfeit(room_id, func(ok: bool, room2: Dictionary):
-					if ok:
-						_current_room = room2
-						_clear_view()
-						_render_room_detail(room2, ref)
-						UITheme.set_scroll_passthrough(_view_root)
-						var t := Toast.get_instance()
-						if t:
-							if str(room2.get("status", "")) == "cancelled":
-								t.show_toast("Match cancelled — refunded.", Toast.Kind.INFO)
-							else:
-								t.show_toast("Forfeit requested — waiting for the other side.", Toast.Kind.INFO)
-					else:
-						ff_btn.disabled = false
-						ff_btn.text = "Forfeit / End Match Early"
-						_show_toast_err("Could not request forfeit — try again.")
-				)
-			)
+	# (Removed the "Forfeit / End Match Early" button. Once both sides are in a
+	# real match there's no bail-out mid-play — the match resolves by scores or
+	# by the play-time expiry/forfeit-on-timeout that the backend already
+	# handles. Single-player no-opponent rooms are still cancellable via the
+	# separate Cancel button above.)
 
 	# ── Watch Replay — only once both sides have actually played (see
 	# backend replay lock in handleReplay: the server itself refuses to
@@ -1388,16 +2122,18 @@ func _render_room_detail(r: Dictionary, ref: float) -> void:
 		cv.add_child(replay_row)
 		if my_session != "":
 			var my_replay_btn := Button.new()
-			my_replay_btn.text = "▶ Your Replay"
+			my_replay_btn.text = "Your Replay"
 			my_replay_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			_warm_btn(my_replay_btn, 8)
+			my_replay_btn.custom_minimum_size.y = int(ref * 0.062)
+			UITheme.apply_play_button(my_replay_btn)
 			replay_row.add_child(my_replay_btn)
 			my_replay_btn.pressed.connect(func(): _fetch_and_emit_replay(my_session, my_replay_btn))
 		if opp_session != "":
 			var opp_replay_btn := Button.new()
-			opp_replay_btn.text = "▶ %s's Replay" % _display_name(opp_nick, opp_addr2)
+			opp_replay_btn.text = "%s's Replay" % _display_name(opp_nick, opp_addr2)
 			opp_replay_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-			_warm_btn(opp_replay_btn, 8)
+			opp_replay_btn.custom_minimum_size.y = int(ref * 0.062)
+			UITheme.apply_play_button(opp_replay_btn)
 			replay_row.add_child(opp_replay_btn)
 			opp_replay_btn.pressed.connect(func(): _fetch_and_emit_replay(opp_session, opp_replay_btn))
 
@@ -1426,25 +2162,41 @@ func _do_pay(room_id: String, role: String, amount_nim: float, btn: Button) -> v
 		return
 	var value_luna := int(round(amount_nim * 100000.0))  # NimLunaMultiplier
 	var result : Dictionary = await NimiqJS.request_payment(pay_to, value_luna, pay_memo)
+	# BUG FIX ("Invalid assignment ... on a base object of type 'previously
+	# freed'"): the web Hub-checkout popup can take many seconds of user
+	# interaction, during which this panel may rebuild (viewport resize, a
+	# poll-driven detail refresh, tab switch...) and free `btn` out from under
+	# us. Every `btn` touch AFTER the await must therefore be guarded — the
+	# payment itself already succeeded/failed regardless of the button's fate.
 	if not bool(result.get("ok", false)):
 		_show_toast_err("Payment failed: " + str(result.get("err", "unknown")))
-		btn.disabled = false
-		btn.text = "Pay %.2f NIM" % amount_nim
+		if is_instance_valid(btn):
+			btn.disabled = false
+			btn.text = "Pay %.2f NIM" % amount_nim
 		return
-	btn.text = "Confirming..."
+	if is_instance_valid(btn):
+		btn.text = "Confirming..."
 	var tx : String = str(result.get("tx", ""))
-	_confirm_payment(room_id, tx, func(ok: bool):
+	_confirm_payment(room_id, tx, func(ok: bool, err_reason: String):
 		if ok:
 			var t := Toast.get_instance()
 			if t: t.show_toast("Payment confirmed!", Toast.Kind.SUCCESS)
 			_show_room_detail(room_id)
+		elif err_reason == "slot_taken_refunded":
+			# Someone else paid and grabbed this room first. Our (real) payment
+			# was refunded automatically by the backend — this isn't a pending
+			# confirm, so don't tell them to wait; send them back to the list.
+			var t := Toast.get_instance()
+			if t: t.show_toast("Someone joined first — your entry was refunded.", Toast.Kind.INFO)
+			_show_room_list()
 		else:
 			# The backend also independently re-scans the wallet's incoming
 			# transactions every ~90s and will pick this payment up on its
 			# own even if this confirm call keeps failing — it is not lost.
 			_show_toast_err("Payment sent — confirming automatically, this can take up to a couple minutes. Reopen this room to check.")
-			btn.disabled = false
-			btn.text = "Pay %.2f NIM" % amount_nim
+			if is_instance_valid(btn):
+				btn.disabled = false
+				btn.text = "Pay %.2f NIM" % amount_nim
 	)
 
 
@@ -1465,36 +2217,113 @@ func _create_room(entry_nim: float, is_private: bool, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — VSPanel (self) or this
+	# http node can be freed mid-flight (panel closed/queue_free'd, or a
+	# window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
-			cb.call(true)
+			# Parse + flatten the new room (id + pay_to/pay_memo) so the caller
+			# can trigger its payment IMMEDIATELY — "create takes the payment
+			# right away" flow. Same flattening _fetch_room() does.
+			var room : Dictionary = {}
+			var j := JSON.new()
+			if j.parse(body.get_string_from_utf8()) == OK:
+				var d = j.get_data()
+				if d is Dictionary:
+					var r = d.get("room", {})
+					if r is Dictionary:
+						room = r
+					if d.has("pay_to"):     room["pay_to"]     = d["pay_to"]
+					if d.has("pay_memo"):   room["pay_memo"]   = d["pay_memo"]
+					if d.has("invite_url"): room["invite_url"] = d["invite_url"]
+			cb.call(true, room)
 		else:
 			_show_toast_err("Could not create room (code %d)" % code)
-			cb.call(false)
+			cb.call(false, {})
 	)
 	var body_str := JSON.stringify({"entry_nim": entry_nim, "is_private": is_private})
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/create"), _headers(true), HTTPClient.METHOD_POST, body_str)
 
 
+## Cancels a room the player created before anyone joined. The backend only
+## allows this when there's no opponent AND the creator hasn't paid (a paid
+## room is committed — it refunds via expiry instead). cb(ok).
+func _cancel_room(room_id: String, cb: Callable) -> void:
+	var http := HTTPRequest.new()
+	http.timeout = 10.0
+	add_child(http)
+	var _alive : WeakRef = weakref(self)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
+	http.request_completed.connect(func(result, code, _h, _body):
+		if not is_instance_valid(http): return
+		http.queue_free()
+		if _alive.get_ref() == null: return
+		cb.call(result == HTTPRequest.RESULT_SUCCESS and code == 200)
+	)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/%s/cancel" % room_id), _headers(), HTTPClient.METHOD_POST)
+
+
 ## Public browse list — open rooms anyone can join (private rooms never
-## appear here, they only work via their direct invite link).
-func _fetch_open(cb: Callable) -> void:
+## appear here, they only work via their direct invite link). Paginated
+## (highest entry fee first, server-side) — cb receives (rooms, total) so the
+## caller can page through via a "Load more" control, _OPEN_PAGE_SIZE at a time.
+func _fetch_open(offset: int, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# "Lambda capture at index 0 was freed": Godot validates a lambda's captures
+	# BEFORE running its body, so directly capturing the `http` node errors the
+	# instant it's freed (panel rebuilt on a ?vs= deeplink / resize) — the
+	# is_instance_valid guard never even gets a chance. Capture WEAKREFS instead
+	# (never themselves freed) and also verify `cb` is still valid before calling
+	# it (its target — a torn-down list view — may be gone).
+	var _alive : WeakRef = weakref(self)
+	var _http_ref : WeakRef = weakref(http)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
-		http.queue_free()
+		var h = _http_ref.get_ref()
+		if h == null or _alive.get_ref() == null: return
+		h.queue_free()
+		if not cb.is_valid(): return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
-				cb.call(_as_array(j.get_data().get("rooms", [])))
+				var d : Dictionary = j.get_data()
+				cb.call(_as_array(d.get("rooms", [])), int(d.get("total", 0)))
 				return
-		cb.call([])
+		cb.call([], 0)
 	)
-	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/open"), _headers())
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/open?limit=%d&offset=%d" % [_OPEN_PAGE_SIZE, offset]), _headers())
+
+
+## "Load more" for the Open Challenges list — mirror of _add_load_more_if_needed
+## but paging through _fetch_open (public rooms) instead of _fetch_mine.
+func _add_open_load_more_if_needed(container: VBoxContainer, loaded_so_far: int, total: int, ref: float) -> void:
+	if loaded_so_far >= total:
+		return
+	var more_btn := Button.new()
+	more_btn.text = "Load more (%d of %d)" % [loaded_so_far, total]
+	more_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	more_btn.custom_minimum_size.y = int(ref * 0.058)
+	_load_more_btn_style(more_btn)
+	more_btn.add_theme_font_size_override("font_size", int(ref * 0.024))
+	container.add_child(more_btn)
+	more_btn.pressed.connect(func():
+		more_btn.disabled = true
+		more_btn.text = "Loading..."
+		_fetch_open(loaded_so_far, func(rooms: Array, total2: int):
+			if not is_instance_valid(container): return
+			more_btn.queue_free()
+			for r in rooms:
+				container.add_child(_make_room_row(r, ref))
+			_add_open_load_more_if_needed(container, loaded_so_far + rooms.size(), total2, ref)
+		)
+	)
 
 
 ## Appends a "Load more" button to `container` if fewer than `total` rooms
@@ -1506,7 +2335,9 @@ func _add_load_more_if_needed(container: VBoxContainer, loaded_so_far: int, tota
 	var more_btn := Button.new()
 	more_btn.text = "Load more (%d of %d)" % [loaded_so_far, total]
 	more_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_warm_btn(more_btn, 8)
+	more_btn.custom_minimum_size.y = int(ref * 0.058)
+	_load_more_btn_style(more_btn)
+	more_btn.add_theme_font_size_override("font_size", int(ref * 0.024))
 	container.add_child(more_btn)
 	more_btn.pressed.connect(func():
 		more_btn.disabled = true
@@ -1530,9 +2361,16 @@ func _fetch_mine(offset: int, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# Weakref captures so a panel/view rebuilt by a ?vs= deeplink mid-request
+	# doesn't trigger "Lambda capture ... was freed" — see _fetch_open above.
+	var _alive : WeakRef = weakref(self)
+	var _http_ref : WeakRef = weakref(http)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
-		http.queue_free()
+		var h = _http_ref.get_ref()
+		if h == null or _alive.get_ref() == null: return
+		h.queue_free()
+		if not cb.is_valid(): return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -1548,9 +2386,16 @@ func _fetch_room(room_id: String, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# Weakref captures — see _fetch_open. A ?vs= deeplink opens this room right as
+	# the list view is torn down, which used to error "Lambda capture was freed".
+	var _alive : WeakRef = weakref(self)
+	var _http_ref : WeakRef = weakref(http)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
-		http.queue_free()
+		var h = _http_ref.get_ref()
+		if h == null or _alive.get_ref() == null: return
+		h.queue_free()
+		if not cb.is_valid(): return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -1561,6 +2406,7 @@ func _fetch_room(room_id: String, cb: Callable) -> void:
 				if d.has("pay_to"):     room["pay_to"]     = d["pay_to"]
 				if d.has("pay_memo"):   room["pay_memo"]   = d["pay_memo"]
 				if d.has("invite_url"): room["invite_url"] = d["invite_url"]
+				if d.has("viewer_is_pending_opponent"): room["viewer_is_pending_opponent"] = d["viewer_is_pending_opponent"]
 				cb.call(true, room)
 				return
 		cb.call(false, {})
@@ -1572,9 +2418,15 @@ func _join_room(room_id: String, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — VSPanel (self) or this
+	# http node can be freed mid-flight (panel closed/queue_free'd, or a
+	# window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -1582,6 +2434,7 @@ func _join_room(room_id: String, cb: Callable) -> void:
 				var room2 : Dictionary = d.get("room", {})
 				if d.has("pay_to"):   room2["pay_to"]   = d["pay_to"]
 				if d.has("pay_memo"): room2["pay_memo"] = d["pay_memo"]
+				if d.has("viewer_is_pending_opponent"): room2["viewer_is_pending_opponent"] = d["viewer_is_pending_opponent"]
 				cb.call(true, room2)
 				return
 		cb.call(false, {})
@@ -1589,14 +2442,64 @@ func _join_room(room_id: String, cb: Callable) -> void:
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/join"), _headers(true), HTTPClient.METHOD_POST, "{}")
 
 
+## Claims this player's SINGLE play attempt on the server BEFORE the round starts
+## — the network-safe lock. cb(ok, room, code, err): ok=true only on a real 200
+## (round may start with room.seed). On failure ok=false and (code, err) tell the
+## caller whether it was "already_played" (409 — show result/waiting) or a
+## transport failure (no/!=200 — "check your connection", DON'T start the round).
+func _start_play(room_id: String, cb: Callable) -> void:
+	var http := HTTPRequest.new()
+	http.timeout = 10.0
+	add_child(http)
+	var _alive : WeakRef = weakref(self)
+	http.request_completed.connect(ApiConfig.check_clock_skew)
+	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
+		http.queue_free()
+		if _alive.get_ref() == null: return
+		if not cb.is_valid(): return
+		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
+			var j := JSON.new()
+			if j.parse(body.get_string_from_utf8()) == OK:
+				var d : Dictionary = j.get_data()
+				cb.call(true, d.get("room", {}), 200, "")
+				return
+			cb.call(false, {}, code, "bad_response")
+			return
+		# Non-200: pull the backend error code ("already_played", etc.) if present.
+		var err_reason := ""
+		if body != null:
+			var j2 := JSON.new()
+			if j2.parse(body.get_string_from_utf8()) == OK:
+				var d2 = j2.get_data()
+				if d2 is Dictionary: err_reason = str(d2.get("error", ""))
+		cb.call(false, {}, code, err_reason)
+	)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/start"), _headers(true), HTTPClient.METHOD_POST, "{}")
+
+
 func _confirm_payment(room_id: String, tx_hash: String, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 20.0   # RPC lookup server-side can take a moment
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — VSPanel (self) or this
+	# http node can be freed mid-flight (panel closed/queue_free'd, or a
+	# window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
-		cb.call(result == HTTPRequest.RESULT_SUCCESS and code == 200)
+		if _alive.get_ref() == null: return
+		var ok : bool = result == HTTPRequest.RESULT_SUCCESS and code == 200
+		var err_reason := ""
+		if not ok and body != null:
+			var j := JSON.new()
+			if j.parse(body.get_string_from_utf8()) == OK:
+				var d = j.get_data()
+				if typeof(d) == TYPE_DICTIONARY:
+					err_reason = str(d.get("error", ""))
+		cb.call(ok, err_reason)
 	)
 	var body_str := JSON.stringify({"tx_hash": tx_hash})
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/pay"), _headers(true), HTTPClient.METHOD_POST, body_str)
@@ -1612,9 +2515,15 @@ func _request_forfeit(room_id: String, cb: Callable) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — VSPanel (self) or this
+	# http node can be freed mid-flight (panel closed/queue_free'd, or a
+	# window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
 			var j := JSON.new()
 			if j.parse(body.get_string_from_utf8()) == OK:
@@ -1639,13 +2548,19 @@ func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:
 	var http := HTTPRequest.new()
 	http.timeout = 8.0
 	add_child(http)
+	# BUG FIX: "Lambda capture at index 0 was freed" — VSPanel (self) or this
+	# http node can be freed mid-flight (panel closed/queue_free'd, or a
+	# window-resize rebuild) before the response lands.
+	var _alive : WeakRef = weakref(self)
 	http.request_completed.connect(ApiConfig.check_clock_skew)
 	http.request_completed.connect(func(result, code, _h, body):
+		if not is_instance_valid(http): return
 		http.queue_free()
+		if _alive.get_ref() == null: return
 		if not is_instance_valid(btn): return
 		btn.disabled = false
 		if result != HTTPRequest.RESULT_SUCCESS or code != 200:
-			btn.text = "▶ Replay"
+			btn.text = "Replay"
 			if code == 403:
 				_show_toast_err("Replay isn't unlocked yet — both sides need to finish first.")
 			else:
@@ -1683,6 +2598,14 @@ func _make_nimiq_avatar(address: String, size: int) -> TextureRect:
 	tr.expand_mode    = TextureRect.EXPAND_IGNORE_SIZE
 	tr.stretch_mode   = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 	tr.texture_filter = Control.TEXTURE_FILTER_LINEAR
+	# If we've already loaded the real identicon for this address+size, use it
+	# straight away — no fallback flash, no re-load. This is what stops the VS
+	# detail's 4s poll re-render from briefly dropping every avatar back to the
+	# colored placeholder before the async load swaps the real one back in.
+	var real_key := address + "@" + str(size)
+	if _nimiq_avatar_cache.has(real_key):
+		tr.texture = _nimiq_avatar_cache[real_key]
+		return tr
 	tr.texture = _make_fallback_avatar(address, size)
 	if OS.has_feature("web") and address != "" and address != "null" and address != "undefined":
 		_load_nimiq_avatar_async(tr, address, size)
@@ -1818,18 +2741,22 @@ func _load_nimiq_avatar_async(target: Control, address: String, size: int) -> vo
 		var result := str(raw)
 		if result == "" or result == "null" or result == "undefined":
 			return
-		_apply_png_base64(target as TextureRect, result)
+		var tex := _png_base64_to_tex(result)
+		if tex != null:
+			# Cache the real identicon so future re-renders (the 4s poll) reuse it
+			# instantly instead of flashing the fallback and re-loading.
+			_nimiq_avatar_cache[address + "@" + str(size)] = tex
+			if is_instance_valid(target):
+				(target as TextureRect).texture = tex
 		return
 
 
-func _apply_png_base64(target: TextureRect, data_url: String) -> void:
-	if DisplayServer.get_name() == "headless": return
-	if not is_instance_valid(target): return
-	if not data_url.begins_with("data:image/png;base64,"): return
+func _png_base64_to_tex(data_url: String) -> ImageTexture:
+	if DisplayServer.get_name() == "headless": return null
+	if not data_url.begins_with("data:image/png;base64,"): return null
 	var b64   := data_url.substr(len("data:image/png;base64,")).strip_edges()
 	var bytes := Marshalls.base64_to_raw(b64)
-	if bytes.is_empty(): return
+	if bytes.is_empty(): return null
 	var img := Image.new()
-	if img.load_png_from_buffer(bytes) != OK: return
-	if is_instance_valid(target):
-		target.texture = ImageTexture.create_from_image(img)
+	if img.load_png_from_buffer(bytes) != OK: return null
+	return ImageTexture.create_from_image(img)

@@ -91,6 +91,13 @@ type VSRoom struct {
 	NeedsReview  bool   `json:"needs_review,omitempty"`
 	ReviewReason string `json:"review_reason,omitempty"`
 
+	// RefundedDupTxs — hashes of DUPLICATE/extra entry payments already refunded.
+	// A player whose wallet (or Nimiq Pay) is slow can send the same entry twice;
+	// the room only ever keeps ONE payment per side, and the reconciler refunds
+	// every extra matching tx to its sender. Recording the refunded hashes here
+	// keeps that refund strictly once-only across reconcile cycles. Internal.
+	RefundedDupTxs []string `json:"-"`
+
 	WinnerID     string  `json:"winner_id,omitempty"`     // "" if tie-split or refunded
 	PayoutNIM    float64 `json:"payout_nim,omitempty"`     // total amount actually paid out (post-fee)
 	FeeNIM       float64 `json:"fee_nim,omitempty"`
