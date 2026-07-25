@@ -24,4 +24,4 @@ Sound Effects
 Jump and damage sound effects are procedurally generated original audio.
 
 ---
-NimJump — developed by THE_dUDE
+NimJump — developed by The_Dude (Emre Altınok)
