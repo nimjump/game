@@ -322,14 +322,9 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 			msg = "I scored %d in NimJump! Can you beat me? %s" % [score, url]
 	# Avoid duplicating the URL when the message already contains it.
 	var full := msg if url != "" and url in msg else msg + "\n" + url
-	# For navigator.share() we pass the link separately in the `url` field, so the
-	# shared TEXT must NOT also contain it — otherwise share targets that append
-	# the url to the text end up showing the link TWICE ("Watch my replay: <url>
-	# <url>"). Strip the url out of the text for the native-share path; `full`
-	# (used for the clipboard/banner fallback) still carries it exactly once.
-	var share_text := msg
-	if url != "" and url in share_text:
-		share_text = share_text.replace(url, "").strip_edges()
+	# `full` (message + link, combined exactly once) is now the ONLY text we
+	# ever hand to navigator.share() or the clipboard/banner fallback — see
+	# the BUG FIX note below for why a separate `url` field is no longer used.
 	if OS.has_feature("web"):
 		var toast_cb := JavaScriptBridge.create_callback(_on_share_toast)
 		var banner_cb := JavaScriptBridge.create_callback(_on_share_banner)
@@ -437,7 +432,17 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 					if (navigator.share) {
 						var _shareStartedAt = Date.now();
 						var SHARE_STALE_MS = 10000;
-						navigator.share({ title: 'NimJump', text: text, url: url }).then(function(){
+						// BUG FIX: previously passed `text` and `url` as separate fields.
+						// Several share targets on Android/iOS (notably the system "Copy"
+						// quick-action, and some messaging apps) only read the `url` field
+						// when both are present and silently drop `text` — so what actually
+						// got shared/copied was just the bare link, no score message at all.
+						// Putting the full combined message (score text + link already
+						// embedded) into `text` alone and omitting `url` entirely fixes this
+						// for every share target uniformly, since there's no separate url
+						// field left for a target to cherry-pick instead. Messaging apps
+						// still auto-linkify the URL found inside the text just fine.
+						navigator.share({ title: 'NimJump', text: full }).then(function(){
 							console.log('[Share] navigator.share resolved (user shared)');
 							showToast('Shared!');
 						}).catch(function(e){
@@ -463,7 +468,7 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 					tryClipboard();
 				}
 			})();
-		""" % [JSON.stringify(url), JSON.stringify(share_text), JSON.stringify(full)]
+		""" % [JSON.stringify(url), JSON.stringify(msg), JSON.stringify(full)]
 		JavaScriptBridge.eval(js, true)
 	else:
 		DisplayServer.clipboard_set(full)
@@ -512,7 +517,10 @@ func share_link(text: String, url: String) -> void:
 				}
 				try{
 					if(navigator.share){
-						navigator.share({ title:'NimJump VS', text:text, url:url }).then(function(){ showToast('Shared!'); })
+						// Same fix as share_score(): pass the combined message (text+link)
+						// as a single `text` field, no separate `url` — some share targets
+						// only read `url` and drop `text` when both are given.
+						navigator.share({ title:'NimJump VS', text:full }).then(function(){ showToast('Shared!'); })
 							.catch(function(e){
 								if(e && e.name==='AbortError'){ showToast('Share cancelled'); return; }
 								tryClipboard();

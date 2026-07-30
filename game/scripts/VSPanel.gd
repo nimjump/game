@@ -134,17 +134,32 @@ func _room_invite_url(r: Dictionary) -> String:
 	return backend_url
 
 
-## Copy the invite URL to the clipboard (web-aware) and toast a confirmation.
-func _copy_invite_link(url: String) -> void:
+## Builds the invite message text (stake-aware) used by both the "Copy" button
+## and the "Share Invite Link" button, so they always say the same thing.
+## Mentions the actual NIM on the line (matches the 95%-of-pot payout shown in
+## the prize breakdown strip above) — every VS room is a paid room, no free
+## variant needed.
+func _invite_message(entry_nim: float) -> String:
+	var win : float = entry_nim * 2.0 * 0.95
+	return "I staked %.2f NIM in NimJump VS — beat me and take %.2f NIM!" % [entry_nim, win]
+
+
+## Copy the invite message (stake-aware text + URL) to the clipboard
+## (web-aware) and toast a confirmation.
+func _copy_invite_link(url: String, entry_nim: float = 0.0) -> void:
 	if url == "":
 		return
+	var full := _invite_message(entry_nim) + "\n" + url
 	if OS.has_feature("web"):
-		var js := "try{navigator.clipboard.writeText(%s);}catch(e){}" % JSON.stringify(url)
+		# BUG FIX: previously only copied the bare url — same class of "the
+		# message text got dropped" issue fixed in ApiConfig.share_score/
+		# share_link. Copies the full stake-aware message + link now.
+		var js := "try{navigator.clipboard.writeText(%s);}catch(e){}" % JSON.stringify(full)
 		JavaScriptBridge.eval(js, true)
 	else:
-		DisplayServer.clipboard_set(url)
+		DisplayServer.clipboard_set(full)
 	var t := Toast.get_instance()
-	if t: t.show_toast("Invite link copied!", Toast.Kind.SUCCESS)
+	if t: t.show_toast("Invite copied!", Toast.Kind.SUCCESS)
 
 
 func setup(player_id: String) -> void:
@@ -1937,7 +1952,7 @@ func _render_room_detail(r: Dictionary, ref: float) -> void:
 		copy_btn.custom_minimum_size = Vector2(int(ref * 0.20), int(ref * 0.062))
 		_load_more_btn_style(copy_btn)
 		copy_btn.pressed.connect(func():
-			_copy_invite_link(_room_invite_url(r))
+			_copy_invite_link(_room_invite_url(r), entry)
 		)
 		invite_row.add_child(copy_btn)
 
@@ -1971,8 +1986,10 @@ func _render_room_detail(r: Dictionary, ref: float) -> void:
 		UITheme.apply_play_button(share_btn)
 		share_btn.pressed.connect(func():
 			# Native share sheet first (mobile), clipboard fallback (desktop / no
-			# Web Share support) — see ApiConfig.share_link.
-			ApiConfig.share_link("Join my NimJump VS match!", _room_invite_url(r))
+			# Web Share support) — see ApiConfig.share_link. Same stake-aware
+			# message as the Copy button now (was a generic "Join my match!"
+			# with no mention of the actual NIM on the line).
+			ApiConfig.share_link(_invite_message(entry), _room_invite_url(r))
 		)
 		cv.add_child(share_btn)
 

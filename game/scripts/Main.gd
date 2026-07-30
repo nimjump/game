@@ -2593,17 +2593,70 @@ func _build_game() -> void:
 	_claim_btn.pressed.connect(_do_claim)
 	go_vbox.add_child(_claim_btn)
 
-	# Button row — referans UI gibi: PLAY AGAIN (büyük turuncu) | WATCH REPLAY (ghost)
+	# UX FIX round 2: PLAY AGAIN now gets its own full-width row up top (one
+	# clear primary action, nothing beside it competing for the eye), and
+	# WATCH REPLAY + Share Score share a second row below as equal, clearly
+	# secondary options. An icon on PLAY AGAIN reinforces it further.
 	var go_btn_row := HBoxContainer.new()
 	go_btn_row.add_theme_constant_override("separation", int(_p(0.012)))
 	go_btn_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	go_vbox.add_child(go_btn_row)
 
 	var restart_btn := Button.new()
-	restart_btn.text = "PLAY AGAIN"
-	restart_btn.add_theme_font_size_override("font_size", int(_p(0.034)))
+	# NOTE: text left empty on purpose — native Button icon+text layout can't
+	# center an icon+label as one glued-together group (icon_alignment=LEFT
+	# just pins the icon to the button's left edge while the text centers
+	# independently in the full rect, leaving a big gap — that's the "icon
+	# floating off to the side" look from the last screenshot). Instead we
+	# draw icon+label ourselves in a centered HBox laid on top of the button.
+	restart_btn.text = ""
 	restart_btn.custom_minimum_size = Vector2(0, int(_p(0.088)))
 	restart_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	var _pa_icon : Texture2D = load("res://assets/icons/lucide/rotate-ccw.png") if ResourceLoader.exists("res://assets/icons/lucide/rotate-ccw.png") else null
+	var _pa_content := HBoxContainer.new()
+	_pa_content.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	# NOTE: set_anchors_preset(FULL_RECT) alone does NOT reliably stretch to
+	# fill the button (its MINSIZE resize mode can leave the container sized
+	# to its own content and left-anchored) — that's what caused the icon
+	# and label to cram together/overlap at the left edge last time. Setting
+	# anchors AND offsets explicitly guarantees it actually fills the button.
+	_pa_content.anchor_left   = 0.0
+	_pa_content.anchor_top    = 0.0
+	_pa_content.anchor_right  = 1.0
+	_pa_content.anchor_bottom = 1.0
+	_pa_content.offset_left   = 0.0
+	_pa_content.offset_top    = 0.0
+	_pa_content.offset_right  = 0.0
+	_pa_content.offset_bottom = 0.0
+	_pa_content.alignment = BoxContainer.ALIGNMENT_CENTER
+	_pa_content.add_theme_constant_override("separation", int(_p(0.014)))
+	var _pa_icon_tr : TextureRect = null
+	if _pa_icon:
+		_pa_icon_tr = TextureRect.new()
+		_pa_icon_tr.texture = _pa_icon
+		var _pa_icon_sz := int(_p(0.036))
+		_pa_icon_tr.custom_minimum_size = Vector2(_pa_icon_sz, _pa_icon_sz)
+		_pa_icon_tr.stretch_mode  = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		_pa_icon_tr.expand_mode   = TextureRect.EXPAND_IGNORE_SIZE
+		_pa_icon_tr.modulate      = Color(0.957, 0.898, 0.800)
+		_pa_icon_tr.mouse_filter  = Control.MOUSE_FILTER_IGNORE
+		_pa_icon_tr.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		_pa_content.add_child(_pa_icon_tr)
+	var _pa_label := Label.new()
+	_pa_label.text = "PLAY AGAIN"
+	_pa_label.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_pa_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_pa_label.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_pa_content.add_child(_pa_label)
+	# NOTE: relies on UITheme.apply_label() — the exact same helper every
+	# other real label in this game uses (e.g. the "GAME OVER" title) —
+	# rather than the root theme's default_font cascade, so this is
+	# guaranteed pixel-identical to how VIEW RESULT/PLAY AGAIN rendered
+	# back when it was native Button.text, not just "close enough."
+	UITheme.apply_label(_pa_label, Color(0.957, 0.898, 0.800), int(_p(0.034)))
+	restart_btn.add_child(_pa_content)
+	restart_btn.set_meta("label_node", _pa_label)
+	restart_btn.set_meta("icon_node", _pa_icon_tr)
 	restart_btn.pressed.connect(func():
 		# If the run that just ended was a VS match, don't drop the player back on
 		# the home menu — take them straight to that challenge's result screen in
@@ -2626,38 +2679,66 @@ func _build_game() -> void:
 			JavaScriptBridge.eval("history.replaceState(null,'',location.pathname)", true)
 		get_tree().reload_current_scene()
 	)
-	UITheme.apply_play_button(restart_btn)
+	# UX FIX: apply_play_button() uses the same cream/tan nine-patch texture
+	# as apply_ghost_button() (WATCH REPLAY below) — visually near-identical,
+	# so this, the button that actually matters most here (retention — get
+	# them into another run), blended right into the secondary "watch
+	# replay" action while Share Score (hand-styled with a vivid custom
+	# orange, see below) ended up looking like the most important button on
+	# the whole screen despite being the least essential action. Swapping
+	# that same vivid orange onto THIS button instead — reusing an already-
+	# proven, already-in-this-exact-screen color rather than inventing a new
+	# one — makes it the one clear primary action at a glance.
+	var _pa_n := StyleBoxFlat.new(); var _pa_h := StyleBoxFlat.new(); var _pa_p := StyleBoxFlat.new()
+	_pa_n.bg_color = Color(0.780, 0.380, 0.120); _pa_n.set_corner_radius_all(10)
+	_pa_h.bg_color = Color(0.820, 0.450, 0.160); _pa_h.set_corner_radius_all(10)
+	_pa_p.bg_color = Color(0.640, 0.300, 0.080); _pa_p.set_corner_radius_all(10)
+	restart_btn.add_theme_stylebox_override("normal",  _pa_n)
+	restart_btn.add_theme_stylebox_override("hover",   _pa_h)
+	restart_btn.add_theme_stylebox_override("pressed", _pa_p)
+	restart_btn.add_theme_color_override("font_color",         Color(0.957, 0.898, 0.800))
+	restart_btn.add_theme_color_override("font_hover_color",   Color(1.0, 1.0, 1.0))
+	restart_btn.add_theme_color_override("font_pressed_color", Color(0.957, 0.898, 0.800))
 	go_btn_row.add_child(restart_btn)
 	_go_panel.set_meta("restart_btn", restart_btn)
 
-	# ── REPLAY button ────────────────────────────────────────────────
+	# ── Second row: REPLAY + SHARE, side by side, both ghost/secondary ──
+	var go_btn_row2 := HBoxContainer.new()
+	# Was 0.012, same as the PLAY AGAIN row above — but with only these two
+	# buttons side by side and no icon/visual weight to break them up, that
+	# gap read as too tight/"squished together." Widened just for this row.
+	go_btn_row2.add_theme_constant_override("separation", int(_p(0.028)))
+	go_btn_row2.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	go_vbox.add_child(go_btn_row2)
+
 	var replay_btn := Button.new()
-	replay_btn.text = "WATCH REPLAY"
-	replay_btn.add_theme_font_size_override("font_size", int(_p(0.034)))
-	replay_btn.custom_minimum_size = Vector2(0, int(_p(0.088)))
+	# NOTE: was "WATCH REPLAY" (all caps) — the game's display font is a
+	# small-caps style font, so all-caps input rendered with a mismatched
+	# "big letter + tiny caps" look next to Share Score's normal title-case
+	# text below it. Matching the casing style fixes that inconsistency.
+	replay_btn.text = "Watch Replay"
+	replay_btn.add_theme_font_size_override("font_size", int(_p(0.030)))
+	replay_btn.custom_minimum_size = Vector2(0, int(_p(0.072)))
 	replay_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	replay_btn.size_flags_stretch_ratio = 1.0
 	replay_btn.visible = false   # hidden when no replay available
 	UITheme.apply_ghost_button(replay_btn)
 	replay_btn.pressed.connect(_on_replay_pressed)
-	go_btn_row.add_child(replay_btn)
+	go_btn_row2.add_child(replay_btn)
 	_go_panel.set_meta("replay_btn", replay_btn)
 
-	# ── SHARE button — full width, turuncu, StatsPanel ile aynı stil ──
+	# ── SHARE button — now equal-weight secondary, sits beside REPLAY ──
 	var share_btn := Button.new()
 	share_btn.text = "Share Score"
 	share_btn.add_theme_font_size_override("font_size", int(_p(0.030)))
 	share_btn.custom_minimum_size = Vector2(0, int(_p(0.072)))
 	share_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	var _shs_n := StyleBoxFlat.new(); var _shs_h := StyleBoxFlat.new(); var _shs_p := StyleBoxFlat.new()
-	_shs_n.bg_color = Color(0.780, 0.380, 0.120); _shs_n.set_corner_radius_all(10)
-	_shs_h.bg_color = Color(0.820, 0.450, 0.160); _shs_h.set_corner_radius_all(10)
-	_shs_p.bg_color = Color(0.640, 0.300, 0.080); _shs_p.set_corner_radius_all(10)
-	share_btn.add_theme_stylebox_override("normal",  _shs_n)
-	share_btn.add_theme_stylebox_override("hover",   _shs_h)
-	share_btn.add_theme_stylebox_override("pressed", _shs_p)
-	share_btn.add_theme_color_override("font_color",         Color(0.957, 0.898, 0.800))
-	share_btn.add_theme_color_override("font_hover_color",   Color(1.0, 1.0, 1.0))
-	share_btn.add_theme_color_override("font_pressed_color", Color(0.957, 0.898, 0.800))
+	share_btn.size_flags_stretch_ratio = 1.0
+	# UX FIX: demoted from the hand-styled vivid orange (now moved onto
+	# PLAY AGAIN above) to the same ghost style as WATCH REPLAY — Share
+	# Score is a nice-to-have, not the primary action, and shouldn't
+	# visually outrank the button players should actually tap next.
+	UITheme.apply_ghost_button(share_btn)
 	share_btn.pressed.connect(func():
 		var sc : int = int(_gm.get("score")) if _gm else 0
 		var sid : String = str(_gm.get("session_id")) if _gm and _gm.get("session_id") != null else ""
@@ -2669,7 +2750,7 @@ func _build_game() -> void:
 			msg = "My score %d — can you beat me? %s" % [sc, share_url]
 		ApiConfig.share_score(sc, msg, share_url)
 	)
-	go_vbox.add_child(share_btn)
+	go_btn_row2.add_child(share_btn)
 
 	_go_panel.set_meta("container", go_center)
 	_go_panel.set_meta("dim", go_dim)
@@ -5843,7 +5924,25 @@ func show_game_over(p_score: int, p_best: int, p_stats: Dictionary = {}) -> void
 	# the post-game LOCAL session clears _gm.vs_room_id.
 	_last_go_vs_room_id = str(_gm.get("vs_room_id")) if _gm != null and _gm.get("vs_room_id") != null else ""
 	if is_instance_valid(_go_panel) and _go_panel.has_meta("restart_btn"):
-		(_go_panel.get_meta("restart_btn") as Button).text = "VIEW RESULT" if _last_go_vs_room_id != "" else "PLAY AGAIN"
+		# NOTE: restart_btn.text is intentionally left empty (see button build
+		# site) — the visible label is a separate child Label (meta
+		# "label_node") drawn over the button, so relabeling must go through
+		# that Label, not Button.text (setting Button.text here used to draw
+		# a second, overlapping copy of the text on top of our custom label).
+		var _rb : Button = _go_panel.get_meta("restart_btn") as Button
+		var _rb_label : Label = _rb.get_meta("label_node") as Label if _rb.has_meta("label_node") else null
+		var _rb_is_vs : bool = _last_go_vs_room_id != ""
+		var _rb_text : String = "VIEW RESULT" if _rb_is_vs else "PLAY AGAIN"
+		if is_instance_valid(_rb_label):
+			_rb_label.text = _rb_text
+		else:
+			_rb.text = _rb_text
+		# The restart/refresh icon only makes sense for "PLAY AGAIN" (start a
+		# new run) — "VIEW RESULT" isn't a restart action, so hide it there.
+		if _rb.has_meta("icon_node"):
+			var _rb_icon : TextureRect = _rb.get_meta("icon_node") as TextureRect
+			if is_instance_valid(_rb_icon):
+				_rb_icon.visible = not _rb_is_vs
 	_show_go_panel()
 
 func update_score_display(p_score: int) -> void:
