@@ -140,9 +140,11 @@ on Chrome/Firefox. `patch_safari.py` (repo root, next to `game/` and
 `backend/`) fixes this and a couple of related export-time issues by
 patching the freshly exported `index.js`/`index.html` in place.
 
-Run it from the repo root, right after exporting the web build and
-**before** `setup/build.py`:
+**Run it from the main repo folder (repo root) only — NOT from inside
+`backend/`, `game/`, or `setup/`.** Run it right after exporting the web
+build and **before** `setup/build.py`:
 
+    cd /path/to/nimjump    # the repo root — same folder as game/, backend/, setup/
     python patch_safari.py
 
 What it does, in `export/index.js`:

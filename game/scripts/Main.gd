@@ -2717,8 +2717,11 @@ func _build_game() -> void:
 	# "big letter + tiny caps" look next to Share Score's normal title-case
 	# text below it. Matching the casing style fixes that inconsistency.
 	replay_btn.text = "Watch Replay"
-	replay_btn.add_theme_font_size_override("font_size", int(_p(0.030)))
-	replay_btn.custom_minimum_size = Vector2(0, int(_p(0.072)))
+	# Was 0.030/0.072 — noticeably smaller/thinner than the original single-row
+	# design's 0.034/0.088, which read as "washed out"/less lively. Restored
+	# to the original full size now that it has its own row to itself.
+	replay_btn.add_theme_font_size_override("font_size", int(_p(0.034)))
+	replay_btn.custom_minimum_size = Vector2(0, int(_p(0.088)))
 	replay_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	replay_btn.size_flags_stretch_ratio = 1.0
 	replay_btn.visible = false   # hidden when no replay available
@@ -2730,8 +2733,10 @@ func _build_game() -> void:
 	# ── SHARE button — now equal-weight secondary, sits beside REPLAY ──
 	var share_btn := Button.new()
 	share_btn.text = "Share Score"
-	share_btn.add_theme_font_size_override("font_size", int(_p(0.030)))
-	share_btn.custom_minimum_size = Vector2(0, int(_p(0.072)))
+	# Matches replay_btn's restored full size (see note above) — same row,
+	# should look equally full/lively rather than smaller than PLAY AGAIN.
+	share_btn.add_theme_font_size_override("font_size", int(_p(0.034)))
+	share_btn.custom_minimum_size = Vector2(0, int(_p(0.088)))
 	share_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	share_btn.size_flags_stretch_ratio = 1.0
 	# UX FIX: demoted from the hand-styled vivid orange (now moved onto
