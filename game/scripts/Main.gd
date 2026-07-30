@@ -4359,6 +4359,19 @@ func _build_settings_popup() -> void:
 		bg_right_btn.disabled = on
 		if not on:
 			apply_selected_background()
+		else:
+			# BUG FIX: turning Auto ON used to do nothing at all here — the
+			# background just kept showing whatever manual pick (or leftover
+			# replay biome) was already on screen until the next real match
+			# started. Should switch immediately, and with the same smooth
+			# crossfade transition_background() already does for live biome
+			# changes — not an instant snap like apply_selected_background()
+			# uses for manual picks — since the player is actively watching
+			# it happen right after tapping the toggle. "grass" matches
+			# apply_selected_background()'s own score=0 baseline (see that
+			# function's doc comment — GameManager._biome_name_for_score(0)
+			# is always "grass").
+			transition_background("grass")
 		_save_settings()
 	)
 	bg_left_btn.disabled  = _bg_auto
@@ -6351,6 +6364,23 @@ func _restore_lobby_ui() -> void:
 		_hud.visible = false
 	if is_instance_valid(_bottom_bar):
 		_bottom_bar.visible = true
+	# BUG FIX ("watched a replay, background doesn't go back to normal in the
+	# lobby, stays wherever the replay left it — fixes itself once you press
+	# Play"): watching ANY replay (from Leaderboard, Stats, or VS — this
+	# function is the shared "return to the lobby" path all three of those
+	# funnel through, see _exit_replay_ui()'s match block below) re-runs the
+	# exact same biome-crossing code a live match uses, so
+	# transition_background() happily crossfades _bg_rect/_bg_rect2 to
+	# whatever biome that OTHER run's replay reached — nothing ever told it
+	# to go back once the replay stopped. It only looked "fixed" by pressing
+	# Play because starting a real game re-applies the background itself
+	# from scratch elsewhere, coincidentally papering over the leftover
+	# state rather than this function actually resetting it. Explicitly
+	# reapplying the player's own selected/auto background here — every time
+	# the lobby is restored, regardless of which panel sent us back here —
+	# guarantees it's never left showing a stale biome from someone else's
+	# replay (or your own, watched from Stats).
+	apply_selected_background()
 
 
 func _exit_replay_ui() -> void:
@@ -7137,13 +7167,26 @@ void fragment() {
 			_gm.call("set_replay_speed", spd)
 			
 		spd_btn.text = _spd_lbls[_replay_speed_idx]
-		
-		if spd != 1.0: 
-			UITheme.apply_play_button(spd_btn)
-		else:          
-			UITheme.apply_ghost_button(spd_btn)
-			
-		spd_btn.add_theme_font_size_override("font_size", fs_sm)
+		# BUG FIX: this used to swap to apply_play_button() (the big orange
+		# "Play" button style) whenever speed wasn't 1x, and back to
+		# apply_ghost_button() at 1x — so the speed button visually jumped
+		# between two completely different button styles every press, while
+		# every other transport control here (pause/forward/back) always
+		# keeps the SAME custom look (the rounded C_BG/C_TRACK/C_BTN_BORDER
+		# styleboxes _mk_ghost_btn set once at creation, a few lines up).
+		#
+		# ACTUAL FIX: calling UITheme.apply_ghost_button() again here (an
+		# earlier attempt at this fix) wasn't right either — that function
+		# sets its OWN "normal"/"hover"/"pressed" styleboxes using a
+		# different nine-patch texture set ("btn_3"), which would silently
+		# overwrite _mk_ghost_btn's custom rounded-rect styleboxes the very
+		# first time this button was pressed — swapping one style
+		# inconsistency (orange Play button) for a subtler one (nine-patch
+		# ghost texture instead of the flat rounded box every other button
+		# in this row uses). Changing .text alone never touches stylebox
+		# overrides at all — nothing here needs to re-style the button on
+		# every press, its look was already set correctly once at creation
+		# and should just stay that way.
 	)
 	hbox.add_child(spd_btn)
 	# ------------------------------------
@@ -7244,11 +7287,54 @@ void fragment() {
 		_rb_open_tw.tween_property(root, "modulate:a", 1.0, 0.20).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 
 func apply_selected_background() -> void:
-	var tex : Texture2D = UITheme.get_background_texture(_bg_selected)
-	if is_instance_valid(_bg_rect):  _bg_rect.texture  = tex
+	# BUG FIX ("replay izledim, lobiye döndüm, arka plan hâlâ o replay'in
+	# kaldığı yerde — auto açıksa auto olmalı, kapalıysa seçtiğim olmalı"):
+	# this used to always apply _bg_selected (the MANUAL pick) no matter
+	# what _bg_auto was set to. That's correct when auto is off, but when
+	# auto is ON, _bg_selected isn't even meant to represent anything live
+	# — the manual selector arrows are disabled in Settings while auto is on
+	# (see bg_left_btn/bg_right_btn.disabled = _bg_auto), so it can be
+	# holding a stale value from before auto was ever turned on, or from
+	# whatever it defaulted to. Calling this with the wrong background for
+	# the current mode is exactly why the "reset to the real background"
+	# fix in _restore_lobby_ui() didn't actually look right for auto users.
+	# Real fix: branch on _bg_auto here — auto mode always resets to
+	# whatever biome score=0 maps to (the same biome-cycle logic
+	# transition_background() drives during a live run, so the lobby shows
+	# the same "starting" biome a fresh run would), manual mode keeps using
+	# _bg_selected exactly like before.
+	#
+	# SECOND BUG FIX (first attempt still didn't match auto mode): used
+	# UITheme.get_background_index_for_score(0) here, which does NOT agree
+	# with the function that actually drives live biome changes,
+	# GameManager._biome_name_for_score() — two separate, out-of-sync biome
+	# orderings. GameManager's is the real one (it's what transition_background()
+	# gets fed from during an actual run — see GameManager.gd's simulate_tick,
+	# "_new_biome := _biome_name_for_score(score)"): cycle<500 → "grass".
+	# Score is always exactly 0 here (this is the lobby/idle state, not a
+	# live run), and 0 % 2000 = 0 is always < 500 by construction — so the
+	# correct starting biome is always "grass" (Meadow), full stop, not
+	# whatever UITheme's separate/differently-ordered helper happened to
+	# return for slot 0. Going through get_background_index_by_id("grass")
+	# instead of a raw index keeps this readable and matches the id-based
+	# convention transition_background() itself uses.
+	var idx : int = UITheme.get_background_index_by_id("grass") if _bg_auto else _bg_selected
+	var tex : Texture2D = UITheme.get_background_texture(idx)
+	if is_instance_valid(_bg_rect):
+		_bg_rect.texture  = tex
+		# ALSO BUG FIX: transition_background() tints _bg_rect (e.g. a pink
+		# tint for the "candy" biome — see its own tint variable) and never
+		# resets it back to white on its own; that tint was only ever meant
+		# to fade back to neutral through a fresh transition, not to persist
+		# once the biome cycle stops. Without resetting it here, a replay
+		# that ended mid-candy-biome could leave the lobby's background
+		# showing the CORRECT image but still pink-tinted. Full white =
+		# fully untinted, matches how the background looks the very first
+		# time it's ever applied.
+		_bg_rect.modulate = Color.WHITE
 	if is_instance_valid(_bg_rect2):
 		_bg_rect2.texture    = tex
-		_bg_rect2.modulate.a = 0.0
+		_bg_rect2.modulate   = Color(1, 1, 1, 0.0)
 
 func transition_background(biome_id: String) -> void:
 	if not _bg_auto: return   # Manuel modda biome geçişi devre dışı

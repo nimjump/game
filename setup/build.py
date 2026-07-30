@@ -272,12 +272,13 @@ def find_template_folder() -> pathlib.Path:
 
 def copy_template_extras(export_folder: pathlib.Path, template_folder: pathlib.Path):
     """
-    Copies _headers, manifest.json, and assets/ from game/template into the
-    export folder, overwriting whatever is already there.
+    Copies _headers, manifest.json, robots.txt, sitemap.xml, and assets/
+    from game/template into the export folder, overwriting whatever is
+    already there.
     """
     if not template_folder.is_dir():
         print(f"Template folder not found: {template_folder.resolve()}")
-        print("  Skipping _headers/manifest.json/assets copy — check the game/template path.")
+        print("  Skipping _headers/manifest.json/robots.txt/sitemap.xml/assets copy — check the game/template path.")
         return
 
     headers_src = template_folder / "_headers"
@@ -300,6 +301,19 @@ def copy_template_extras(export_folder: pathlib.Path, template_folder: pathlib.P
         print(f"  copied manifest.json → {manifest_dst}")
     else:
         print(f"  no manifest.json found in {template_folder.resolve()}, skipped")
+
+    # robots.txt / sitemap.xml — SEO. Search engine crawlers request these
+    # from the domain root (https://.../robots.txt), so they have to land in
+    # export/'s top level same as everything else here, not just live in the
+    # source template folder.
+    for seo_name in ("robots.txt", "sitemap.xml"):
+        seo_src = template_folder / seo_name
+        if seo_src.is_file():
+            seo_dst = export_folder / seo_name
+            shutil.copyfile(seo_src, seo_dst)
+            print(f"  copied {seo_name} → {seo_dst}")
+        else:
+            print(f"  no {seo_name} found in {template_folder.resolve()}, skipped")
 
     assets_src = template_folder / "assets"
     if assets_src.is_dir():

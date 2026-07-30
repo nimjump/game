@@ -184,6 +184,64 @@
   <link rel="apple-touch-icon" sizes="180x180" href="assets/icon/ico-180.png">
   <meta name="theme-color" content="#242424">
 
+  <!-- ── SEO ────────────────────────────────────────────────────────────────
+       This whole page is a single <canvas> once Godot boots — there is
+       normally ZERO real text content here for a crawler to read, and
+       nothing here relies on JS running to be indexable (crawlers fetch and
+       parse this raw HTML directly). Everything below is static markup, not
+       injected at runtime, so it's present in the very first response.
+       If the canonical domain, name, or pitch ever changes, update it
+       everywhere below AND in robots.txt/sitemap.xml (game/template) — the
+       URL/description are repeated across several tags on purpose (title,
+       description, OG, Twitter, JSON-LD) since each surface (Google result,
+       Twitter/X card, Discord/Slack unfurl, iMessage preview) reads a
+       different subset of these. -->
+  <link rel="canonical" href="https://nimjump.zetashare.com/">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="description" content="NimJump — an endless vertical platformer for Nimiq. Jump, dodge, and climb as high as you can with tap or gyro-tilt controls, earn real NIM as you play, and challenge friends directly in 1v1 VS wagers. Every run is verified server-side, so every score is real.">
+  <meta name="keywords" content="NimJump, Nimiq, Nimiq game, NIM crypto game, play to earn, web3 game, blockchain game, endless jumper, platformer game, crypto rewards game">
+  <meta name="author" content="NimJump">
+
+  <!-- Open Graph — Facebook, Discord, Slack, WhatsApp, LinkedIn, most link-unfurl previews -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="NimJump">
+  <meta property="og:title" content="NimJump — Jump, Dodge, Earn NIM">
+  <meta property="og:description" content="An endless vertical platformer for Nimiq. Jump, dodge, and climb with tap or gyro-tilt controls, earn real NIM as you play, and challenge friends in 1v1 VS wagers — every run is verified server-side.">
+  <meta property="og:url" content="https://nimjump.zetashare.com/">
+  <meta property="og:image" content="https://nimjump.zetashare.com/assets/icon/ico-512.png">
+  <meta property="og:image:width" content="512">
+  <meta property="og:image:height" content="512">
+  <meta property="og:locale" content="en_US">
+
+  <!-- Twitter/X Card -->
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="NimJump — Jump, Dodge, Earn NIM">
+  <meta name="twitter:description" content="An endless vertical platformer for Nimiq. Tap or gyro-tilt controls, real NIM rewards, 1v1 VS wagers against friends — every run is verified server-side.">
+  <meta name="twitter:image" content="https://nimjump.zetashare.com/assets/icon/ico-512.png">
+
+  <!-- Structured data — lets Google show a richer result (game category,
+       platform, free-to-play) instead of a bare blue link. VideoGame is a
+       real schema.org type search engines actively parse for this. -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "VideoGame",
+    "name": "NimJump",
+    "url": "https://nimjump.zetashare.com/",
+    "description": "An endless vertical platformer for Nimiq. Jump, dodge, and climb as high as you can with tap or gyro-tilt controls, earn real NIM as you play, and challenge friends directly in 1v1 VS wagers. Every run is verified server-side.",
+    "image": "https://nimjump.zetashare.com/assets/icon/ico-512.png",
+    "applicationCategory": "Game",
+    "gamePlatform": ["Web Browser", "Android", "iOS"],
+    "genre": ["Platformer", "Arcade", "Blockchain Game"],
+    "playMode": "SinglePlayer, MultiPlayer",
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD"
+    }
+  }
+  </script>
+
   <!-- ── DEV MODE ──────────────────────────────────────────────────────────────
        Add ?dev to URL to enable debug overlay, FPS counter, and verbose logs.
        Example: https://nimjump.zetashare.com/?dev
@@ -893,6 +951,27 @@
 
 </head>
 <body>
+
+<!-- SEO fallback text — visually hidden (off-screen, not display:none, so
+     screen readers and crawlers that penalize display:none'd content both
+     still see it fine), only ever visible to something reading the raw
+     HTML rather than looking at the rendered canvas. This is the only place
+     real, crawlable sentences about what the game actually is exist on the
+     page at all; everything else a visitor sees is drawn by Godot inside
+     the canvas, which is opaque to a crawler. Content here matches the
+     meta description in <head> — describes the real game, not stuffed
+     with unrelated keywords. -->
+<div style="position:absolute; width:1px; height:1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap;">
+  <h1>NimJump</h1>
+  <p>NimJump is an endless vertical platformer game for Nimiq. Jump, dodge, and
+  climb as high as you can using tap or gyro-tilt controls. Earn real NIM as
+  you play, complete daily quests, climb the daily and weekly leaderboards,
+  and challenge friends directly in 1v1 VS matches where both players stake
+  NIM and the higher score takes the pot. Every run is verified server-side
+  — the client only records inputs, the backend replays the match itself,
+  and only pays out if the replay matches exactly — so every score and
+  every leaderboard entry is real and checkable.</p>
+</div>
 
 <canvas id="canvas">Your browser does not support the canvas tag.</canvas>
 <noscript>Your browser does not support JavaScript.</noscript>

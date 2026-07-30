@@ -697,6 +697,41 @@ func reset_to_idle() -> void:
 		_anim_sprite.stop()
 		_anim_sprite.play("stand")
 		_anim_sprite.set_frame_and_progress(0, 0.0)
+	# BUG FIX ("watched a replay, went back to the lobby, character is
+	# sitting there with a jetpack still attached"): _update_overlays_visual()
+	# — the function that actually turns the jetpack/wings/shield/flame
+	# overlay sprites on and off — only ever runs from _physics_process(),
+	# which bails out immediately whenever `_initialized` is false (see that
+	# function's own guard). Setting _initialized = false two lines above
+	# (to freeze the character back into its idle lobby pose) means that
+	# update loop never runs again — so if a powerup happened to still be
+	# active on the very last frame before this ran (e.g. watching a replay
+	# that ended mid-jetpack, or a live run that ended the same way), its
+	# overlay sprite's `.visible = true` was the last write it ever got and
+	# just stays stuck on forever, floating on top of the now-idle
+	# character. Clearing the powerup state AND directly hiding every
+	# overlay sprite here — instead of leaving it for a visual-update loop
+	# that's about to stop running — guarantees the lobby character always
+	# comes back clean regardless of what was happening the instant before.
+	is_powered_up       = false
+	powerup_type         = ""
+	_powerup_is_jetpack  = false
+	_powerup_is_wings    = false
+	has_shield           = false
+	_speed_boost         = false
+	_jump_boost          = false
+	_ov_jet    = false
+	_ov_wings  = false
+	_ov_shield = false
+	_ov_flame  = false
+	_glow_state = 0
+	if is_instance_valid(_overlay_jetpack): _overlay_jetpack.visible = false
+	if is_instance_valid(_overlay_wing_l):  _overlay_wing_l.visible  = false
+	if is_instance_valid(_overlay_wing_r):  _overlay_wing_r.visible  = false
+	if is_instance_valid(_overlay_bubble):  _overlay_bubble.visible  = false
+	if is_instance_valid(_overlay_flame):   _overlay_flame.visible   = false
+	if is_instance_valid(_overlay_flame_r): _overlay_flame_r.visible = false
+	if is_instance_valid(_glow_spr):        _glow_spr.visible        = false
 	_start_idle_anim()
 
 
