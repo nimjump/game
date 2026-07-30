@@ -26,20 +26,24 @@ extends Node
 # same pattern:
 #   1. ?game_url=... query param / localStorage nj_game_url (web)
 #      or --game-url=... / NIMJUMP_GAME_URL env var (native)
-#   2. Server-provided game_url (stats/submit responses) via set_game_url()
-#   3. Web: window.location.origin
-#   4. Native config file entry (game_url key)
+#   2. window.NJ_GAME_URL_BASE (dev-tunnel injection)
+#   3. Compiled PROD_GAME_URL — the single source of truth for a prod build
+#   4. Web: window.location.origin  /  Native: config file entry (game_url key)
 #   5. _FALLBACK_GAME_URL — local-dev-only last resort
+#
+# NOTE: a server-provided game_url (set_game_url, from stats/submit responses)
+# is honoured ONLY when there is no compiled PROD_GAME_URL — otherwise the
+# compiled URL always wins, so invite/share links never flip host mid-session.
 
 const CONFIG_FILE_NAME := "config.cfg"
 
 # ════════════════════════════════════════════════════════════════════════
 #  BURAYA KENDİ BACKEND URL'İNİ YAZ (deploy ettiğin domain/IP)
-#  Örnek:  const PROD_BASE := "https://api.nimjump.io"
+#  Örnek:  const PROD_BASE := "https://backbone.zetashare.com"
 #  Örnek:  const PROD_BASE := "http://1.2.3.4:8080"
 # ════════════════════════════════════════════════════════════════════════
-const PROD_BASE     := "https://msgstr-inspections-skirts-registered.trycloudflare.com"   # <-- backend API URL'i
-const PROD_GAME_URL := "https://traveler-specifies-pharmacy-prototype.trycloudflare.com"     # <-- oyunun public URL'i (share/replay/VS invite linkleri)
+const PROD_BASE     := "https://backbone.zetashare.com"   # <-- backend API URL'i
+const PROD_GAME_URL := "https://nimjump.zetashare.com"     # <-- oyunun public URL'i (share/replay/VS invite linkleri)
 
 # Local-dev-only last-resort values. These are intentionally NOT "the"
 # production backend — real deployments must set NIMJUMP_API_BASE / --api=
@@ -66,9 +70,21 @@ func game_url() -> String:
 	return _game_cached
 
 ## Called when backend returns game_url (stats, config, etc).
+##
+## BUG FIX ("invite link sometimes showed a different host than other times"):
+## a stale/misconfigured backend game_url used to OVERRIDE our own compiled
+## public URL here, so VS invite / share links flipped between hosts depending
+## on whether the stats response had landed yet. The compiled PROD_GAME_URL is
+## the single source of truth for a production build — never let a server value
+## replace it. We only accept a server-provided URL when there is NO compiled
+## default at all (an unknown/dev build) and nothing has been resolved yet.
 func set_game_url(url: String) -> void:
 	url = _trim_slash(url.strip_edges())
-	if url != "":
+	if url == "":
+		return
+	if PROD_GAME_URL.strip_edges() != "" or PROD_BASE.strip_edges() != "":
+		return  # compiled canonical URL wins — ignore the server override
+	if _game_cached == "":
 		_game_cached = url
 
 func replay_url(session_id: String) -> String:
@@ -306,6 +322,14 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 			msg = "I scored %d in NimJump! Can you beat me? %s" % [score, url]
 	# Avoid duplicating the URL when the message already contains it.
 	var full := msg if url != "" and url in msg else msg + "\n" + url
+	# For navigator.share() we pass the link separately in the `url` field, so the
+	# shared TEXT must NOT also contain it — otherwise share targets that append
+	# the url to the text end up showing the link TWICE ("Watch my replay: <url>
+	# <url>"). Strip the url out of the text for the native-share path; `full`
+	# (used for the clipboard/banner fallback) still carries it exactly once.
+	var share_text := msg
+	if url != "" and url in share_text:
+		share_text = share_text.replace(url, "").strip_edges()
 	if OS.has_feature("web"):
 		var toast_cb := JavaScriptBridge.create_callback(_on_share_toast)
 		var banner_cb := JavaScriptBridge.create_callback(_on_share_banner)
@@ -439,7 +463,7 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 					tryClipboard();
 				}
 			})();
-		""" % [JSON.stringify(url), JSON.stringify(msg), JSON.stringify(full)]
+		""" % [JSON.stringify(url), JSON.stringify(share_text), JSON.stringify(full)]
 		JavaScriptBridge.eval(js, true)
 	else:
 		DisplayServer.clipboard_set(full)

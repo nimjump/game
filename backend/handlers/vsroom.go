@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"math"
-	"os"
 	"strconv"
 
 	"github.com/valyala/fasthttp"
@@ -424,11 +423,9 @@ func (s *Server) handleAdminVSRoomReopen(ctx *fasthttp.RequestCtx) {
 // (not the long internal ID) — "?vs=1903". The backend resolves that code back
 // to the room on the GET route (see handleVSRoomGet).
 func vsRoomInviteURL(shortCode string) string {
-	baseURL := os.Getenv("GAME_URL")
-	if baseURL == "" {
-		baseURL = "https://nimjump.io"
-	}
-	return fmt.Sprintf("%s/?vs=%s", baseURL, shortCode)
+	// Single source of truth (handlers/origin.go gameURL()) — one place resolves
+	// the game URL for the whole backend.
+	return fmt.Sprintf("%s/?vs=%s", gameURL(), shortCode)
 }
 
 func vsRoomMemoForRole(roomID, role string) string {

@@ -186,7 +186,7 @@
 
   <!-- ── DEV MODE ──────────────────────────────────────────────────────────────
        Add ?dev to URL to enable debug overlay, FPS counter, and verbose logs.
-       Example: https://nimjump.io/?dev
+       Example: https://nimjump.zetashare.com/?dev
        In production nothing extra is loaded or visible.
   ─────────────────────────────────────────────────────────────────────────── -->
   <script data-cfasync="false">
@@ -542,7 +542,14 @@
   <script data-cfasync="false">
   (function() {
     var _sounds  = {};
-    var _busVol  = { BGM:0.55, SFX_Jump:0.85, SFX_Damage:0.90, Master:1.0 };
+    // BUG FIX: Master default here was 1.0, but Main.gd's fresh-user default
+    // is 0.5 (see _volume var). Godot's _apply_audio_settings() overwrites
+    // this with the real value on every boot, so in the normal case it never
+    // mattered — but keeping the two in sync removes any window (e.g. a sound
+    // firing before Godot's WASM finishes booting and calling _gdSetBus) where
+    // a fresh user could hear full-volume audio instead of the intended
+    // quieter default.
+    var _busVol  = { BGM:0.55, SFX_Jump:0.85, SFX_Damage:0.90, Master:0.5 };
     var _busMute = { BGM:false, SFX_Jump:false, SFX_Damage:false, Master:false };
     var _unlocked = false;
 
@@ -634,8 +641,29 @@
       }
       return ''; // nothing resolved — deep link will be built without a host
     }
+    // BUG FIX: resolveGameHost() above only ever returns the bare host
+    // (nimjump.zetashare.com) — it strips protocol/trailing-slash on
+    // purpose, but callers then used ONLY that host for the deep link,
+    // silently dropping the current page's own path+query string (e.g.
+    // "?vs=id"). That's exactly the param that identifies the session/
+    // referral/auto-payout trigger, so whoever tapped the button while on
+    // nimjump.zetashare.com?vs=id got dropped into Nimiq Pay at the bare
+    // host with no ?vs=id at all — no session id, no auto NIM payout.
+    // Fix: append the CURRENT page's pathname+search (not just re-derive
+    // from ?game_url=, which may not even be present) onto the resolved
+    // host, so the deep link reopens the exact same URL+params inside
+    // Nimiq Pay. Left unencoded on purpose — matches the existing
+    // "url=" + host concatenation style below (Nimiq Pay's own deep-link
+    // parser expects the raw url, not a URI-encoded one), and since this
+    // is the LAST/only param on the nimiqpay:// scheme, the embedded "?"
+    // and "&" from our own query string don't collide with anything.
+    function currentPathAndQuery() {
+      try { return window.location.pathname + window.location.search; }
+      catch(e) { return ''; }
+    }
     var _host = resolveGameHost();
-    var DEEP_LINK = _host ? ('nimiqpay://miniapp?url=' + _host) : '';
+    var _target = _host ? (_host + currentPathAndQuery()) : '';
+    var DEEP_LINK = _target ? ('nimiqpay://miniapp?url=' + _target) : '';
     try { if (sessionStorage.getItem('nq_banner_dismissed')==='1') return; } catch(e) {}
 
     // We're already inside Nimiq Pay if either the host injects window.nimiqPay,
@@ -744,6 +772,108 @@
       banner.appendChild(txt); banner.appendChild(open); banner.appendChild(cls);
       if (document.body) document.body.appendChild(banner);
       else document.addEventListener('DOMContentLoaded',function(){document.body.appendChild(banner);});
+    }
+
+    // ── AUTO-REDIRECT when the URL already carries params ───────────────────
+    // If the page was opened with query params (e.g. nimjump.zetashare.com
+    // ?vs=id — a referral/session id that should drive an automatic NIM
+    // payout), don't make the player notice+tap the top banner's "Open"
+    // button first. Jump straight to a centered "Opening Nimiq Pay…" popup
+    // AND fire the deep link immediately, in the background, on load. The
+    // popup stays up as visible confirmation something is happening (and as
+    // a manual fallback button) while window.location.href does its thing;
+    // same deferred-deep-link check as the banner's button (still visible
+    // after ~1.2s -> Nimiq Pay isn't installed -> swap to the install
+    // popup) so a player without the app doesn't just see a popup that
+    // silently never resolves.
+    function hasForwardableParams() {
+      try { return window.location.search.length > 1; } catch(e) { return false; }
+    }
+    function showAutoRedirectPopup() {
+      if (document.getElementById('nq-auto-redirect')) return;
+      var overlay = document.createElement('div');
+      overlay.id = 'nq-auto-redirect';
+      overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;background:rgba(0,0,0,.6);' +
+        'display:flex;align-items:center;justify-content:center;font-family:sans-serif;padding:24px;box-sizing:border-box';
+      var card = document.createElement('div');
+      card.style.cssText = 'background:#1a1a2e;color:#fff;border-radius:16px;padding:24px;max-width:340px;' +
+        'width:100%;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.5)';
+      var title = document.createElement('div');
+      title.textContent = 'Opening Nimiq Pay…';
+      title.style.cssText = 'font-size:18px;font-weight:bold;margin-bottom:10px';
+      var body = document.createElement('div');
+      body.textContent = "Taking you to Nimiq Pay to claim your NIM reward. If nothing happens, tap below.";
+      body.style.cssText = 'font-size:14px;line-height:1.4;color:#cfd0e0;margin-bottom:18px';
+      var openBtn = document.createElement('button');
+      openBtn.textContent = 'Open Nimiq Pay ↗';
+      openBtn.style.cssText = 'background:#f6b221;color:#1a1a2e;border:none;border-radius:10px;' +
+        'padding:12px 20px;font-weight:bold;font-size:15px;cursor:pointer;width:100%;margin-bottom:10px';
+      openBtn.onclick = function(){ if (DEEP_LINK) window.location.href = DEEP_LINK; };
+      var closeBtn = document.createElement('button');
+      closeBtn.textContent = 'Continue on web';
+      closeBtn.style.cssText = 'background:transparent;color:#9a9ab0;border:none;font-size:14px;cursor:pointer;padding:6px';
+      closeBtn.onclick = function(){
+        overlay.remove();
+        try { sessionStorage.setItem('nq_banner_dismissed', '1'); } catch(e) {}
+      };
+      card.appendChild(title); card.appendChild(body); card.appendChild(openBtn); card.appendChild(closeBtn);
+      overlay.appendChild(card);
+      // No backdrop-tap-to-dismiss here (unlike showInstallPopup/showBanner)
+      // — this popup represents an in-flight automatic action the player
+      // didn't have to ask for, an accidental tap outside it shouldn't
+      // silently cancel the payout attempt. "Continue on web" is the
+      // explicit, intentional way out.
+      document.body.appendChild(overlay);
+    }
+    function tryAutoRedirect() {
+      if (!hasForwardableParams() || insideNimiqPay() || !DEEP_LINK) return false;
+      // BUG FIX: the very first insideNimiqPay() check above can run before
+      // the native host has actually injected window.nimiqPay yet (that
+      // check above is synchronous, right at load) — the flag can still
+      // land a beat later. Firing the popup+redirect immediately on that
+      // false negative, then correcting a moment later once the flag shows
+      // up, is exactly what caused the "Open Nimiq Pay" popup to flash on
+      // screen for a fraction of a second and then vanish — technically
+      // correct (nothing wrong happened, no incorrect install-prompt), but
+      // visually looks like a glitch. Fix: give window.nimiqPay a brief,
+      // silent grace window (300ms, checked every 50ms) to show up BEFORE
+      // we ever create the popup or touch window.location — a real "not
+      // inside Nimiq Pay" case barely feels the extra 300ms, but a
+      // just-opened-inside-Nimiq-Pay case never sees the popup flash at all.
+      var _checks = 0, _maxChecks = 6; // 6 * 50ms = 300ms
+      var _grace = setInterval(function(){
+        _checks++;
+        if (insideNimiqPay()) { clearInterval(_grace); return; } // confirmed inside within the grace window -> do nothing, no flash
+        if (_checks >= _maxChecks) {
+          clearInterval(_grace);
+          showAutoRedirectPopup();
+          window.location.href = DEEP_LINK;
+          setTimeout(function(){
+            // Re-check once more before falling back to the install popup —
+            // same reasoning as above, just a second, later checkpoint.
+            if (insideNimiqPay()) {
+              var already = document.getElementById('nq-auto-redirect');
+              if (already) already.remove();
+              return;
+            }
+            if (document.visibilityState === 'visible') {
+              var el = document.getElementById('nq-auto-redirect');
+              if (el) el.remove();
+              showInstallPopup();
+            }
+          }, 1200);
+        }
+      }, 50);
+      return true;
+    }
+    // Params present -> ALSO kick off the auto-redirect popup, but this
+    // must NOT skip the banner logic below — the banner ("Play in Nimiq
+    // Pay & earn 2x NIM rewards") stays the one always-on signal whenever
+    // we're not inside Nimiq Pay, param or no param. The two are additive,
+    // not either/or.
+    if (hasForwardableParams()) {
+      if (document.body) tryAutoRedirect();
+      else document.addEventListener('DOMContentLoaded', tryAutoRedirect);
     }
 
     // Wait for the SDK's definitive result instead of guessing off a fixed delay.

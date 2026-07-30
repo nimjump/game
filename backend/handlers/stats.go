@@ -10,7 +10,6 @@ package handlers
 
 import (
 	"log"
-	"os"
 	"strconv"
 	"time"
 
@@ -167,10 +166,9 @@ func (s *Server) handleStats(ctx *fasthttp.RequestCtx) {
 		playerID[:min8(playerID)], bestScore, totalGames, rank,
 		capStats.EarnedToday, capStats.Cap)
 
-	gameURL := os.Getenv("GAME_URL")
-	if gameURL == "" {
-		gameURL = "https://nimjump.io"
-	}
+	// Single source of truth (handlers/origin.go) — never a per-file hardcoded
+	// default that could go stale and leak into every link via set_game_url.
+	gURL := gameURL()
 
 	// ── Daily login streak ──────────────────────────────────────────────────
 	streak := s.Store.GetStreak(playerID)
@@ -181,7 +179,7 @@ func (s *Server) handleStats(ctx *fasthttp.RequestCtx) {
 		"nickname":        nick,
 		"best_score":      bestScore,
 		"best_session_id": bestSessionID,
-		"game_url":        gameURL,
+		"game_url":        gURL,
 		"total_games":     totalGames,
 		"total_ticks":     totalTicks,
 		"total_kills":     totalKills,

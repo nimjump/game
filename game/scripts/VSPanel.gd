@@ -78,7 +78,7 @@ var _current_room : Dictionary = {}
 var _detail_timer : Timer = null
 var _pending_open_room_id : String = ""   # deep-link target, applied once auth is ready
 var _viewing_room_id : String = ""        # room whose detail is on screen (set BEFORE its
-                                          # fetch resolves) so late auth/player-id syncs don't
+										  # fetch resolves) so late auth/player-id syncs don't
                                           # re-render the list on top of an opening detail view
 var _avatar_tex_cache : Dictionary = {}   # address+size key → fallback ImageTexture
 var _nimiq_avatar_cache : Dictionary = {} # address+size key → REAL loaded identicon ImageTexture
@@ -111,7 +111,8 @@ func _display_name(nickname: String, address: String) -> String:
 ## (ApiConfig.game_url — window.NJ_GAME_URL_BASE or the compiled prod URL), so
 ## it always points at wherever the game is ACTUALLY served, obeying the same
 ## global game-URL rule everything else uses — instead of the backend's
-## possibly-stale GAME_URL env fallback (which was hard-defaulting to nimjump.io).
+## possibly-stale GAME_URL env fallback (which used to hard-default to a
+## stale placeholder domain instead of the real production one).
 ## Falls back to the backend's invite_url only if the short code is missing.
 func _room_invite_url(r: Dictionary) -> String:
 	var base := ApiConfig.game_url().strip_edges()
@@ -121,8 +122,9 @@ func _room_invite_url(r: Dictionary) -> String:
 	if base != "" and short_code != "":
 		return base + "?vs=" + short_code
 	# Fallback: the backend invite_url carries the correct "?vs=CODE" query, but
-	# its HOST is the backend's GAME_URL env default (nimjump.io) — swap that host
-	# for the client's own resolved game URL so the link never leaks nimjump.io.
+	# its HOST is whatever the backend's GAME_URL env var defaults to (which can
+	# be a stale/placeholder domain) — swap that host for the client's own
+	# resolved game URL so the link never leaks that stale backend default.
 	var backend_url := str(r.get("invite_url", ""))
 	if base != "":
 		var q := backend_url.find("?")

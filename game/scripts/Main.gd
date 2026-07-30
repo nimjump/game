@@ -27,7 +27,8 @@ var _status_poll_timer : Timer = null
 const _STATUS_POLL_SEC := 25.0
 
 var _muted      := false
-var _volume     := 1.0
+var _volume     := 0.5   # default for a fresh user — was 1.0 (full). Anyone with
+						  # saved settings still loads their own value via _load_settings.
 # iOS never supports the Vibration API (Safari/WKWebView have no navigator.vibrate,
 # and it's never coming — Apple has no plans to implement it). Detected once at
 # startup so the settings toggle can be shown-but-disabled instead of a toggle
@@ -104,6 +105,18 @@ var _settings_rebuilding := false  # re-entrancy guard for _rebuild_settings_if_
 var _settings_closing    := false  # true while _close_settings()'s fade-out tween is running
 var _nick_overlay      : Control   # tam ekran nickname düzenleme overlay'i
 var _onboarding_overlay : Control = null   # ilk açılışta bir kez gösterilen "nasıl oynanır" katmanı
+# BUG FIX: this overlay used to live inside _ui_root/_ui_layer. On web, the
+# first second after page load can fire several viewport-resize events in a
+# row (browser chrome / URL bar / safe-area settling) — each one runs
+# _on_viewport_resized()'s debounced teardown+rebuild of _ui_layer, which
+# frees this overlay along with everything else, and _maybe_show_onboarding()
+# at the end of _build_start_ui() just builds a brand-new one, re-centered on
+# whatever (possibly not-yet-settled) width that particular rebuild saw. The
+# visible result was the "Welcome to NimJump" card visibly jumping left/right
+# a couple of times right at startup. Fix: give it its own CanvasLayer,
+# parented directly under Main instead of under _ui_root, so a UI
+# teardown/rebuild never touches it — it's built once and stays put.
+var _onboarding_layer   : CanvasLayer = null
 var _streak_badge      : Control = null   # lobide sürekli görünen "🔥 N" streak rozeti
 var _streak_badge_lbl  : Label   = null
 # Claimable NIM reward — see backend/game/streak_reward.go. NOT auto-paid;
@@ -120,7 +133,7 @@ var _volume_slider     : HSlider
 var _sound_icon        : TextureRect
 var _settings_char_lbl : Label
 
-const CHAR_NAMES := ["Bunny 1", "Bunny 2", "Bunny 3", "Bunny 4", "Bunny 5"]
+const CHAR_NAMES := ["Cocoa", "Lilac", "Specs", "Topper", "Rosie"]
 const CHAR_DESCS := ["Fast + Light", "Heavy + Strong", "Balanced", "Strong + Slow", "Light + Bouncy"]
 
 var _powerup_slots : Array[Dictionary] = []
@@ -207,9 +220,9 @@ var _auth_token     : String:
 var _vs_badge_lbl   : Label = null   # red "it's your turn" count on the VS tab
 var _vs_badge_timer : Timer = null   # polls the pending-count endpoint
 var _vs_countdown_pending := false   # true while a VS round's level is built but
-                                     # frozen behind the 3-2-1 countdown, so
-                                     # _on_gm_ready must NOT auto-activate the
-                                     # player yet (we activate on "GO" instead)
+									 # frozen behind the 3-2-1 countdown, so
+									 # _on_gm_ready must NOT auto-activate the
+									 # player yet (we activate on "GO" instead)
 var _player_nickname: String = ""  # chosen display name (from /backend/nickname)
 var _nickname_cooldown_end: int = 0 # unix: can't change nickname until this
 var _avatar_tex     : ImageTexture = null
@@ -338,6 +351,7 @@ func _ready() -> void:
 			// their "tilt in degrees-equivalent" the same way instead of web
 			// alone paying the fusion-latency tax.
 			window._gyroRaw      = 0;
+			window._gyroSmooth   = 0;
 			window._gyroDir      = 0;
 			window._gyroBase     = 0;
 			window._gyroCalibN   = 0;
@@ -390,6 +404,19 @@ func _ready() -> void:
 					// the negation and uses the raw value directly.
 					var g = (_gyroIsIOS ? 1 : -1) * (acc.x / 9.8) * 90.0;
 					window._gyroRaw = g;
+					// BUG FIX (iOS'ta sağ/sol takılıyor, sıçrıyordu): raw
+					// accelerationIncludingGravity is genuinely noisier on iOS/
+					// WebKit than the fused deviceorientation angle we deliberately
+					// moved away from for latency (see LATENCY FIX above) — a hand
+					// tremor, phone vibration, or just holding it loosely produces
+					// single-sample spikes that used to go straight into `tilted`
+					// and could flip _gyroDir back and forth every other frame
+					// ("takılıyor, dönüyor" symptom). A light EMA low-pass here
+					// smooths those spikes out while staying fast enough (devicemotion
+					// fires ~60Hz, alpha=0.5 settles in ~2-3 samples, <50ms) that it
+					// doesn't reintroduce the fusion-filter lag this code originally
+					// moved away from.
+					window._gyroSmooth = window._gyroSmooth + (g - window._gyroSmooth) * 0.5;
 					// Fast calibration: first 15 events, but only once the
 					// post-listener-start grace window (see _startGyroListener's
 					// doc comment above) has passed — skip samples that land
@@ -399,7 +426,7 @@ func _ready() -> void:
 						window._gyroBase = g * a + window._gyroBase * (1 - a);
 						window._gyroCalibN++;
 					}
-					var tilted = g - window._gyroBase;
+					var tilted = window._gyroSmooth - window._gyroBase;
 					// TUNING: was 3.5° — twitchy in practice on a real phone (a small
 					// hand tremor or resting tilt was enough to flip direction).
 					// Bumped to 5.0° (with the same 0.5x hysteresis ratio, so the
@@ -443,7 +470,20 @@ func _ready() -> void:
 		# Pre-compile getter functions — called per frame with zero string parsing
 		JavaScriptBridge.eval("""
 			window._getGyroDir = function(){ return window._gyroPermDenied ? 0 : (window._gyroDir|0); };
-			window._getGyroRaw = function(){ return +(window._gyroRaw||0); };
+			// BUG FIX: this used to return window._gyroRaw (the true unsmoothed
+			// instantaneous sample) — but real gameplay direction is computed
+			// from window._gyroSmooth - window._gyroBase (see the EMA smoothing
+			// fix above), not from the raw value at all. Two callers read this:
+			// the calibration screen's live degree label (cosmetic, but should
+			// show what the game actually sees, not a noisier number) and,
+			// more importantly, the "Set Zero Now" button, which feeds this
+			// straight into _setGyroBase() as the new baseline. Zeroing against
+			// the raw value while gameplay reads the smoothed value meant a
+			// single noisy sample at the exact instant someone tapped "Set Zero
+			// Now" could bake a small permanent offset into their calibration.
+			// Returning the smoothed value here makes calibration consistent
+			// with what gameplay actually measures.
+			window._getGyroRaw = function(){ return +(window._gyroSmooth||0); };
 			window._getGyroBase = function(){ return +(window._gyroBase||0); };  // "Auto Set" reads this back after re-averaging
 			window._getTapDir  = function(){
 				var t = window._activeTouches;
@@ -1452,6 +1492,10 @@ func _set_nickname_async(nickname: String, token: String, on_done: Callable) -> 
 var _resize_token   : int   = 0     # BUG FIX: see _on_viewport_resized's debounce comment
 var _last_vw_real   : float = 0.0   # klavye olmadan son gerçek genişlik
 var _last_vh_real   : float = 0.0   # klavye olmadan son gerçek yükseklik
+var _reopen_tab_after_resize : String = ""  # tab that was open when a rotation
+											# rebuilt the UI — reopened at the new
+											# size so panels re-lay-out instead of
+											# dumping the player back to the menu
 
 func _on_viewport_resized() -> void:
 	var vp    := get_viewport()
@@ -1513,30 +1557,36 @@ func _on_viewport_resized() -> void:
 	# İkisi de değiştiyse gerçek resize sayılır
 	var is_real_resize := (w_changed and h_changed) or (w_changed and not h_changed)
 
-	# Bir panel (VS, Quest, Stats, Leaderboard) tüm ekranı kaplayarak açıkken
-	# alttaki ana menüyü yıkıp yeniden kurmak riskli (task #64'ün crash'i) —
-	# o yüzden hâlâ yapmıyoruz. AMA panelin kendi İÇİ (ikon/font/margin
-	# boyutları) sadece panel ilk açıldığında hesaplanan sabit `ref` değerini
-	# kullanıyor — döndürme gerçek bir yön değişikliğiyse (klavye değil) o
-	# `ref` artık yanlış, ve panel HİÇ yeniden kurulmadığı için bazı öğeler
-	# (anchor'lı pozisyonlar) doğru yerleşirken bazıları (sabit piksel boyut/
-	# font) eski haliyle takılı kalıyor — "bazıları güncelleniyor bazıları
-	# olmuyor" hatası tam bu. Güvenli çözüm: gerçek yön değişikliğinde açık
-	# paneli kapat (içeriği bozmadan) — kullanıcı sekmeye tekrar dokunduğunda
-	# panel sıfırdan, doğru ref ile kurulur. Küçük/klavye kaynaklı
-	# değişikliklerde panel açık kalır, sadece _vw/_vh güncellenir.
+	# A panel (VS/Quest/Stats/Leaderboard) is open full-screen. Its inner sizes
+	# (icons/fonts/margins) were computed once from the `ref` at open time, so a
+	# real orientation change makes that ref stale and the panel half-updates
+	# ("some elements reflow, some stay stuck"). We fix this by doing the SAME
+	# safe teardown+rebuild as the menu — free the panel first (never rebuild the
+	# menu under a still-live panel, that was task #64's crash), rebuild at the
+	# new size, then reopen the same tab (see after _build_start_ui). On a minor/
+	# keyboard-driven change we leave the open panel untouched and just sync sizes.
+	var _open_panel_found := false
 	for panel in [_vs_panel, _quest_panel, _stats_panel, _leaderboard_panel, _streak_panel]:
 		if is_instance_valid(panel) and panel.visible:
-			_vw  = new_w
-			_vh  = new_h
-			_ref = minf(minf(_vw, _vh), GameConstants.VW)
-			if is_real_resize and panel.has_method("hide_panel"):
-				panel.call("hide_panel")
-				_last_vw_real = new_w
-				_last_vh_real = new_h
-			return
+			_open_panel_found = true
+			break
 
-	if not is_real_resize:
+	if _open_panel_found:
+		_vw  = new_w
+		_vh  = new_h
+		_ref = minf(minf(_vw, _vh), GameConstants.VW)
+		if not is_real_resize:
+			return   # keyboard / minor change — leave the open panel as-is
+		# Real rotation with a panel open: remember which tab it was so we can
+		# bring it straight back at the new size after the rebuild below —
+		# "rotate and it just re-lays-out" instead of closing on the player.
+		# (_active_tab is "" for the streak/customize overlays, which aren't
+		# bottom-bar tabs — those simply close, same as before.)
+		_reopen_tab_after_resize = _active_tab
+		_last_vw_real = new_w
+		_last_vh_real = new_h
+		# fall through to the debounced teardown + rebuild
+	elif not is_real_resize:
 		return
 
 	_last_vw_real = new_w
@@ -1563,7 +1613,10 @@ func _on_viewport_resized() -> void:
 	# olduğunu görüp hiçbir şey yapmadan çıkar.
 	_resize_token += 1
 	var _my_resize_token := _resize_token
-	await get_tree().create_timer(0.3).timeout
+	# 150ms: long enough to coalesce a burst of resize events (dragging a window
+	# edge, the orientation-change settle), short enough that a rotate feels
+	# instant rather than laggy.
+	await get_tree().create_timer(0.15).timeout
 	if _my_resize_token != _resize_token:
 		return
 	# UI'ı teardown + rebuild
@@ -1592,6 +1645,21 @@ func _on_viewport_resized() -> void:
 	if is_instance_valid(_vs_panel):         _vs_panel.free();         _vs_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_customize_panel):  _customize_panel.free();  _customize_panel = null  # determinism-ok: same viewport-resize rebuild as the other panels above
 	_build_start_ui()
+
+	# Bring back the panel that was open before this rotation, now rebuilt at the
+	# new orientation's size — so turning the phone re-lays-out the panel in place
+	# instead of kicking the player back to the lobby. _build_start_ui() already
+	# rebuilt quests/leaderboard/stats/streak; VS is (re)built lazily by
+	# _open_vs_panel(). Guarded to the four bottom-bar tabs.
+	if _reopen_tab_after_resize != "":
+		var _rt := _reopen_tab_after_resize
+		_reopen_tab_after_resize = ""
+		_set_active_tab(_rt)
+		match _rt:
+			"quests":      if is_instance_valid(_quest_panel):       _quest_panel.call("show_panel")
+			"leaderboard": if is_instance_valid(_leaderboard_panel): _leaderboard_panel.call("show_panel")
+			"stats":       if is_instance_valid(_stats_panel):       _stats_panel.call("show_panel")
+			"vs":          _open_vs_panel()
 
 
 func _check_landscape() -> void:
@@ -3395,6 +3463,13 @@ func _build_vs_panel() -> void:
 func _start_vs_round(room_id: String, role: String, seed_str: String) -> void:
 	if _started: return
 
+	# See _rearm_gyro_if_needed()'s doc comment — VS matches are a separate
+	# live-gameplay entry point from Play/_on_play_pressed() and were missing
+	# this entirely, which is exactly why gyro could work from the main lobby
+	# but not from a VS room after a fresh reload.
+	await _rearm_gyro_if_needed()
+	if _started: return
+
 	if _auth_token == "":
 		print("[VS] play pressed — not signed in, requesting auth")
 		if is_instance_valid(_nimiq_bridge) and not _nimiq_bridge.auth_verified:
@@ -3775,7 +3850,8 @@ func _build_settings_popup() -> void:
 	# icon_key: "icon_sound_on" için volume seviyesine göre volume-2/volume-x seçer,
 	#           "icon_music" için music ikonu sabit kalır.
 	var _make_sound_row := func(label: String, enabled: bool, volume: float,
-			on_toggle: Callable, on_volume: Callable, icon_key: String = "icon_sound_on") -> HSlider:
+			on_toggle: Callable, on_volume: Callable, icon_key: String = "icon_sound_on",
+			get_enabled: Callable = Callable()) -> HSlider:
 		var row_vbox := VBoxContainer.new()
 		row_vbox.add_theme_constant_override("separation", int(_p(0.004)))
 		row_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -3800,7 +3876,7 @@ func _build_settings_popup() -> void:
 			return at2.get("icon_sound_on", "")
 
 		var row_ic : TextureRect = null
-		var ic_path : String = _row_icon_path.call(enabled, volume)
+		var ic_path : String = _row_icon_path.call(enabled and not _muted, volume)
 		if ResourceLoader.exists(ic_path):
 			row_ic = TextureRect.new()
 			row_ic.texture = load(ic_path)
@@ -3819,11 +3895,22 @@ func _build_settings_popup() -> void:
 
 		var toggle := CheckButton.new()
 		UITheme.apply_toggle_button(toggle)
-		toggle.button_pressed = enabled
+		# Match the master-toggle handler below: if Sound is already off at
+		# the moment this panel is first built (e.g. loaded muted from a
+		# saved setting), show this row as off too instead of contradicting
+		# the master right out of the gate — the real `enabled` state is
+		# untouched, still readable via this row's "get_enabled" getter, and
+		# gets restored the moment master is switched back on.
+		toggle.button_pressed = enabled and not _muted
+		toggle.disabled       = _muted
 		toggle.toggled.connect(on_toggle)
 		row.add_child(toggle)
 
 		var slider := HSlider.new()
+		# Lets the master-toggle handler below (which dims ALL per-sound
+		# sliders at once) check each slider's own row toggle instead of
+		# blindly re-enabling it — see that handler's comment.
+		slider.set_meta("row_toggle", toggle)
 		slider.min_value = 0.0; slider.max_value = 1.0
 		slider.step = 0.01;     slider.value = volume
 		slider.custom_minimum_size   = Vector2(0, int(_p(0.014)))
@@ -3840,8 +3927,10 @@ func _build_settings_popup() -> void:
 					row_ic.texture  = load(np)
 					row_ic.modulate = ICON_ORANGE
 		)
-		# per-toggle: icon güncelle + dim
-		toggle.toggled.connect(func(p: bool):
+		# per-toggle: icon güncelle + dim. Named (not an inline lambda passed
+		# straight to .connect) so the master-toggle handler below can also
+		# call it directly — see that handler's comment for why.
+		var _refresh_row_visual := func(p: bool):
 			var active := p and not _muted
 			slider.editable   = active
 			slider.modulate.a = 1.0 if active else 0.4
@@ -3850,7 +3939,9 @@ func _build_settings_popup() -> void:
 				if ResourceLoader.exists(np):
 					row_ic.texture  = load(np)
 					row_ic.modulate = ICON_ORANGE
-		)
+		toggle.toggled.connect(_refresh_row_visual)
+		slider.set_meta("refresh_row_visual", _refresh_row_visual)
+		slider.set_meta("get_enabled", get_enabled)
 		row_vbox.add_child(slider)
 		return slider
 
@@ -3876,7 +3967,8 @@ func _build_settings_popup() -> void:
 			_bgm_volume = v
 			_apply_audio_settings()
 			_save_settings(),
-		"icon_music"
+		"icon_music",
+		func(): return _bgm_enabled
 	) as HSlider)
 
 	# ── Effects başlığı ──
@@ -3890,20 +3982,61 @@ func _build_settings_popup() -> void:
 	_per_sliders.append(_make_sound_row.call("Jump", _jump_enabled, _jump_volume,
 		func(p: bool): _jump_enabled = p; _apply_audio_settings(); _save_settings(),
 		func(v: float): _jump_volume = v; _apply_audio_settings(); _save_settings(),
-		"icon_sound_on"
+		"icon_sound_on",
+		func(): return _jump_enabled
 	) as HSlider)
 	_per_sliders.append(_make_sound_row.call("Damage", _damage_enabled, _damage_volume,
 		func(p: bool): _damage_enabled = p; _apply_audio_settings(); _save_settings(),
 		func(v: float): _damage_volume = v; _apply_audio_settings(); _save_settings(),
-		"icon_sound_on"
+		"icon_sound_on",
+		func(): return _damage_enabled
 	) as HSlider)
 
-	# Master toggle — per-sound slider'ları da dim et / aktif et
+	# Master toggle — per-sound toggles/sliders follow it, not just dim.
+	#
+	# UX: master Sound is the common on/off for every channel underneath it
+	# (Music/Jump/Damage) — turning it off should make that obvious at a
+	# glance, not leave the sub-toggles sitting there still reading "ON"
+	# while sound is actually silent (confusing: "why does this still say
+	# on if nothing's playing?"). So turning master OFF now visually flips
+	# every per-sound toggle to OFF too and locks them (can't be tapped
+	# while master is off — there's nothing for an individual toggle to
+	# control when the whole channel is silenced anyway). Turning master
+	# back ON restores each toggle to whatever the player actually had it
+	# set to before (read straight from the live _bgm_enabled/_jump_enabled/
+	# _damage_enabled vars via each row's "get_enabled" meta — these vars
+	# are never touched by this handler, only the toggle's visual/pressed
+	# state is, so nothing here can accidentally overwrite a real
+	# preference) and unlocks them again.
+	#
+	# set_pressed_no_signal is used throughout so flipping these
+	# programmatically never re-fires on_toggle (which would otherwise
+	# overwrite _bgm_enabled/etc with a false value we don't actually mean)
+	# — the visual refresh (icon/slider dim) is instead done by calling
+	# each row's stashed "refresh_row_visual" closure directly.
 	_sound_toggle.toggled.connect(func(p: bool):
 		for s : HSlider in _per_sliders:
-			if is_instance_valid(s):
-				s.editable  = p
-				s.modulate.a = 1.0 if p else 0.4
+			if not is_instance_valid(s):
+				continue
+			var row_toggle : Variant       = s.get_meta("row_toggle", null)
+			var get_enabled : Variant      = s.get_meta("get_enabled", null)
+			var refresh_visual : Variant   = s.get_meta("refresh_row_visual", null)
+			if not (row_toggle is CheckButton):
+				continue
+			var shown_state : bool
+			if p:
+				# Master back on — restore each toggle to its real saved state.
+				shown_state = get_enabled.call() if (get_enabled is Callable) else true
+				row_toggle.disabled = false
+			else:
+				# Master off — show every row as off and lock it. The real
+				# _bgm_enabled/_jump_enabled/_damage_enabled vars are left
+				# alone, only this toggle's displayed state changes.
+				shown_state = false
+				row_toggle.disabled = true
+			row_toggle.set_pressed_no_signal(shown_state)
+			if refresh_visual is Callable:
+				refresh_visual.call(shown_state)
 	)
 
 	# ── Vibration ──────────────────────────────────
@@ -4091,8 +4224,8 @@ func _build_settings_popup() -> void:
 	)
 	gyro_btn.pressed.connect(func():
 		if _control_mode == "gyro": return
-		# Requesting permission here happens on a real user tap (this button
-		# press), which is required for iOS Safari's
+		# Requesting permission here happens on a real user tap (this
+		# confirm button press), which is required for iOS Safari's
 		# DeviceOrientationEvent.requestPermission() gate to succeed at all.
 		#
 		# BUG FIX: this used to set _control_mode = "gyro" and refresh the UI
@@ -4104,17 +4237,37 @@ func _build_settings_popup() -> void:
 		# waits for the real outcome first: only commits to gyro mode if it's
 		# actually usable, otherwise reverts to (and visibly shows) Tap, so a
 		# second press genuinely re-prompts instead of doing nothing.
-		gyro_btn.disabled = true
-		var usable := await _ensure_gyro_js_and_await()
-		if is_instance_valid(gyro_btn): gyro_btn.disabled = false
-		if usable:
-			_control_mode = "gyro"
-		else:
-			_control_mode = "tap"
-			var t := Toast.get_instance()
-			if t: t.show_toast("Motion access denied — enable it in your browser/device settings to use Gyro.", Toast.Kind.WARN)
-		_refresh_ctrl_ui.call()
-		_save_settings()
+		var _on_gyro_confirmed := func():
+			gyro_btn.disabled = true
+			var usable := await _ensure_gyro_js_and_await()
+			if is_instance_valid(gyro_btn): gyro_btn.disabled = false
+			if usable:
+				_control_mode = "gyro"
+			else:
+				_control_mode = "tap"
+				var t := Toast.get_instance()
+				if t: t.show_toast("Motion access denied — enable it in your browser/device settings to use Gyro.", Toast.Kind.WARN)
+			_refresh_ctrl_ui.call()
+			_save_settings()
+		# UX: gyro is genuinely less tested than Tap across real devices —
+		# rather than a toast that flashes by AFTER already switching (easy
+		# to miss, and by then the player's already committed), stop and ask
+		# up front with the same center-screen "are you sure?" confirmation
+		# style used elsewhere in the game (e.g. VSPanel's "Cancel match?").
+		# Only proceeds to the actual permission request if they confirm.
+		# BUG FIX: passing `self` (Main.gd, a plain Node — not a Control or
+		# CanvasLayer) here used to add the confirm overlay OUTSIDE the UI's
+		# actual CanvasLayer (_ui_layer, layer=10) — Godot then draws it in
+		# the default layer-0 canvas, underneath everything in _ui_layer
+		# (including the Settings popup itself), so it visually rendered
+		# behind the panel instead of on top of it. VSPanel's own
+		# confirm_action calls work correctly because `self` there IS
+		# already a descendant of _ui_layer. Using _ui_root (which lives
+		# inside _ui_layer) as the parent here puts the overlay in the same
+		# layer as everything else in the UI, on top like it's supposed to.
+		UITheme.confirm_action(_ui_root, "Are you sure?",
+			"Gyro controls are very experimental and not tested much yet — it may not work well on your device. You can switch back to Tap anytime in Settings.",
+			"Yes", _ref, _on_gyro_confirmed, false)
 	)
 
 	# ── Background Selection ───────────────────────
@@ -4837,10 +4990,16 @@ func _build_onboarding_overlay() -> void:
 	const OB_BROWN  := Color(0.220, 0.130, 0.060)
 	const OB_MID    := Color(0.480, 0.340, 0.200)
 
+	# Own CanvasLayer, parented directly under Main (NOT under _ui_root/_ui_layer)
+	# so a viewport-resize teardown+rebuild of the rest of the menu never frees
+	# or re-centers this — see the doc comment on _onboarding_layer above.
+	_onboarding_layer = CanvasLayer.new()
+	_onboarding_layer.layer = 60   # above the nick overlay (50) and settings popup (20)
+	add_child(_onboarding_layer)
+
 	_onboarding_overlay = Control.new()
 	_onboarding_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
-	_onboarding_overlay.z_index = 60   # above the nick overlay (50) and settings popup (20)
-	_ui_root.add_child(_onboarding_overlay)
+	_onboarding_layer.add_child(_onboarding_overlay)
 
 	var dim := ColorRect.new()
 	dim.color = Color(0, 0, 0, 0.65)
@@ -4880,7 +5039,12 @@ func _build_onboarding_overlay() -> void:
 	vb.add_theme_constant_override("separation", int(_p(0.020)))
 	pc.add_child(vb)
 
-	var mc := _make_margin_container(int(_p(0.036)))
+	# Bumped from 0.036 to keep pace with the larger title/row fonts above —
+	# at the old margin, wrapped row text (and the button) sat too close to
+	# the card's left/right edges. This margin wraps everything in `inner`
+	# (title, all five rows, and the button below), so bumping it once here
+	# keeps all of it evenly inset and visually consistent, edge to edge.
+	var mc := _make_margin_container(int(_p(0.052)))
 	mc.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	vb.add_child(mc)
 
@@ -4891,7 +5055,10 @@ func _build_onboarding_overlay() -> void:
 	var title := Label.new()
 	title.text = "Welcome to NimJump!"
 	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	UITheme.apply_label(title, OB_BROWN, int(_p(0.048)))
+	# Bumped from 0.048 — this card is the very first thing a new player sees,
+	# and at the old size its title and body text read noticeably smaller than
+	# the rest of the game's UI (settings headers, game-over title, etc).
+	UITheme.apply_label(title, OB_BROWN, int(_p(0.064)))
 	inner.add_child(title)
 
 	# Five short lines — controls, goal, the NIM hook, a pointer at the bottom
@@ -4919,13 +5086,13 @@ func _build_onboarding_overlay() -> void:
 		var hb := HBoxContainer.new()
 		hb.add_theme_constant_override("separation", int(_p(0.020)))
 		inner.add_child(hb)
-		var ic := UITheme.lucide_icon(row[0], int(_p(0.040)), OB_BROWN)
+		var ic := UITheme.lucide_icon(row[0], int(_p(0.052)), OB_BROWN)
 		hb.add_child(ic)
 		var txt := Label.new()
 		txt.text = row[1]
 		txt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		txt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		UITheme.apply_label(txt, OB_MID, int(_p(0.028)))
+		UITheme.apply_label(txt, OB_MID, int(_p(0.036)))
 		hb.add_child(txt)
 
 	# Small gap before the button, then the button right under the rows — the
@@ -4940,6 +5107,10 @@ func _build_onboarding_overlay() -> void:
 	got_it.text = "Got it — let's play!"
 	got_it.custom_minimum_size = Vector2(0, int(_p(0.088)))
 	UITheme.apply_play_button(got_it)
+	# restart_btn/replay_btn (game-over panel) use this exact same 0.088 button
+	# height with a 0.034 font — matching that here instead of my earlier 0.066,
+	# which was oversized and threw off the button's centering.
+	got_it.add_theme_font_size_override("font_size", int(_p(0.034)))
 	got_it.pressed.connect(_dismiss_onboarding)
 	inner.add_child(got_it)
 
@@ -5000,13 +5171,15 @@ func _dismiss_onboarding() -> void:
 		JavaScriptBridge.eval("localStorage.setItem('nj_onboarding_seen', '1')", true)
 	if is_instance_valid(_onboarding_overlay):
 		var ov := _onboarding_overlay
+		var ovl := _onboarding_layer
 		var tw := create_tween()
 		if tw:
 			tw.tween_property(ov, "modulate:a", 0.0, 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
-			tw.tween_callback(func(): if is_instance_valid(ov): ov.queue_free())
+			tw.tween_callback(func(): if is_instance_valid(ovl): ovl.queue_free())  # frees ov too, ov is its child
 		else:
-			ov.queue_free()
+			if is_instance_valid(ovl): ovl.queue_free()
 	_onboarding_overlay = null
+	_onboarding_layer   = null
 
 
 func _close_settings() -> void:
@@ -5051,11 +5224,32 @@ func _on_sound_toggled(pressed: bool) -> void:
 	if _volume_slider:
 		_volume_slider.editable = not _muted
 	_apply_audio_settings()
+	# BUG FIX: master mute toggle never called _save_settings() — every other
+	# audio control here (volume slider, per-sound toggles/sliders) saves on
+	# change, but this one only updated the in-memory _muted var. Result: mute
+	# the game, close/reopen (or just a page reload), and _load_settings()
+	# reads the OLD (never-written) value — defaults back to unmuted and sound
+	# plays again. This is the "off ayarladım, aç kapa yaptım yine ses çalıyor"
+	# symptom.
+	_save_settings()
 	if OS.has_feature("web"):
 		if _muted:
 			JavaScriptBridge.eval("if(window._gdSound) window._gdSound('bgm_stop');", true)
-		elif _bgm_enabled and _bgm_started:
-			JavaScriptBridge.eval("if(window._gdSound) window._gdSound('bgm_play');", true)
+			_bgm_started = false
+		elif _bgm_enabled:
+			# BUG FIX: this used to only resend 'bgm_play' if _bgm_started was
+			# ALREADY true — but _start_bgm_if_needed() (see its own doc
+			# comment) now refuses to ever set _bgm_started=true while _muted
+			# is true. So a player who started muted (sound already off on
+			# page load, e.g. from a saved setting) and then unmutes mid-
+			# session would hit neither branch here: not muted anymore, but
+			# _bgm_started still false — music would just never start.
+			# Resetting _bgm_started and going through _start_bgm_if_needed()
+			# (now that _muted is already false above) reuses the exact same
+			# single code path that starts BGM everywhere else instead of
+			# duplicating its logic here.
+			_bgm_started = false
+			_start_bgm_if_needed()
 
 
 func _on_volume_changed(val: float) -> void:
@@ -5115,12 +5309,30 @@ var _audio_unlocked : bool = false
 func _start_bgm_if_needed() -> void:
 	_audio_unlocked = true
 	if not OS.has_feature("web"): return
-	JavaScriptBridge.eval("""
-		if (window._gdSound) {
-			window._gdSound('unlock');
-			window._gdSound('bgm_play');
-		}
-	""", true)
+	# Always send 'unlock' — this just flips the JS-side autoplay-policy gate
+	# open, it doesn't make any sound by itself, so it's safe unconditionally.
+	JavaScriptBridge.eval("if (window._gdSound) window._gdSound('unlock');", true)
+	if _bgm_started:
+		return
+	# BUG FIX: this used to send 'bgm_play' unconditionally too, every single
+	# time this function was called (and it's called from a LOT of places —
+	# any tap on _ui_root, opening the VS panel, pressing Play — with no
+	# "already started" guard on most of those call sites). The only thing
+	# stopping it from being audible while muted was the JS side's own
+	# _busMute/_effVol bookkeeping already being correctly synced by the time
+	# this fired — which depends on ordering that isn't actually guaranteed:
+	# e.g. the very tap that toggles the Sound switch OFF can itself be the
+	# tap that first unlocks audio (see _input()'s "_start_bgm_if_needed()"
+	# hook, which fires for every touch/click/key on the whole viewport,
+	# ahead of the button's own toggled-signal handler running). That race
+	# is exactly the "turned sound off, a match started, music played anyway"
+	# symptom. Checking _muted/_bgm_enabled here in GDScript — the same
+	# source of truth _apply_audio_settings() itself reads — removes the
+	# dependency on JS-side timing entirely: if muted, this simply never
+	# tells JS to play in the first place, no race window left to hit.
+	if _muted or not _bgm_enabled:
+		return
+	JavaScriptBridge.eval("if (window._gdSound) window._gdSound('bgm_play');", true)
 	_bgm_started = true
 	print("[AUDIO] bgm_play sent to JS")
 
@@ -5153,8 +5365,48 @@ func _change_char_settings(dir: int) -> void:
 # ─────────────────────────────────────────────────────
 var _play_waiting_for_auth := false   # true while a Play-triggered auth wait is already pending
 
+## BUG FIX (iOS: "gyro selected, restarted the game, couldn't move at all"):
+## _ensure_gyro_js() — which is what actually starts the JS devicemotion
+## listener, and on iOS is what calls DeviceMotionEvent.requestPermission()
+## — used to only ever get called from the Gyro button's own press handler
+## in Settings, or from opening the calibration screen. Neither of those
+## runs automatically on boot, and neither runs for EVERY way a live match
+## can actually start — originally this was only wired into
+## _on_play_pressed(), which missed VS matches entirely (_start_vs_round()
+## is a separate entry point that never goes through _on_play_pressed() at
+## all). A player who had "gyro" saved as their control mode from a
+## PREVIOUS session (_load_settings() restores _control_mode fine, it's
+## just a string) would load into a brand-new Main.gd instance — after
+## "Play Again" (reload_current_scene), a real page reload, or just opening
+## a VS room fresh — with _control_mode == "gyro" but no JS listener ever
+## (re)started and, on iOS specifically, no permission re-granted for THIS
+## page context (iOS does not persist that grant across a reload — it has
+## to be re-requested from a real user gesture every time). get_control_dir()
+## then silently returns 0 forever: not visibly an error, just a character
+## that never moves. Call this from the START of every real "a live match is
+## about to begin" entry point (Play, VS round start — see call sites) —
+## each of those is itself a real user gesture, same requirement
+## _ensure_gyro_js's iOS branch already relies on. Cheap/harmless if already
+## granted this session — DeviceMotionEvent.requestPermission() resolves
+## immediately without a new native prompt once already granted, and
+## _startGyroListener() itself no-ops if the listener is already attached
+## (see its own window._gyroListenerSet guard). Falls back to Tap for this
+## session only (not saved) if it turns out denied, so the player can still
+## actually play instead of standing still with no explanation.
+func _rearm_gyro_if_needed() -> void:
+	if _control_mode != "gyro": return
+	var _gyro_usable := await _ensure_gyro_js_and_await()
+	if not _gyro_usable:
+		_control_mode = "tap"
+		var _gt := Toast.get_instance()
+		if _gt: _gt.show_toast("Motion access unavailable — switched to Tap for this session.", Toast.Kind.WARN)
+
+
 func _on_play_pressed() -> void:
 	_start_bgm_if_needed()  # ilk etkileşim → BGM başlat
+	if _started: return
+
+	await _rearm_gyro_if_needed()
 	if _started: return
 
 	# Sign-in required — request if no auth, wait again if rejected (game must not start)
@@ -6185,9 +6437,9 @@ func _build_replay_watch_badge(bar_h: float) -> void:
 	st.content_margin_bottom = pad
 	badge.add_theme_stylebox_override("panel", st)
 	badge.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	# Same anchor+grow_direction trick _life_panel uses (see its "PanelContainer
-	# auto-sizes to content — no manual calculation needed" comment above),
-	# just mirrored to the opposite corner: pin a single point at the
+	# Same anchor+grow_direction trick _life_panel uses (auto-size to content,
+	# no manual measurement — see its construction in _build_game()), just
+	# mirrored to the opposite corner: pin a single point at the
 	# bottom-right, inset by edge_pad from the right edge and by
 	# (edge_pad + bar_h) from the bottom (so it sits just above the replay
 	# bar), then GROW_DIRECTION_BEGIN on both axes so the panel expands
@@ -6431,6 +6683,10 @@ func _build_replay_bar() -> void:
 	const C_TRACK  := Color(0.820, 0.760, 0.680)
 	const C_BG     := Color(0.957, 0.898, 0.800)
 	const C_BORDER := Color(0.700, 0.520, 0.340)
+	# Küçük replay butonları için biraz daha yumuşak/açık bir çerçeve tonu —
+	# C_BORDER (panel_bg'nin üst çizgisi için kullanılıyor) kremrengi zemin
+	# üzerinde butonlarda fazla sert/koyu duruyordu.
+	const C_BTN_BORDER := Color(0.800, 0.660, 0.500)
 	var   C_ORANGE := UITheme.COL_ORANGE
 
 	var seek_h  : float = _p(0.028)
@@ -6483,6 +6739,30 @@ func _build_replay_bar() -> void:
 	if ResourceLoader.exists("res://assets/hud/hudX.png"):
 		_tex_x = load("res://assets/hud/hudX.png")
 
+	# ─── ZORLA-BEYAZ İKON SHADER'I ────────────────────────────────────
+	# SORUN: Button'un icon_normal_color / icon_hover_color gibi tema
+	# renkleri ÇARPIMSAL çalışır (modulate). İkon PNG'si zaten siyah/koyu
+	# piksellerden oluşuyorsa (0,0,0), beyazla (1,1,1) çarpsan bile sonuç
+	# yine siyah kalır (0 × 1 = 0) — bu yüzden "beyaz yap" dememize rağmen
+	# ikon siyah görünmeye devam ediyordu.
+	# ÇÖZÜM: kaynak pikselin RGB'sini tamamen YOK SAYIP sadece alfa
+	# (şekil) maskesini kullanan bir shader — ikonun rengini istediğimiz
+	# renge (burada beyaz) SIFIRDAN boyuyor, kaynak renk ne olursa olsun.
+	var _white_icon_shader := Shader.new()
+	_white_icon_shader.code = """
+shader_type canvas_item;
+uniform vec4 tint_color : source_color = vec4(1.0, 1.0, 1.0, 1.0);
+void fragment() {
+	vec4 tex = texture(TEXTURE, UV);
+	COLOR = vec4(tint_color.rgb, tex.a * tint_color.a);
+}
+"""
+	var _mk_icon_mat := func(tint: Color) -> ShaderMaterial:
+		var m := ShaderMaterial.new()
+		m.shader = _white_icon_shader
+		m.set_shader_parameter("tint_color", tint)
+		return m
+
 	var _set_icon := func(b: Button, tex: Texture2D, ic_size: int):
 		b.icon = tex
 		b.text = ""
@@ -6493,19 +6773,31 @@ func _build_replay_bar() -> void:
 		b.add_theme_constant_override("icon_max_height", ic_size)
 
 	var pause_btn : Button = null
-	
+	# Play/pause ikonu artık Button.icon değil, kendi TextureRect'i + beyaz
+	# zorlayan shader — CenterContainer + TextureRect pattern'i (dosyada
+	# zaten kanıtlanmış olan X ikonuyla aynı yaklaşım, satır ~2534).
+	# BUG FIX: bu değişken önceden düz bir `var` idi. GDScript'te lambda'lar
+	# dış scope'taki local değişkenleri TANIMLANDIKLARI ANDAKİ değerle
+	# (kopya) yakalar — sonradan o değişkene yapılan atamayı GÖRMEZLER.
+	# _refresh_pause_icon aşağıda tanımlandığı anda bu değişken hâlâ null'du;
+	# gerçek TextureRect ancak ~300 satır sonra oluşturulup atanıyordu, ama
+	# closure'ın içindeki kopya sonsuza dek null kaldığı için ikon hiçbir
+	# zaman çizilmiyordu (play/pause butonu boş görünüyordu). Dosyada zaten
+	# aynı tuzak için kullanılan tek-elemanlı Array trick'i (bkz. _tick,
+	# _paused, _finished, _drag, _touch_idx, _drag_pct) burada da uygulanıyor:
+	# Array bir referans tipi olduğundan içeriği (index) sonradan değişse de
+	# closure bunu görür.
+	var _pause_icon_rect_holder : Array[TextureRect] = [null]
+
 	var _refresh_pause_icon := func(btn: Button):
 		if not is_instance_valid(btn): return
 		var use_play : bool = _finished[0] or _paused[0]
 		var tex : Texture2D = _tex_play if use_play else _tex_pause
 		if tex == null: return
 		btn.text = ""
-		btn.icon = tex
-		btn.expand_icon = true
-		btn.icon_alignment = HORIZONTAL_ALIGNMENT_CENTER
-		btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_CENTER
-		btn.add_theme_constant_override("icon_max_width", ic_lg)
-		btn.add_theme_constant_override("icon_max_height", ic_lg)
+		btn.icon = null   # native icon kapalı — çizimi TextureRect üstleniyor
+		if is_instance_valid(_pause_icon_rect_holder[0]):
+			_pause_icon_rect_holder[0].texture = tex
 
 	var root := Control.new()
 	root.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
@@ -6685,36 +6977,91 @@ func _build_replay_bar() -> void:
 	hbox.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	content.add_child(hbox)
 
-	var _mk_btn := func(min_w: float) -> Button:
+	# --- UI SKIN: kremrengi/çerçeveli, yuvarlak köşeli buton görünümü —
+	# game over ekranındaki go_btn_row/share_btn şablonuyla AYNI teknik:
+	# SIZE_EXPAND_FILL + size_flags_stretch_ratio (sabit piksel genişliği
+	# YOK), tıpkı restart_btn/replay_btn'in yaptığı gibi. Böylece satır
+	# HER ZAMAN bar genişliğine tam oturur, ekran dar olduğunda bile
+	# sağa/sola taşma olmaz. Bu sadece görsel bir katman (StyleBoxFlat
+	# override) — hiçbir pressed/sinyal mantığına dokunmuyor.
+	var C_PLAY_BORDER := Color(0.780, 0.380, 0.120)  # share_btn ile aynı ton (game over ekranından)
+	var C_PLAY_HOVER  := Color(0.820, 0.450, 0.160)
+	var C_PLAY_PRESS  := Color(0.640, 0.300, 0.080)
+	# Kullanıcı isteği: play/exit butonu daha AÇIK bir turuncu olsun — bu,
+	# seek bar dolgusunda kullanılan C_ORANGE'dan bağımsız, sadece bu
+	# butonlara özel bir ton (seek bar'ın rengi değişmiyor).
+	var C_PLAY_BG_LIGHT := Color(0.851, 0.549, 0.290)
+
+	var _mk_stylebox := func(bg: Color, border: Color, radius: int, border_w: int = 2) -> StyleBoxFlat:
+		var sb := StyleBoxFlat.new()
+		sb.bg_color     = bg
+		sb.border_color = border
+		sb.set_border_width_all(border_w)
+		sb.set_corner_radius_all(radius)
+		return sb
+
+	# ratio_w: go_btn_row'daki gibi orantılı genişlik payı (piksel değil).
+	var _mk_btn := func(ratio_w: float) -> Button:
 		var b := Button.new()
-		b.custom_minimum_size = Vector2(min_w, btn_h)
-		b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		b.custom_minimum_size = Vector2(0, btn_h)   # sadece yükseklik zorunlu — restart_btn şablonu
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		b.size_flags_stretch_ratio = ratio_w
 		b.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 		b.focus_mode = Control.FOCUS_NONE
 		UITheme.apply_button(b)
+		var r := int(btn_h * 0.30)
+		b.add_theme_stylebox_override("normal",  _mk_stylebox.call(C_BG,    C_BTN_BORDER, r, 2))
+		b.add_theme_stylebox_override("hover",    _mk_stylebox.call(C_TRACK, C_BTN_BORDER, r, 2))
+		b.add_theme_stylebox_override("pressed",  _mk_stylebox.call(C_TRACK, C_BTN_BORDER, r, 2))
+		b.add_theme_stylebox_override("disabled", _mk_stylebox.call(C_BG,    C_BTN_BORDER, r, 2))
+		# İkon/ok rengi — kremrengi zemin üzerinde iyi kontrast için koyu kahve.
+		# UITheme.apply_button()'ın verdiği varsayılan ikon rengi (muhtemelen
+		# eski koyu zemine göre ayarlanmıştı) yeni açık zeminle çakışıyordu.
+		b.add_theme_color_override("icon_normal_color",  C_MID)
+		b.add_theme_color_override("icon_hover_color",   C_MID)
+		b.add_theme_color_override("icon_pressed_color", C_MID)
+		b.add_theme_color_override("icon_disabled_color", C_MID)
 		return b
 
-	var _mk_play_btn := func(min_w: float) -> Button:
+	var _mk_play_btn := func(ratio_w: float) -> Button:
 		var b := Button.new()
-		b.custom_minimum_size = Vector2(min_w, btn_h)
+		b.custom_minimum_size = Vector2(0, btn_h)
 		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		b.size_flags_stretch_ratio = ratio_w
 		b.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 		b.focus_mode = Control.FOCUS_NONE
 		UITheme.apply_play_button(b)
+		var r := int(btn_h * 0.34)
+		b.add_theme_stylebox_override("normal",  _mk_stylebox.call(C_PLAY_BG_LIGHT, C_PLAY_BORDER, r, 3))
+		b.add_theme_stylebox_override("hover",    _mk_stylebox.call(C_PLAY_HOVER, C_PLAY_BORDER, r, 3))
+		b.add_theme_stylebox_override("pressed",  _mk_stylebox.call(C_PLAY_PRESS,  C_PLAY_BORDER, r, 3))
+		# Not: ikon rengi artık burada değil — pause_btn'e eklenen ayrı
+		# TextureRect + _white_icon_shader ile garantili beyaz çiziliyor
+		# (bkz. pause_btn oluşturma bloğu, ~satır 6878).
 		return b
 
-	var _mk_ghost_btn := func(min_w: float) -> Button:
+	var _mk_ghost_btn := func(ratio_w: float) -> Button:
 		var b := Button.new()
-		b.custom_minimum_size = Vector2(min_w, btn_h)
-		b.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
+		b.custom_minimum_size = Vector2(0, btn_h)
+		b.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		b.size_flags_stretch_ratio = ratio_w
 		b.size_flags_vertical   = Control.SIZE_EXPAND_FILL
 		b.focus_mode = Control.FOCUS_NONE
 		UITheme.apply_ghost_button(b)
+		var r := int(btn_h * 0.30)
+		b.add_theme_stylebox_override("normal", _mk_stylebox.call(C_BG,    C_BTN_BORDER, r, 2))
+		b.add_theme_stylebox_override("hover",   _mk_stylebox.call(C_TRACK, C_BTN_BORDER, r, 2))
+		b.add_theme_stylebox_override("pressed", _mk_stylebox.call(C_TRACK, C_BTN_BORDER, r, 2))
 		return b
 
-	var side_w : float = btn_h * 1.5
 
-	var bk_btn := _mk_btn.call(side_w) as Button
+
+	# Bu artık piksel değil, go_btn_row şablonundaki gibi ORANTI (stretch ratio):
+	# tüm butonların toplam genişliği ne olursa olsun bar genişliğine tam
+	# oturur — ekran daralsa da taşma olmaz.
+	var side_r : float = 1.0
+
+	var bk_btn := _mk_btn.call(side_r) as Button
 	_set_icon.call(bk_btn, _tex_left, ic_sm)
 	bk_btn.pressed.connect(func():
 		if not is_instance_valid(_gm): return
@@ -6727,7 +7074,23 @@ func _build_replay_bar() -> void:
 	)
 	hbox.add_child(bk_btn)
 
-	pause_btn = _mk_play_btn.call(btn_h * 2.4) as Button
+	pause_btn = _mk_play_btn.call(1.6) as Button
+	# İkonu native Button.icon yerine kendi TextureRect'imizle çiziyoruz —
+	# _white_icon_shader sayesinde renk garantili beyaz (kaynak PNG'nin
+	# rengi ne olursa olsun). X ikonuyla aynı CenterContainer+TextureRect
+	# pattern'i.
+	var pause_center := CenterContainer.new()
+	pause_center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	pause_center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	pause_btn.add_child(pause_center)
+	var _pause_icon_rect := TextureRect.new()
+	_pause_icon_rect.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_pause_icon_rect.expand_mode  = TextureRect.EXPAND_IGNORE_SIZE
+	_pause_icon_rect.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_pause_icon_rect.custom_minimum_size = Vector2(ic_lg, ic_lg)
+	_pause_icon_rect.material = _mk_icon_mat.call(Color(1, 1, 1, 1))
+	pause_center.add_child(_pause_icon_rect)
+	_pause_icon_rect_holder[0] = _pause_icon_rect   # BUG FIX: closure artık bunu görebiliyor
 	pause_btn.pressed.connect(func():
 		if not is_instance_valid(_gm): return
 		if _finished[0]:
@@ -6743,7 +7106,7 @@ func _build_replay_bar() -> void:
 	hbox.add_child(pause_btn)
 	_refresh_pause_icon.call_deferred(pause_btn)
 
-	var fw_btn := _mk_btn.call(side_w) as Button
+	var fw_btn := _mk_btn.call(side_r) as Button
 	_set_icon.call(fw_btn, _tex_right, ic_sm)
 	fw_btn.pressed.connect(func():
 		if not is_instance_valid(_gm): return
@@ -6759,7 +7122,7 @@ func _build_replay_bar() -> void:
 	var _spd_vals : Array[float]  = [1.0, 2.0, 4.0, 0.5]
 	var _spd_lbls : Array[String] = ["1x", "2x", "4x", "0.5x"] 
 
-	var spd_btn := _mk_ghost_btn.call(btn_h * 1.8) as Button
+	var spd_btn := _mk_ghost_btn.call(1.2) as Button
 	spd_btn.text = _spd_lbls[_replay_speed_idx]
 	spd_btn.add_theme_font_size_override("font_size", fs_sm)
 	
@@ -6785,17 +7148,33 @@ func _build_replay_bar() -> void:
 	hbox.add_child(spd_btn)
 	# ------------------------------------
 
+	# UI SKIN: referans görseldeki gibi zaman metnini kendi çerçeveli kutusuna
+	# alıyoruz. tick_lbl nesnesi ve onu güncelleyen kod (aşağıdaki
+	# replay_tick_changed bağlantısı) aynen duruyor — sadece görsel sarmalayıcı.
+	var tick_box := PanelContainer.new()
+	tick_box.custom_minimum_size = Vector2(0, btn_h)   # sadece yükseklik zorunlu
+	tick_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	tick_box.size_flags_stretch_ratio = 1.33
+	tick_box.size_flags_vertical   = Control.SIZE_EXPAND_FILL
+	tick_box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	tick_box.add_theme_stylebox_override("panel", _mk_stylebox.call(C_BG, C_BTN_BORDER, int(btn_h * 0.30), 2))
+	hbox.add_child(tick_box)
+
 	var tick_lbl := Label.new()
 	tick_lbl.text = "0:00 / 0:00"
 	tick_lbl.add_theme_font_size_override("font_size", fs_sm)
 	tick_lbl.add_theme_color_override("font_color", C_MID)
-	tick_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	tick_lbl.horizontal_alignment  = HORIZONTAL_ALIGNMENT_CENTER
 	tick_lbl.vertical_alignment    = VERTICAL_ALIGNMENT_CENTER
 	tick_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
-	hbox.add_child(tick_lbl)
+	tick_box.add_child(tick_lbl)
 
-	var exit_btn := _mk_btn.call(side_w) as Button
+	var exit_btn := _mk_btn.call(side_r) as Button
+	# Kullanıcı isteği: X beyaz + play butonuyla aynı renk şeması (turuncu).
+	var _exit_r := int(btn_h * 0.30)
+	exit_btn.add_theme_stylebox_override("normal",  _mk_stylebox.call(C_PLAY_BG_LIGHT, C_PLAY_BORDER, _exit_r, 2))
+	exit_btn.add_theme_stylebox_override("hover",    _mk_stylebox.call(C_PLAY_HOVER,  C_PLAY_BORDER, _exit_r, 2))
+	exit_btn.add_theme_stylebox_override("pressed",  _mk_stylebox.call(C_PLAY_PRESS,  C_PLAY_BORDER, _exit_r, 2))
 	# Not: Button.icon yalnızca "icon_max_width" ile sınırlanır, "icon_max_height" diye
 	# bir theme constant Godot'ta yok — bu yüzden kare olmayan hudX.png buton sınırlarının
 	# dışına taşabiliyordu. Çözüm: dosyanın başka yerinde (close_ic2, satır ~2534) zaten
@@ -6808,6 +7187,7 @@ func _build_replay_bar() -> void:
 		exit_btn.add_child(x_center)
 		var x_icon := TextureRect.new()
 		x_icon.texture = _tex_x
+		x_icon.material = _mk_icon_mat.call(Color(1, 1, 1, 1))   # garantili beyaz — modulate çarpımsal olduğu için yetersiz kalabiliyordu
 		x_icon.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
 		x_icon.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
 		x_icon.mouse_filter = Control.MOUSE_FILTER_IGNORE

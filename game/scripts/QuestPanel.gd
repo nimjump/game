@@ -299,20 +299,14 @@ func _fetch_quests() -> void:
 
 
 func _claim_quest(quest_id: String, claim_btn: Button) -> void:
-	# Collect ALL claimable quests and send as one batch request
-	var ids : Array[String] = []
-	for q in _quest_data:
-		if q.get("completed", false) and q.get("claimed_at", 0) == 0:
-			ids.append(str(q.get("id", "")))
-	# Make sure the pressed one is in there
-	if not ids.has(quest_id):
-		ids.append(quest_id)
+	# Claim ONLY the quest whose button was pressed — one at a time. (This used
+	# to batch every claimable quest into a single /quests/claim_all request, so
+	# claiming one silently collected them all; each quest is now its own claim.)
+	if quest_id == "":
+		return
 
 	claim_btn.disabled = true
 	claim_btn.text = "Claiming..."
-
-	var body_dict := { "player_id": _player_id, "quest_ids": ids }
-	var body_str  := JSON.stringify(body_dict)
 
 	var http := HTTPRequest.new()
 	http.timeout = 10.0
@@ -327,33 +321,6 @@ func _claim_quest(quest_id: String, claim_btn: Button) -> void:
 		http.queue_free()
 		if _alive.get_ref() == null: return
 		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
-			# BUG FIX: this used to treat any 200 as "all claimed, done" and
-			# just re-fetch — but /quests/claim_all responds 200 with a
-			# per-item results[] array even when SOME items were blocked
-			# (e.g. "ip_account_limit"), the top-level status alone never
-			# reflected that. Surface the first blocked item's reason as a
-			# toast instead of silently pretending everything succeeded.
-			var j := JSON.new()
-			if j.parse(body.get_string_from_utf8()) == OK:
-				var d : Dictionary = j.get_data()
-				var results : Array = d.get("results", [])
-				for r in results:
-					var err_code : String = str(r.get("error", ""))
-					if err_code == "ip_account_limit":
-						Toast.get_instance().show_toast(
-							"Too many accounts have claimed from this connection today.", Toast.Kind.WARN)
-						break
-					elif err_code == "claim_in_progress":
-						Toast.get_instance().show_toast("A claim for this quest is already in progress.", Toast.Kind.WARN)
-						break
-					elif err_code == "not_completed":
-						Toast.get_instance().show_toast("That quest isn't completed yet.", Toast.Kind.WARN)
-						break
-					elif err_code != "" and err_code != "already_claimed":
-						# Unrecognized backend error code — still readable
-						# (not a raw snake_case string) rather than silent.
-						Toast.get_instance().show_toast("Could not claim: %s" % err_code, Toast.Kind.WARN)
-						break
 			_fetch_quests()
 		else:
 			claim_btn.text = "Claim Reward"
@@ -361,16 +328,29 @@ func _claim_quest(quest_id: String, claim_btn: Button) -> void:
 			if result != HTTPRequest.RESULT_SUCCESS:
 				Toast.network_error("quests_claim result=%d" % result)
 			else:
-				var j2 := JSON.new()
-				var err_msg: String = "Error (%d)" % code
-				if j2.parse(body.get_string_from_utf8()) == OK:
-					err_msg = str(j2.get_data().get("error", err_msg))
-				Toast.get_instance().show_toast(err_msg, Toast.Kind.ERROR)
+				var err_code := ""
+				var j := JSON.new()
+				if j.parse(body.get_string_from_utf8()) == OK:
+					err_code = str(j.get_data().get("error", ""))
+				match err_code:
+					"ip_account_limit":
+						Toast.get_instance().show_toast(
+							"Too many accounts have claimed from this connection today.", Toast.Kind.WARN)
+					"claim_in_progress":
+						Toast.get_instance().show_toast("A claim for this quest is already in progress.", Toast.Kind.WARN)
+					"quest_not_completed":
+						Toast.get_instance().show_toast("That quest isn't completed yet.", Toast.Kind.WARN)
+					"already_claimed":
+						# Nothing to do — just refresh so the button flips to claimed.
+						_fetch_quests()
+					_:
+						Toast.get_instance().show_toast(
+							"Could not claim: %s" % ("Error (%d)" % code if err_code == "" else err_code), Toast.Kind.ERROR)
 	)
 	var headers : PackedStringArray = ["Content-Type: application/json"]
 	if _auth_token != "":
 		headers.append("Authorization: Bearer " + _auth_token)
-	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/quests/claim_all"), headers, HTTPClient.METHOD_POST, body_str)
+	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/quests/claim?quest_id=" + quest_id.uri_encode()), headers, HTTPClient.METHOD_POST, "")
 
 
 # ── Quest listesi ─────────────────────────────────────────────────

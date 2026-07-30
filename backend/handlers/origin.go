@@ -27,10 +27,26 @@ import (
 	"strings"
 )
 
+// defaultGameURL — the game's public URL and the SINGLE source of truth for it
+// across the whole backend. Every place that needs the game's base URL (the
+// game_url sent to the client, share/replay links, VS invite links) reads it via
+// gameURL() below — no more per-file hardcoded copies. Keep in sync with
+// ApiConfig.gd's PROD_GAME_URL on the client.
+const defaultGameURL = "https://nimjump.zetashare.com"
+
+// gameURL — the configured public game URL: the GAME_URL env var if set,
+// otherwise the canonical default above. The ONE place the backend resolves it.
+func gameURL() string {
+	if v := strings.TrimSpace(os.Getenv("GAME_URL")); v != "" {
+		return v
+	}
+	return defaultGameURL
+}
+
 // allowedOrigins — exact matches. Keep in sync with ApiConfig.gd's
 // PROD_BASE / PROD_GAME_URL on the client.
 var allowedOrigins = map[string]bool{
-	"https://nimjump.zetashare.com":  true, // the game's public URL (ApiConfig.PROD_GAME_URL)
+	defaultGameURL:                   true, // the game's public URL (ApiConfig.PROD_GAME_URL)
 	"https://backbone.zetashare.com": true, // the backend's own URL (ApiConfig.PROD_BASE) — same-origin case
 }
 

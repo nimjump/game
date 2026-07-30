@@ -1,5 +1,5 @@
 export const BASE     = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8080";
-export const GAME_URL = process.env.NEXT_PUBLIC_GAME_URL   ?? "https://nimjump.io";
+export const GAME_URL = process.env.NEXT_PUBLIC_GAME_URL   ?? "https://nimjump.zetashare.com";
 
 // Every call below goes through this instead of the global fetch, so the
 // admin session cookie (see backend/handlers/admin_session.go) always gets
