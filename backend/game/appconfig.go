@@ -163,11 +163,10 @@ func defaultAppConfig() AppConfig {
 	}
 
 	return AppConfig{
-		// Weekly leaderboard starts OFF on purpose (temporarily disabled —
-		// not a bug). Both can be flipped back on from the admin panel or
-		// via DAILY_LEADERBOARD_ENABLED / WEEKLY_LEADERBOARD_ENABLED env vars.
+		// Both leaderboards default to ON. Either can be turned off from the
+		// admin panel's System tab, or via the env vars below.
 		DailyLeaderboardEnabled:  envBoolDefault("DAILY_LEADERBOARD_ENABLED", true),
-		WeeklyLeaderboardEnabled: envBoolDefault("WEEKLY_LEADERBOARD_ENABLED", false),
+		WeeklyLeaderboardEnabled: envBoolDefault("WEEKLY_LEADERBOARD_ENABLED", true),
 		UpdateActive:             false,
 		DailyEarnCapNIM:            dailyCap,
 		CoinNIMRate:                coinRate,

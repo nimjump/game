@@ -38,12 +38,25 @@ extends Node
 const CONFIG_FILE_NAME := "config.cfg"
 
 # ════════════════════════════════════════════════════════════════════════
-#  BURAYA KENDİ BACKEND URL'İNİ YAZ (deploy ettiğin domain/IP)
-#  Örnek:  const PROD_BASE := "https://backbone.zetashare.com"
-#  Örnek:  const PROD_BASE := "http://1.2.3.4:8080"
+#  DON'T EDIT THESE TWO BY HAND.
+#
+#  They are GENERATED from setup/urls.ini, the project's single source of
+#  truth for URLs. To change your domains:
+#
+#      1. edit  setup/urls.ini
+#      2. run   python setup/apply_urls.py     (rewrites the two lines below)
+#      3. re-export the game in Godot          (they're compiled into the build)
+#
+#  `python setup/apply_urls.py --check` tells you if this file has drifted
+#  out of sync with urls.ini without changing anything.
+#
+#  Hand-edits here are not "wrong" — the game reads whatever is in this file
+#  — but the next apply_urls.py run overwrites them, and the SEO tags /
+#  robots.txt / sitemap.xml read urls.ini instead, so editing only here
+#  silently leaves the rest pointing elsewhere.
 # ════════════════════════════════════════════════════════════════════════
-const PROD_BASE     := "https://backbone.zetashare.com"   # <-- backend API URL'i
-const PROD_GAME_URL := "https://nimjump.zetashare.com"     # <-- oyunun public URL'i (share/replay/VS invite linkleri)
+const PROD_BASE     := "https://backbone.zetashare.com"   # backend API URL (urls.ini: api_base)
+const PROD_GAME_URL := "https://nimjump.zetashare.com"    # public game URL (urls.ini: game_url)
 
 # Local-dev-only last-resort values. These are intentionally NOT "the"
 # production backend — real deployments must set NIMJUMP_API_BASE / --api=
@@ -356,7 +369,7 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 				// fallback here was window.prompt(), which most Android WebViews
 				// never implement (no WebChromeClient.onJsPrompt override), so it
 				// either does nothing or throws immediately. Net effect: total
-				// silence, no toast, nothing copied — exactly what was reported.
+				// silence, no toast, nothing copied.
 				// Fix: try the legacy execCommand('copy') trick FIRST — it works
 				// through a hidden textarea + a real selection/copy, which is far
 				// more widely supported inside restrictive WebViews than the async
@@ -425,7 +438,7 @@ func share_score(score: int, text_override: String = "", share_url: String = "")
 				}
 
 				// Every path below must end in a showToast/showFallbackBanner call —
-				// no silent "nothing happened" outcome, per explicit request. That
+				// no silent "nothing happened" outcome. That
 				// includes the user dismissing the native share sheet (AbortError)
 				// and the stale/late-resolve case, which used to just `return`.
 				try {

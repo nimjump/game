@@ -1,5 +1,11 @@
+// Both come from admin/.env (NEXT_PUBLIC_* — inlined at build time by
+// Next.js). No production domain is hardcoded here.
+//
+// The BASE fallback is a local-dev convenience. GAME_URL deliberately has
+// none: it builds outbound links to the live game, and a wrong-but-plausible
+// default produces links that look fine and silently go nowhere.
 export const BASE     = process.env.NEXT_PUBLIC_BACKEND_URL ?? "http://localhost:8080";
-export const GAME_URL = process.env.NEXT_PUBLIC_GAME_URL   ?? "https://nimjump.zetashare.com";
+export const GAME_URL = process.env.NEXT_PUBLIC_GAME_URL   ?? "";
 
 // Every call below goes through this instead of the global fetch, so the
 // admin session cookie (see backend/handlers/admin_session.go) always gets

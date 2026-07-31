@@ -27,27 +27,62 @@ import (
 	"strings"
 )
 
-// defaultGameURL — the game's public URL and the SINGLE source of truth for it
-// across the whole backend. Every place that needs the game's base URL (the
-// game_url sent to the client, share/replay links, VS invite links) reads it via
-// gameURL() below — no more per-file hardcoded copies. Keep in sync with
-// ApiConfig.gd's PROD_GAME_URL on the client.
-const defaultGameURL = "https://nimjump.zetashare.com"
+// Both URLs come from backend/.env — GAME_URL and BACKEND_URL. No domain is
+// hardcoded in this package, and neither has a compiled-in fallback on
+// purpose: a typo'd or forgotten env var should be an obvious startup
+// failure, not a backend quietly running against somebody else's domain.
 
-// gameURL — the configured public game URL: the GAME_URL env var if set,
-// otherwise the canonical default above. The ONE place the backend resolves it.
-func gameURL() string {
-	if v := strings.TrimSpace(os.Getenv("GAME_URL")); v != "" {
-		return v
+var (
+	resolvedGameURL    string
+	resolvedBackendURL string
+
+	// allowedOrigins — exact matches, built by InitURLs from the two env
+	// vars. This is what makes changing domains a one-file edit: nothing
+	// here to keep in sync with the client by hand.
+	allowedOrigins = map[string]bool{}
+)
+
+// InitURLs — resolves GAME_URL / BACKEND_URL and builds the CORS allowlist.
+//
+// MUST be called from main() AFTER loadEnv() and before serving. It is
+// deliberately not a package-level `var x = os.Getenv(...)`: those run during
+// package initialisation, which happens before main() gets a chance to read
+// backend/.env, so every value would come back empty.
+func InitURLs() {
+	resolvedGameURL = mustURLEnv("GAME_URL")
+	resolvedBackendURL = mustURLEnv("BACKEND_URL")
+
+	allowedOrigins = map[string]bool{
+		gameURL():    true, // the game's public URL
+		backendURL(): true, // the backend's own URL — same-origin case
 	}
-	return defaultGameURL
+	log.Printf("[CONFIG] GAME_URL=%s BACKEND_URL=%s (CORS allowlist built from these)",
+		resolvedGameURL, resolvedBackendURL)
 }
 
-// allowedOrigins — exact matches. Keep in sync with ApiConfig.gd's
-// PROD_BASE / PROD_GAME_URL on the client.
-var allowedOrigins = map[string]bool{
-	defaultGameURL:                   true, // the game's public URL (ApiConfig.PROD_GAME_URL)
-	"https://backbone.zetashare.com": true, // the backend's own URL (ApiConfig.PROD_BASE) — same-origin case
+// gameURL — the game's public URL, and the SINGLE source of truth for it
+// across the whole backend. Everything that needs it (the game_url sent to
+// the client, share/replay links, VS invite links) goes through here.
+func gameURL() string { return resolvedGameURL }
+
+// backendURL — this backend's own public URL. Currently only the CORS
+// same-origin case needs it; kept as an accessor so nothing reads the var
+// directly.
+func backendURL() string { return resolvedBackendURL }
+
+// mustURLEnv — reads a required URL env var, normalises away any trailing
+// slash (so "https://x.com/" and "https://x.com" can't produce two different
+// allowlist entries), and refuses to start without it.
+func mustURLEnv(key string) string {
+	v := strings.TrimRight(strings.TrimSpace(os.Getenv(key)), "/")
+	if v == "" {
+		log.Fatalf("[CONFIG] %s is not set in backend/.env — it has no default. "+
+			"See backend/.env.example.", key)
+	}
+	if !strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
+		log.Fatalf("[CONFIG] %s must start with http:// or https:// (got %q)", key, v)
+	}
+	return v
 }
 
 // extraAllowedOrigins — populated once at startup from the EXTRA_ALLOWED_ORIGINS

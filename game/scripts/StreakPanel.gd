@@ -600,8 +600,8 @@ static func _warm_btn(btn: Button, r: float = 8.0) -> void:
 	# BUG FIX: no "disabled" stylebox was ever set here — only normal/hover/
 	# pressed — so a disabled Button (the Claim button before there's anything
 	# to claim) fell all the way back to Godot's raw ENGINE-DEFAULT disabled
-	# panel, a flat grey box that doesn't match this warm bej/orange theme at
-	# all (looks broken/ugly next to everything else — the "korkunç" report).
+	# panel, a flat grey box that doesn't match this warm beige/orange theme
+	# at all — it reads as a rendering bug next to everything else.
 	# Same shape as the other three states, just muted so it still reads as
 	# "not tappable" without looking like a rendering bug.
 	sd.bg_color = Color(0.720, 0.660, 0.580)

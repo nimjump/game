@@ -28,11 +28,31 @@ folder:
   - _headers
   - assets/ (whole folder)
 
+Finally it fills in the URL placeholders. Nothing in this project hardcodes
+a domain: game/template's index.html, robots.txt and sitemap.xml all carry
+__GAME_URL__ / __API_BASE__ markers, and this script replaces them with the
+values from setup/urls.ini (the single source of truth — see also
+setup/apply_urls.py, which pushes the same values into ApiConfig.gd before
+the export). If any placeholder is left unresolved afterwards, this script
+fails loudly rather than shipping a broken build.
+
 Usage:
   python build.py                 # auto-finds ../export (relative to this script)
   python build.py path/to/folder  # explicit override
 """
 import sys, shutil, pathlib
+
+# urls_config.py sits next to this file. Python normally puts the script's own
+# folder on sys.path automatically, but not under every launcher (`-m`, some
+# IDE run configs, embedded interpreters), so make it explicit — this script
+# gets invoked from devtools and by hand from several different cwds.
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+from urls_config import (
+    API_BASE_PLACEHOLDER,
+    GAME_URL_PLACEHOLDER,
+    load_urls_or_exit,
+)
 
 # Cloudflare Pages' hard per-file limit is 25 MiB. We split anything
 # bigger than this, with a little headroom so each half stays safely
@@ -270,11 +290,82 @@ def find_template_folder() -> pathlib.Path:
     return candidate
 
 
-def copy_template_extras(export_folder: pathlib.Path, template_folder: pathlib.Path):
+def substitute_urls(text: str, api_base: str, game_url: str) -> str:
+    """Swaps the two placeholders for their real values. One helper for every
+    file type so the marker names can never drift apart between them."""
+    return (text
+            .replace(GAME_URL_PLACEHOLDER, game_url)
+            .replace(API_BASE_PLACEHOLDER, api_base))
+
+
+def copy_with_urls(src: pathlib.Path, dst: pathlib.Path, api_base: str, game_url: str) -> int:
+    """Copies a text file while substituting URL placeholders. Returns how
+    many placeholder occurrences were replaced (0 is fine — not every file
+    has to contain one)."""
+    text = src.read_text(encoding="utf-8")
+    count = text.count(GAME_URL_PLACEHOLDER) + text.count(API_BASE_PLACEHOLDER)
+    dst.write_text(substitute_urls(text, api_base, game_url), encoding="utf-8")
+    return count
+
+
+def fill_urls_in_export_html(export_folder: pathlib.Path, api_base: str, game_url: str):
+    """Replaces the placeholders inside the ALREADY-EXPORTED index.html.
+
+    Godot copies game/template/index.html into export/ verbatim during the
+    web export, placeholders and all — this is where the canonical/OG/Twitter/
+    JSON-LD tags and the client-log API base actually get their real values.
+    Idempotent: once substituted there are no markers left, so re-running is a
+    no-op.
+    """
+    html_files = list(export_folder.glob("*.html"))
+    if not html_files:
+        print("  no .html file found in export folder — nothing to substitute")
+        return
+
+    for html_path in html_files:
+        text = html_path.read_text(encoding="utf-8")
+        count = text.count(GAME_URL_PLACEHOLDER) + text.count(API_BASE_PLACEHOLDER)
+        if count == 0:
+            print(f"  {html_path.name}: no placeholders left (already substituted)")
+            continue
+        html_path.write_text(substitute_urls(text, api_base, game_url), encoding="utf-8")
+        print(f"  {html_path.name}: filled {count} placeholder(s)")
+
+
+def verify_no_placeholders_left(export_folder: pathlib.Path):
+    """Last line of defence: scan every text file we're about to ship for a
+    leftover marker. A stray __GAME_URL__ in a canonical tag or in the API
+    base would be live on the deployed site, so this is a hard failure rather
+    than a warning."""
+    offenders = []
+    for path in sorted(export_folder.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in (".html", ".txt", ".xml", ".json", ".js"):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if GAME_URL_PLACEHOLDER in text or API_BASE_PLACEHOLDER in text:
+            offenders.append(path.relative_to(export_folder))
+
+    if offenders:
+        print("\nUNRESOLVED URL PLACEHOLDERS — not safe to deploy:", file=sys.stderr)
+        for rel in offenders:
+            print(f"  {rel}", file=sys.stderr)
+        print("\n  These files still contain __GAME_URL__ / __API_BASE__.\n"
+              "  Check setup/urls.ini and re-run this script.\n", file=sys.stderr)
+        sys.exit(1)
+
+    print("  no leftover placeholders — URLs are fully resolved")
+
+
+def copy_template_extras(export_folder: pathlib.Path, template_folder: pathlib.Path,
+                         api_base: str, game_url: str):
     """
     Copies _headers, manifest.json, robots.txt, sitemap.xml, and assets/
     from game/template into the export folder, overwriting whatever is
-    already there.
+    already there. robots.txt and sitemap.xml go through URL substitution
+    on the way.
     """
     if not template_folder.is_dir():
         print(f"Template folder not found: {template_folder.resolve()}")
@@ -310,8 +401,9 @@ def copy_template_extras(export_folder: pathlib.Path, template_folder: pathlib.P
         seo_src = template_folder / seo_name
         if seo_src.is_file():
             seo_dst = export_folder / seo_name
-            shutil.copyfile(seo_src, seo_dst)
-            print(f"  copied {seo_name} → {seo_dst}")
+            filled = copy_with_urls(seo_src, seo_dst, api_base, game_url)
+            suffix = f" ({filled} URL placeholder(s) filled)" if filled else ""
+            print(f"  copied {seo_name} → {seo_dst}{suffix}")
         else:
             print(f"  no {seo_name} found in {template_folder.resolve()}, skipped")
 
@@ -327,6 +419,10 @@ def copy_template_extras(export_folder: pathlib.Path, template_folder: pathlib.P
 
 
 def main():
+    # Loaded up front: a missing/broken urls.ini should stop the build before
+    # anything is written, not halfway through.
+    api_base, game_url = load_urls_or_exit()
+
     if len(sys.argv) > 1:
         folder = pathlib.Path(sys.argv[1])
     else:
@@ -367,7 +463,13 @@ def main():
 
     template_folder = find_template_folder()
     print(f"Copying deploy extras from {template_folder.resolve()} into {folder.resolve()}:\n")
-    copy_template_extras(folder, template_folder)
+    copy_template_extras(folder, template_folder, api_base, game_url)
+
+    print(f"\nApplying URLs from setup/urls.ini:\n")
+    print(f"  api_base = {api_base}")
+    print(f"  game_url = {game_url}\n")
+    fill_urls_in_export_html(folder, api_base, game_url)
+    verify_no_placeholders_left(folder)
 
     print("\nDone. export/ is ready to upload to Cloudflare Pages.")
 

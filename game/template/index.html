@@ -196,7 +196,10 @@
        description, OG, Twitter, JSON-LD) since each surface (Google result,
        Twitter/X card, Discord/Slack unfurl, iMessage preview) reads a
        different subset of these. -->
-  <link rel="canonical" href="https://nimjump.zetashare.com/">
+  <!-- __GAME_URL__ / __API_BASE__ below are placeholders — setup/build.py
+       replaces them with the real values from setup/urls.ini after the
+       export. Never hardcode a domain in this file. -->
+  <link rel="canonical" href="__GAME_URL__/">
   <meta name="robots" content="index, follow, max-image-preview:large">
   <meta name="description" content="NimJump — an endless vertical platformer for Nimiq. Jump, dodge, and climb as high as you can with tap or gyro-tilt controls, earn real NIM as you play, and challenge friends directly in 1v1 VS wagers. Every run is verified server-side, so every score is real.">
   <meta name="keywords" content="NimJump, Nimiq, Nimiq game, NIM crypto game, play to earn, web3 game, blockchain game, endless jumper, platformer game, crypto rewards game">
@@ -207,8 +210,8 @@
   <meta property="og:site_name" content="NimJump">
   <meta property="og:title" content="NimJump — Jump, Dodge, Earn NIM">
   <meta property="og:description" content="An endless vertical platformer for Nimiq. Jump, dodge, and climb with tap or gyro-tilt controls, earn real NIM as you play, and challenge friends in 1v1 VS wagers — every run is verified server-side.">
-  <meta property="og:url" content="https://nimjump.zetashare.com/">
-  <meta property="og:image" content="https://nimjump.zetashare.com/assets/icon/ico-512.png">
+  <meta property="og:url" content="__GAME_URL__/">
+  <meta property="og:image" content="__GAME_URL__/assets/icon/ico-512.png">
   <meta property="og:image:width" content="512">
   <meta property="og:image:height" content="512">
   <meta property="og:locale" content="en_US">
@@ -217,7 +220,7 @@
   <meta name="twitter:card" content="summary">
   <meta name="twitter:title" content="NimJump — Jump, Dodge, Earn NIM">
   <meta name="twitter:description" content="An endless vertical platformer for Nimiq. Tap or gyro-tilt controls, real NIM rewards, 1v1 VS wagers against friends — every run is verified server-side.">
-  <meta name="twitter:image" content="https://nimjump.zetashare.com/assets/icon/ico-512.png">
+  <meta name="twitter:image" content="__GAME_URL__/assets/icon/ico-512.png">
 
   <!-- Structured data — lets Google show a richer result (game category,
        platform, free-to-play) instead of a bare blue link. VideoGame is a
@@ -227,9 +230,9 @@
     "@context": "https://schema.org",
     "@type": "VideoGame",
     "name": "NimJump",
-    "url": "https://nimjump.zetashare.com/",
+    "url": "__GAME_URL__/",
     "description": "An endless vertical platformer for Nimiq. Jump, dodge, and climb as high as you can with tap or gyro-tilt controls, earn real NIM as you play, and challenge friends directly in 1v1 VS wagers. Every run is verified server-side.",
-    "image": "https://nimjump.zetashare.com/assets/icon/ico-512.png",
+    "image": "__GAME_URL__/assets/icon/ico-512.png",
     "applicationCategory": "Game",
     "gamePlatform": ["Web Browser", "Android", "iOS"],
     "genre": ["Platformer", "Arcade", "Blockchain Game"],
@@ -244,7 +247,7 @@
 
   <!-- ── DEV MODE ──────────────────────────────────────────────────────────────
        Add ?dev to URL to enable debug overlay, FPS counter, and verbose logs.
-       Example: https://nimjump.zetashare.com/?dev
+       Example: https://your-game-domain.example/?dev
        In production nothing extra is loaded or visible.
   ─────────────────────────────────────────────────────────────────────────── -->
   <script data-cfasync="false">
@@ -699,14 +702,14 @@
       }
       return ''; // nothing resolved — deep link will be built without a host
     }
-    // BUG FIX: resolveGameHost() above only ever returns the bare host
-    // (nimjump.zetashare.com) — it strips protocol/trailing-slash on
-    // purpose, but callers then used ONLY that host for the deep link,
-    // silently dropping the current page's own path+query string (e.g.
-    // "?vs=id"). That's exactly the param that identifies the session/
-    // referral/auto-payout trigger, so whoever tapped the button while on
-    // nimjump.zetashare.com?vs=id got dropped into Nimiq Pay at the bare
-    // host with no ?vs=id at all — no session id, no auto NIM payout.
+    // BUG FIX: resolveGameHost() above only ever returns the bare host —
+    // it strips protocol/trailing-slash on purpose, but callers then used
+    // ONLY that host for the deep link, silently dropping the current
+    // page's own path+query string (e.g. "?vs=id"). That's exactly the
+    // param that identifies the session/referral/auto-payout trigger, so
+    // whoever tapped the button while on <host>?vs=id got dropped into
+    // Nimiq Pay at the bare host with no ?vs=id at all — no session id,
+    // no auto NIM payout.
     // Fix: append the CURRENT page's pathname+search (not just re-derive
     // from ?game_url=, which may not even be present) onto the resolved
     // host, so the deep link reopens the exact same URL+params inside
@@ -833,8 +836,8 @@
     }
 
     // ── AUTO-REDIRECT when the URL already carries params ───────────────────
-    // If the page was opened with query params (e.g. nimjump.zetashare.com
-    // ?vs=id — a referral/session id that should drive an automatic NIM
+    // If the page was opened with query params (e.g. <game url>?vs=id —
+    // a referral/session id that should drive an automatic NIM
     // payout), don't make the player notice+tap the top banner's "Open"
     // button first. Jump straight to a centered "Opening Nimiq Pay…" popup
     // AND fire the deep link immediately, in the background, on load. The
@@ -1078,15 +1081,14 @@
   var _queue = [];
   var _timer = null;
   // BUG FIX: this used to be the relative path '/backend/client-log', which
-  // resolves against the PAGE's own origin (window.location.origin). The
-  // game's static files are hosted on nimjump.zetashare.com, but the actual
-  // Go backend lives on a DIFFERENT domain, backbone.zetashare.com (see
-  // ApiConfig.gd's PROD_BASE) — there is no reverse-proxy making
-  // nimjump.zetashare.com/backend/* reach the backend, so every request
-  // 404'd against the game's own static host. Fix: resolve the same base URL
-  // ApiConfig.gd uses (window.NJ_API_BASE > query param ?api= > localStorage
-  // nj_api_base > the hardcoded prod backend), so this always hits the real
-  // backend regardless of which domain served the page.
+  // resolves against the PAGE's own origin (window.location.origin). In the
+  // default deployment the game's static files and the Go backend are on two
+  // DIFFERENT domains (game_url vs api_base in setup/urls.ini), with no
+  // reverse-proxy making <game url>/backend/* reach the backend — so every
+  // request 404'd against the game's own static host. Fix: resolve the same
+  // base URL ApiConfig.gd uses (window.NJ_API_BASE > query param ?api= >
+  // localStorage nj_api_base > the build-time api_base), so this always hits
+  // the real backend regardless of which domain served the page.
   //
   // BUG FIX #2: devtools (start-dev-tunnels.js) overrides ApiConfig.gd's
   // PROD_BASE for every Godot-side network call, but this block runs in
@@ -1112,7 +1114,10 @@
       var ls = window.localStorage && window.localStorage.getItem('nj_api_base');
       if (ls) return ls.replace(/\/+$/, '');
     } catch(e) {}
-    return 'https://backbone.zetashare.com'; // keep in sync with ApiConfig.gd PROD_BASE
+    // Placeholder — setup/build.py substitutes the api_base from
+    // setup/urls.ini here, the same value apply_urls.py writes into
+    // ApiConfig.gd's PROD_BASE. Nothing to keep in sync by hand.
+    return '__API_BASE__'.replace(/\/+$/, '');
   })();
   var _BACKEND = _API_BASE + '/backend/client-log';
 

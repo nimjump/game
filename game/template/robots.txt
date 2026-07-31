@@ -1,4 +1,5 @@
 User-agent: *
 Allow: /
 
-Sitemap: https://nimjump.zetashare.com/sitemap.xml
+# __GAME_URL__ is filled in by setup/build.py from setup/urls.ini.
+Sitemap: __GAME_URL__/sitemap.xml

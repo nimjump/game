@@ -39,8 +39,8 @@ function loadFile(file, skip) {
     // origin, relative — see start-dev-tunnels.js's buildAdminApp") got
     // silently clobbered right back to the real production backend URL
     // by this very loadFile("./.env") call, which is exactly why the
-    // built admin app kept calling https://backbone.zetashare.com instead
-    // of a relative path even after that override was added. `skip`
+    // built admin app kept calling the .env backend URL instead of a
+    // relative path even after that override was added. `skip`
     // tracks every key that's already meaningfully set (real env vars
     // present before this module ever ran, PLUS anything already filled
     // in by a higher-precedence file below) — an intentionally-blank

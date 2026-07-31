@@ -411,7 +411,7 @@ func _ready() -> void:
 					// tremor, phone vibration, or just holding it loosely produces
 					// single-sample spikes that used to go straight into `tilted`
 					// and could flip _gyroDir back and forth every other frame
-					// ("takılıyor, dönüyor" symptom). A light EMA low-pass here
+					// (character stutters/spins in place). A light EMA low-pass here
 					// smooths those spikes out while staying fast enough (devicemotion
 					// fires ~60Hz, alpha=0.5 settles in ~2-3 samples, <50ms) that it
 					// doesn't reintroduce the fusion-filter lag this code originally

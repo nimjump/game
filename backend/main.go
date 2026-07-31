@@ -169,6 +169,12 @@ func main() {
 	loadEnv(".env")
 	loadEnv("../.env")
 
+	// Resolve GAME_URL / BACKEND_URL and build the CORS allowlist from them.
+	// Has to be here — after loadEnv, before anything serves a request — since
+	// handlers' package-level vars are initialised long before .env is read.
+	// Fails fast with a clear message if either is missing.
+	handlers.InitURLs()
+
 	// Resolve the listen address up front and probe it BEFORE opening the
 	// DB, starting the admin app supervisor, or doing anything else —
 	// running `go run .` (or a second copy of the binary) while another
@@ -177,8 +183,8 @@ func main() {
 	// the very end of main(), by which point the DB was already open, the
 	// admin-app child process had already been spawned, etc. That admin
 	// child then raced its OWN port (see adminproc.go) and kept retrying
-	// with backoff forever — the "şişiyor" (ballooning) symptom: a second
-	// instance stuck looping spawn-attempts instead of just exiting.
+	// with backoff forever: a second instance stuck looping spawn-attempts
+	// instead of just exiting.
 	// Failing here, first, with a clear message, avoids all of that.
 	port := os.Getenv("PORT")
 	if port == "" {
