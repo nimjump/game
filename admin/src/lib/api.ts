@@ -354,6 +354,19 @@ export async function fetchDeviceBreakdown(): Promise<DeviceBreakdownEntry[]> {
   return d.platforms ?? [];
 }
 
+export interface CountryBreakdownEntry {
+  country_code: string;
+  country_name: string;
+  count: number;
+}
+
+export async function fetchCountryBreakdown(): Promise<CountryBreakdownEntry[]> {
+  const r = await fetch(`${BASE}/backend/admin/country-breakdown`, { cache: "no-store" });
+  if (!r.ok) throw new Error("country breakdown fetch failed");
+  const d = await r.json();
+  return d.countries ?? [];
+}
+
 export async function searchPlayer(q: string): Promise<PlayerProfile | null> {
   const r = await fetch(`${BASE}/backend/admin/player?q=${encodeURIComponent(q)}`, { cache: "no-store" });
   if (!r.ok) return null;
@@ -550,6 +563,12 @@ export interface AppConfig {
   // VS match system fee, in PERCENT (0–100). Winner gets (100 - this)% of the
   // pot. See backend/game/vsroom.go VSFeeFraction. undefined = 5% default.
   vs_fee_percent?: number;
+  // How far (in PERCENT, 0-100) a client's claimed score may differ from the
+  // server's own re-simulated score before the run is flagged as suspicious.
+  // The score actually recorded is ALWAYS the server's number regardless of
+  // this — it only controls the flagging/review threshold. undefined = 0%
+  // default (exact match required). See backend/game/appconfig.go.
+  score_mismatch_tolerance_percent?: number;
 }
 
 export async function fetchAppConfig(): Promise<AppConfig> {
@@ -568,6 +587,7 @@ export async function saveAppConfig(patch: Partial<{
   streak_reward_max_nim: number;
   max_reward_accounts_per_ip: number;
   vs_fee_percent: number;
+  score_mismatch_tolerance_percent: number;
 }>): Promise<AppConfig> {
   const r = await fetch(`${BASE}/backend/admin/config`, {
     method: "POST",
@@ -734,11 +754,16 @@ export async function fetchDatabaseOverview(): Promise<DBCategory[]> {
   return data.categories ?? [];
 }
 
-export async function clearDatabaseCategory(category: string): Promise<{ ok: boolean; deleted: number }> {
+// confirm: for "dangerous" categories the backend now requires the category
+// key to be echoed back as a server-side confirmation (previously only the
+// UI's confirm() dialogs guarded this — see admin_database.go's BUG FIX
+// note). Pass the category key again as `confirm` when clearing a dangerous
+// category; harmless/ignored for non-dangerous ones.
+export async function clearDatabaseCategory(category: string, confirm?: string): Promise<{ ok: boolean; deleted: number }> {
   const r = await fetch(`${BASE}/backend/admin/database/clear`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ category }),
+    body: JSON.stringify({ category, confirm: confirm ?? "" }),
   });
   if (!r.ok) throw new Error("clear category failed");
   return r.json();
@@ -765,6 +790,64 @@ export async function fetchFailedReplayArchive(): Promise<FailedReplayEntry[]> {
 
 export function failedReplayDownloadUrl(id: string): string {
   return `${BASE}/backend/admin/failed-replay-archive/${encodeURIComponent(id)}/download`;
+}
+
+// ── Off-site DB backups (Cloudflare R2) ────────────────────────────────────
+
+export interface BackupStatus {
+  configured: boolean;
+  last_attempt_at?: number;
+  last_success_at?: number;
+  last_error?: string;
+  last_object_key?: string;
+  last_size_bytes?: number;
+  interval_hours: number;
+  retention_count: number;
+}
+
+export interface BackupSnapshot {
+  key: string;
+  size: number;
+  last_modified: string;
+}
+
+export async function fetchBackupStatus(): Promise<BackupStatus> {
+  const r = await fetch(`${BASE}/backend/admin/backup`, { cache: "no-store" });
+  if (!r.ok) throw new Error("backup status fetch failed");
+  return r.json();
+}
+
+export async function fetchBackupList(): Promise<BackupSnapshot[]> {
+  const r = await fetch(`${BASE}/backend/admin/backup/list`, { cache: "no-store" });
+  if (!r.ok) throw new Error("backup list fetch failed");
+  const data = await r.json();
+  return data.backups ?? [];
+}
+
+export async function runBackupNow(): Promise<BackupStatus> {
+  const r = await fetch(`${BASE}/backend/admin/backup/run`, { method: "POST" });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    throw new Error(body?.error || "backup run failed");
+  }
+  return r.json();
+}
+
+// restoreBackup — WIPES the entire live database and replaces it with the
+// given snapshot. The backend requires `confirm` to exactly echo `key` back
+// (same pattern as clearDatabaseCategory's dangerous-category confirm) —
+// always pass the same value for both.
+export async function restoreBackup(key: string): Promise<{ ok: boolean }> {
+  const r = await fetch(`${BASE}/backend/admin/backup/restore`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key, confirm: key }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({}));
+    throw new Error(body?.error || "restore failed");
+  }
+  return r.json();
 }
 
 // uploadReplayBinary — always activates immediately now (the old "stage,

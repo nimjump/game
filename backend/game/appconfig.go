@@ -111,6 +111,24 @@ type AppConfig struct {
 	// enforced at 1 (0 would mean "nobody from any IP ever gets paid",
 	// almost certainly not what an admin setting this means).
 	MaxRewardAccountsPerIP *int `json:"max_reward_accounts_per_ip,omitempty"`
+
+	// ScoreMismatchTolerancePercent — how far a client's claimed score is
+	// allowed to differ from the server's own re-simulated score (in
+	// PERCENT, 0-100) before the run gets flagged as suspicious (see
+	// ParseFlagReason in game/replay.go). The score actually recorded is
+	// ALWAYS the server's own number regardless of this setting — this only
+	// controls the flagging/review threshold, never what score gets saved.
+	// Pointer because 0 is a legitimate, meaningful, and now the DEFAULT
+	// choice ("require an exact match, flag any difference at all") — not
+	// just "not configured yet". nil → env SCORE_MISMATCH_TOLERANCE_PERCENT
+	// → 0 (exact match) default. Was hardcoded at 5% before this was made
+	// admin-configurable; 0 chosen as the new default once this session's
+	// determinism hardening pass (LUT trig, snappedf ordering fixes, debug
+	// cheat-key gate fix, move_toward-based smoothing) made native/WASM
+	// divergence rare enough that near-zero tolerance is reasonable for
+	// legitimate players. Raise this from the admin panel if false positives
+	// turn out to be a real problem in practice.
+	ScoreMismatchTolerancePercent *float64 `json:"score_mismatch_tolerance_percent,omitempty"`
 }
 
 func envBoolDefault(key string, def bool) bool {
@@ -161,6 +179,12 @@ func defaultAppConfig() AppConfig {
 			maxAccountsPerIP = &n
 		}
 	}
+	var scoreMismatchTolerance *float64
+	if v := os.Getenv("SCORE_MISMATCH_TOLERANCE_PERCENT"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			scoreMismatchTolerance = &f
+		}
+	}
 
 	return AppConfig{
 		// Both leaderboards default to ON. Either can be turned off from the
@@ -174,7 +198,27 @@ func defaultAppConfig() AppConfig {
 		StreakRewardExtraPerDayNIM: streakExtra,
 		StreakRewardMaxNIM:         streakMax,
 		MaxRewardAccountsPerIP:     maxAccountsPerIP,
+		ScoreMismatchTolerancePercent: scoreMismatchTolerance,
 	}
+}
+
+// ScoreMismatchTolerance — the fraction (0.0-1.0) of allowed client/server
+// score divergence before a replay submission is flagged as suspicious. See
+// AppConfig.ScoreMismatchTolerancePercent's doc comment — nil (never
+// configured) resolves to 0.0, i.e. an exact match is required by default.
+func (s *Store) ScoreMismatchTolerance() float64 {
+	v := s.GetAppConfig().ScoreMismatchTolerancePercent
+	if v == nil {
+		return 0.0
+	}
+	pct := *v
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return pct / 100.0
 }
 
 func (s *Store) GetAppConfig() AppConfig {

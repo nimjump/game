@@ -128,6 +128,16 @@ func (s *Store) SeedExists(seed int64) bool {
 	return exists
 }
 
+// NOTE: ClaimQuestProgressForSession (a "first call per session_id wins"
+// idempotency guard) used to live here, protecting the old client-triggered
+// POST /backend/quests/progress endpoint from being replayed to farm
+// additive quest types (total score, games played, streak). That endpoint is
+// gone — quest progress is now applied exactly once per submitted session,
+// as a direct server-side side effect of replay verification inside the
+// /backend/submit handler (Store.UpdateQuestProgressFromReplay), which is
+// never reachable more than once per session on its own. No separate
+// idempotency guard is needed anymore.
+
 func (s *Store) Get(id string) (*models.Session, error) {
 	var sess models.Session
 	err := s.db.View(func(txn *badger.Txn) error {

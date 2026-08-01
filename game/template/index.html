@@ -640,6 +640,29 @@
     _reg('jump',   'assets/audio/jump.wav',   'SFX_Jump', false);
     _reg('damage', 'assets/audio/damage.wav', 'SFX_Damage', false);
 
+    // BUG FIX ("ses açıktı ama oyun açıldı çalışmadı, ayarlardan aç kapa
+    // yapınca geri geldi, nadiren oldu"): bgm_play's `s.audio.play()` call
+    // below is `.catch(function(){})` — a silent swallow. The browser's
+    // autoplay policy can reject that specific play() attempt (the WASM
+    // round-trip from the real DOM gesture to this JS call isn't always
+    // still within the browser's "transient activation" window by the time
+    // it runs, so the very first bgm_play after boot is the one most at
+    // risk) with zero visible error. Main.gd's _start_bgm_if_needed() used
+    // to mark BGM as "started" the instant it SENT the play command, with no
+    // way to know the attempt actually failed — so a silently-rejected first
+    // attempt left music dead for the rest of the session, since nothing
+    // ever re-sent bgm_play once that flag was set. Track the real,
+    // browser-confirmed playback state here (the 'playing' event only fires
+    // once the browser has actually started producing sound; 'pause'/'ended'
+    // cover both an explicit stop AND the promise-rejection case, since a
+    // rejected play() reverts the element to paused) so GDScript can check
+    // "did it ACTUALLY start" instead of just trusting its own outgoing
+    // command, and retry if not.
+    window._bgmActuallyPlaying = false;
+    _sounds.bgm.audio.addEventListener('playing', function(){ window._bgmActuallyPlaying = true; });
+    _sounds.bgm.audio.addEventListener('pause',   function(){ window._bgmActuallyPlaying = false; });
+    _sounds.bgm.audio.addEventListener('ended',   function(){ window._bgmActuallyPlaying = false; });
+
     window._gdSound = function(cmd) {
       if (cmd === 'unlock') { _unlocked=true; return; }
       if (!_unlocked) return;
@@ -993,7 +1016,32 @@
     function tryLock() {
       try {
         if (screen.orientation && screen.orientation.lock) {
-          screen.orientation.lock('portrait').catch(function () {});
+          // GYRO-AXIS BUG FIX: the W3C Screen Orientation API's 'portrait'
+          // lock type is NOT "upright portrait only" — per spec it means
+          // "portrait-primary OR portrait-secondary", i.e. it explicitly
+          // PERMITS the OS to rotate the canvas into upside-down portrait
+          // (portrait-secondary) on any browser context that actually
+          // honors this call (per the comment above, mostly Android
+          // Chrome PWA/installed contexts). The CSS #rotate-lock blocker
+          // below doesn't catch this either — its media query only fires
+          // on `orientation: landscape`, and upside-down portrait is still
+          // `orientation: portrait` as far as CSS is concerned. If the OS
+          // actually rotates into portrait-secondary, the canvas gets
+          // visually flipped 180° to compensate (correct, expected
+          // behavior for a real orientation lock) — but devicemotion's
+          // accelerationIncludingGravity is reported in the device's raw
+          // HARDWARE frame, which is never rotated by the OS/CSS
+          // transform. So a player holding the phone upside-down would
+          // see a correctly-upright (rotated) canvas, tap zones that
+          // still work (touch coordinates ARE compensated for the CSS
+          // rotation), but gyro left/right permanently reversed, because
+          // the raw acc.x sign convention this code relies on (see
+          // Main.gd's _startGyroListener) assumes portrait-primary only.
+          // 'portrait-primary' locks to just the single upright
+          // orientation and prevents the OS from ever rotating into
+          // portrait-secondary in the first place, closing this off at
+          // the source instead of trying to compensate for it later.
+          screen.orientation.lock('portrait-primary').catch(function () {});
         }
       } catch (e) {}
     }

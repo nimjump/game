@@ -7,6 +7,7 @@ import (
 	"log"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fasthttp/router"
@@ -17,6 +18,62 @@ import (
 )
 
 var startEpoch = time.Now().Unix()
+
+// ── Per-player replay-verification concurrency cap ──────────────────────────
+//
+// BUG FIX (security audit — DoS): the replay-verifier worker pool defaults to
+// just 2 concurrent Godot processes, each of which can legitimately take up
+// to ReplayTimeoutSec (600s, × up to 3 retry attempts). Before this fix,
+// nothing stopped a single authenticated account from bursting many
+// submissions (the generic rate limiter alone allows a burst of 45 requests)
+// and saturating the entire pool by itself, starving every other player's
+// submissions behind an unbounded blocking channel send. Capping how many of
+// ONE player's submissions can be simulating at once (independent of the
+// tick-count/size limits already in place) closes the "one account queues
+// everyone else out" version of this — this is a fairness/availability
+// guard, not a payout-integrity one (those are separately enforced).
+//
+// Raised from 2 to 15 by request — still a real cap (a single account still
+// can't queue unbounded submissions), just generous enough that no legitimate
+// player realistically hits it; the shared worker pool's own limited job
+// channel (see game.GetWorkerPool, default 2 concurrent Godot processes) is
+// still the actual bottleneck/backpressure for total system throughput —
+// this constant only ever protects OTHER players from ONE account hogging
+// that shared pool, not the reverse.
+const maxReplayInFlightPerPlayer = 15
+
+var (
+	replayInFlightMu       sync.Mutex
+	replayInFlightByPlayer = map[string]int{}
+)
+
+// tryClaimReplaySlot reserves one of this player's limited concurrent replay-
+// verification slots. Returns false (claims nothing) if they're already at
+// the cap.
+func tryClaimReplaySlot(playerID string) bool {
+	replayInFlightMu.Lock()
+	defer replayInFlightMu.Unlock()
+	if replayInFlightByPlayer[playerID] >= maxReplayInFlightPerPlayer {
+		return false
+	}
+	replayInFlightByPlayer[playerID]++
+	return true
+}
+
+// releaseReplaySlot must be called exactly once for every successful
+// tryClaimReplaySlot, regardless of how the verification goroutine exits
+// (success, failure, or an early return) — always via `defer` right after
+// claiming.
+func releaseReplaySlot(playerID string) {
+	replayInFlightMu.Lock()
+	defer replayInFlightMu.Unlock()
+	if replayInFlightByPlayer[playerID] > 0 {
+		replayInFlightByPlayer[playerID]--
+		if replayInFlightByPlayer[playerID] == 0 {
+			delete(replayInFlightByPlayer, playerID)
+		}
+	}
+}
 
 type Server struct {
 	Store *game.Store
@@ -35,10 +92,16 @@ func (s *Server) Register(r *router.Router) {
 		return s.rl.Middleware(h, isAuthed)
 	}
 
-	// Admin login — no auth required to reach these (this IS the auth). Rate-
-	// limited (rl) to blunt online password brute-force; the credential check
-	// itself is already constant-time (see handleAdminLogin).
-	r.POST("/backend/admin/login", rl(s.handleAdminLogin))
+	// Admin login — no auth required to reach these (this IS the auth).
+	// SECURITY: uses the dedicated LoginMiddleware, NOT the generic rl()
+	// wrapper — rl()'s guest/authed tier is decided purely by whether an
+	// Authorization header is present (never validated at that layer), so a
+	// brute-forcer could send a throwaway Bearer header to buy the 15/s
+	// "authed" tier instead of 5/s guest. LoginMiddleware ignores that split
+	// entirely and enforces a much stricter dedicated per-IP bucket
+	// (~1 attempt/5s) that can't be bypassed the same way. The credential
+	// check itself is already constant-time (see handleAdminLogin).
+	r.POST("/backend/admin/login", s.rl.LoginMiddleware(s.handleAdminLogin))
 	r.POST("/backend/admin/logout", s.handleAdminLogout)
 	r.GET("/backend/admin/me", s.handleAdminMe)
 
@@ -86,6 +149,7 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/admin/config", s.requireAdminSession(s.handleAdminSetConfig))
 	r.POST("/backend/admin/update-active", s.requireAdminSession(s.handleAdminSetUpdateActive))
 	r.GET("/backend/admin/device-breakdown", s.requireAdminSession(s.handleAdminDeviceBreakdown))
+	r.GET("/backend/admin/country-breakdown", s.requireAdminSession(s.handleAdminCountryBreakdown))
 	r.GET("/backend/admin/quest-pool", s.requireAdminSession(s.handleAdminQuestPool))
 	r.POST("/backend/admin/quest-reward", s.requireAdminSession(s.handleAdminSetQuestReward))
 	r.POST("/backend/admin/quest-target", s.requireAdminSession(s.handleAdminSetQuestTarget))
@@ -99,6 +163,10 @@ func (s *Server) Register(r *router.Router) {
 	// Database tab — key-prefix category overview/clear + failed-replay archive
 	r.GET("/backend/admin/database", s.requireAdminSession(s.handleAdminDatabaseOverview))
 	r.POST("/backend/admin/database/clear", s.requireAdminSession(s.handleAdminDatabaseClear))
+	r.GET("/backend/admin/backup", s.requireAdminSession(s.handleAdminBackupStatus))
+	r.GET("/backend/admin/backup/list", s.requireAdminSession(s.handleAdminBackupList))
+	r.POST("/backend/admin/backup/run", s.requireAdminSession(s.handleAdminBackupRun))
+	r.POST("/backend/admin/backup/restore", s.requireAdminSession(s.handleAdminBackupRestore))
 	r.GET("/backend/admin/failed-replay-archive", s.requireAdminSession(s.handleAdminFailedReplayArchiveList))
 	r.GET("/backend/admin/failed-replay-archive/{id}/download", s.requireAdminSession(s.handleAdminFailedReplayArchiveDownload))
 
@@ -141,11 +209,38 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/ping", rl(s.handlePing))
 	// /prefetch and /game_start removed — offline seed system
 	r.POST("/backend/submit", rl(s.handleSubmit))
-	r.GET("/backend/sessions", rl(s.handleSessions))
+	// CRITICAL BUG FIX (security audit): this was a fully public, unauthenticated
+	// endpoint that dumped up to 100 players' full session records — including
+	// their real Nimiq wallet address (PlayerID), nickname, score, and full
+	// base64 replay log — to literally anyone (only the generic per-IP rate
+	// limiter stood in front of it). Nothing in the game client calls this
+	// route at all (confirmed by grep — it's dead/vestigial), and an
+	// equivalent, properly-gated version already exists at
+	// /backend/admin/sessions (see handleAdminSessions below). This also
+	// closes a secondary gap: handleReplay's public replay-fetch route relies
+	// on session_id being an unguessable capability token, an assumption this
+	// endpoint completely broke by handing out every session_id in bulk.
+	r.GET("/backend/sessions", s.requireAdminSession(s.handleSessions))
 	r.GET("/backend/leaderboard", rl(s.handleLeaderboard))
 	r.GET("/backend/leaderboard/prizes", rl(s.handleLeaderboardPrizes))
 	r.GET("/backend/leaderboard/winners", rl(s.handleLeaderboardWinners))
-	r.POST("/backend/leaderboard/pay-winners", rl(s.handleLeaderboardPayWinners))
+	// CRITICAL BUG FIX (security audit): this had NO auth at all — any
+	// anonymous request could hit it directly, since it isn't under
+	// /backend/admin/ and wasn't wrapped in requireAdminSession like every
+	// other payout-triggering route. Combined with a non-atomic check in
+	// PayWinnersForPeriod (see its own fix in game/leaderboard.go), this
+	// meant: (1) anyone could force-close and pay out a still-in-progress
+	// daily/weekly period early, freezing out whoever would have legitimately
+	// won the rest of it, and (2) firing many concurrent requests for the
+	// same not-yet-paid period could multiply that period's real NIM payout
+	// N-fold to whatever addresses currently sit in the top ranks — no
+	// login, no payment, nothing required. The automatic background loop
+	// (game.StartLeaderboardPayoutLoop, started in Start() below) already
+	// pays winners on schedule with no public trigger needed; this endpoint
+	// only exists for an admin's manual "pay now" button, so it belongs
+	// behind the same admin session gate as every other payout-adjacent
+	// admin route.
+	r.POST("/backend/leaderboard/pay-winners", s.requireAdminSession(s.handleLeaderboardPayWinners))
 	r.POST("/backend/wallet/register", rl(s.handleWalletRegister))
 	r.GET("/backend/wallet", rl(s.handleWalletGet))
 	r.GET("/backend/replay/{session_id}", rl(s.handleReplay))
@@ -154,7 +249,10 @@ func (s *Server) Register(r *router.Router) {
 	r.GET("/backend/nickname/check", rl(s.handleNicknameCheck))
 	r.GET("/backend/stats", rl(s.handleStats))
 	r.GET("/backend/quests", rl(s.handleQuests))
-	r.POST("/backend/quests/progress", rl(s.handleQuestProgress))
+	// NOTE: POST /backend/quests/progress was removed — quest progress is now
+	// applied only as a server-side side effect of replay verification (see
+	// Store.UpdateQuestProgressFromReplay, called from the /backend/submit
+	// handler below), never from a separate client-triggered request.
 	r.POST("/backend/quests/claim", rl(s.handleQuestClaim))
 	r.POST("/backend/quests/claim_all", rl(s.handleQuestClaimAll))
 	r.GET("/backend/streak/status", rl(s.handleStreakStatus))
@@ -206,6 +304,7 @@ func (s *Server) StartBackgroundServices() {
 	s.Store.StartBalanceMonitor()
 	s.Store.StartVSRoomSweep()
 	s.Store.StartVSPaymentReconciler()
+	s.Store.StartCosmeticsReconciler()
 	s.Store.StartLeaderboardPayoutLoop()
 	StartCloudflareIPRefresher()
 	log.Printf("[STARTUP] background services started (retry loop + balance monitor + vs room sweep + vs payment reconciler + leaderboard payout loop + cloudflare ip refresher)")
@@ -264,6 +363,12 @@ func writeErr(ctx *fasthttp.RequestCtx, status int, msg string) {
 	log.Printf("[ERR] %d %s %s -> %s", status, ctx.Method(), ctx.Path(), msg)
 	writeJSON(ctx, status, map[string]string{"error": msg})
 }
+
+// maxReplaySubmitTicks — hard cap on the RLE-decoded tick count a submitted
+// replay is allowed to claim before it's rejected outright (see the BUG FIX
+// comment at its use site in handleSubmit). 60 minutes at 60 ticks/sec —
+// generous enough that no real play session could plausibly hit it.
+const maxReplaySubmitTicks = 60 * 60 * 60
 
 func rleUnpack(raw []byte) (ticks []byte, deltas []float64) {
 	ticks = make([]byte, 0, len(raw)*20) // RLE expands ~20x
@@ -398,6 +503,24 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// BUG FIX (security audit — DoS): body size was never checked before
+	// json.Unmarshal, so any authed player could send a request body up to
+	// the server-wide 250MB ceiling (main.go's MaxRequestBodySize — sized for
+	// the admin replay-binary upload, not this route) and have it fully
+	// buffered AND unmarshaled (allocating a second full copy as Go strings)
+	// before the much smaller 700,000-byte replay_log check further down
+	// ever got a chance to reject it. Repeated bursts of that is a cheap
+	// memory/CPU DoS distinct from the tick-count DoS already fixed below.
+	// 2MB is generous headroom over the largest legitimate payload
+	// (700,000-byte base64 replay_log + the diagnostic ckpt array + the
+	// handful of small scalar fields) while being nowhere near 250MB.
+	const maxSubmitBodyBytes = 2 * 1024 * 1024
+	if len(ctx.PostBody()) > maxSubmitBodyBytes {
+		log.Printf("[SUBMIT] rejected — body too large (%d bytes) ip=%s", len(ctx.PostBody()), ip)
+		writeErr(ctx, 413, "payload_too_large")
+		return
+	}
+
 	var req submitReq
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		log.Printf("[SUBMIT] bad_json ip=%s err=%v", ip, err)
@@ -495,6 +618,45 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 
 	// Delta marker analysis + RLE tick count validation
 	if rawLog, decErr := base64.StdEncoding.DecodeString(replayLog); decErr == nil {
+		// RLE-decoded tick count is authoritative — it's exactly what the replay
+		// binary will see when it reads this same log. No need to compare against
+		// req.Ticks or flag on a mismatch: the client's number was only ever a
+		// hint, never the source of truth.
+		//
+		// BUG FIX (security audit — DoS): moved this cheap, allocation-free
+		// count-only pass (rleTickCount) BEFORE analyzeDeltaMarkers, which
+		// calls the full rleUnpack (allocates the entire decoded tick array,
+		// up to ~44MB for a maximal malicious log — see the tick-count bound
+		// below) just to read its `deltas` return value. Rejecting an
+		// oversized log here first means a malicious submission never
+		// triggers that expensive full decode at all.
+		decodedTicks := rleTickCount(rawLog)
+		log.Printf("[SUBMIT] session=%s rle_ticks=%d client_ticks=%d", sid8, decodedTicks, req.Ticks)
+		// BUG FIX (security audit — DoS): decodedTicks used to be trusted with
+		// no upper bound before being handed off to the headless-simulator
+		// worker pool. The RLE format's 6-bit run-length field caps each
+		// encoded byte at 63 repeated ticks, but the encoded log itself can be
+		// up to 700,000 bytes (see the replayLog length check above) — so a
+		// maliciously crafted log could claim up to ~44 million decoded ticks
+		// from one request, forcing a worker to attempt simulating that for up
+		// to the full ReplayTimeoutSec (600s) × 3 retry attempts ≈ 30 minutes
+		// of real CPU time tied up by a single HTTP POST, on a pool with as
+		// few as 2 concurrent workers by default. Rejecting absurdly long
+		// claimed sessions here — before they ever reach the simulator — costs
+		// nothing (a real run never gets remotely close to this) and closes
+		// the expensive part of the DoS. maxReplaySubmitTicks is generous
+		// (60 real-world minutes at 60 ticks/sec) so it never affects a
+		// legitimate long session.
+		if decodedTicks > maxReplaySubmitTicks {
+			log.Printf("[SUBMIT] rejected — decoded tick count %d exceeds max %d session=%s",
+				decodedTicks, maxReplaySubmitTicks, sid8)
+			writeErr(ctx, 400, "replay_too_long")
+			return
+		}
+		req.Ticks = decodedTicks
+
+		// Only now — after the cheap bound check above already passed — do
+		// the full decode+analysis pass that used to always run first.
 		isPending, deltaFlagged, deltaReason := analyzeDeltaMarkers(rawLog)
 		_ = isPending
 		if deltaFlagged && !flagged {
@@ -502,14 +664,6 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 			flagged = true
 			reason = deltaReason
 		}
-
-		// RLE-decoded tick count is authoritative — it's exactly what the replay
-		// binary will see when it reads this same log. No need to compare against
-		// req.Ticks or flag on a mismatch: the client's number was only ever a
-		// hint, never the source of truth.
-		decodedTicks := rleTickCount(rawLog)
-		log.Printf("[SUBMIT] session=%s rle_ticks=%d client_ticks=%d", sid8, decodedTicks, req.Ticks)
-		req.Ticks = decodedTicks
 	}
 
 	// Parse player seed.
@@ -581,6 +735,16 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 
 	// Replay simulation (background)
 	if !flagged {
+		// See tryClaimReplaySlot's doc comment — caps how many of THIS
+		// player's replay verifications can be running at once, independent
+		// of the generic per-IP rate limiter, so one account can't saturate
+		// the whole (small, by default 2-worker) verification pool and starve
+		// every other player's submissions behind it.
+		if !tryClaimReplaySlot(authedPlayer) {
+			log.Printf("[SUBMIT] rejected — too many in-flight replay verifications player=%s", authedPlayer[:min8(authedPlayer)])
+			writeErr(ctx, 429, "too_many_pending_replays")
+			return
+		}
 		// BUG-AVOIDANCE: ctx (fasthttp.RequestCtx) gets reused/reset by
 		// fasthttp the moment this handler returns — this goroutine keeps
 		// running well after that. Reading ctx.RemoteIP()/headers from
@@ -591,6 +755,7 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 		// as an explicit param instead of closing over ctx/req directly).
 		clientIP := realClientIP(ctx)
 		go func(sessionID, playerID string, clientScore int, log64 string, seed int64, charIdx int, gyroActive bool, playerSeed int64, ticks int, vsRoomID, vsRole string, clientCkpt json.RawMessage, clientIP string) {
+			defer releaseReplaySlot(playerID)
 			log.Printf("[REPLAY_SIM] queued session=%s seed=%d b64=%d ticks=%d", sessionID[:8], seed, len(log64), ticks)
 			result := game.SimulateReplayWithRetry(sessionID, log64, seed, charIdx, gyroActive, playerSeed, ticks)
 
@@ -616,7 +781,12 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 
 			log.Printf("[REPLAY_SIM] session=%s %s", sessionID[:8], game.SummaryLine(result, clientScore))
 
-			simFlagged, simReason := game.ParseFlagReason(clientScore, result.ServerScore, 0.05)
+			// Tolerance is admin-configurable (Database... System tab, defaults
+			// to 0 = exact match required) — see AppConfig.ScoreMismatchTolerancePercent's
+			// doc comment. The score actually stored below is ALWAYS
+			// result.ServerScore regardless of this setting; it only decides
+			// whether the run gets flagged as suspicious.
+			simFlagged, simReason := game.ParseFlagReason(clientScore, result.ServerScore, s.Store.ScoreMismatchTolerance())
 			stored.ServerScore = result.ServerScore
 			stored.TotalKills = result.QuestKills
 			stored.TotalPlatforms = result.QuestPlatforms
@@ -630,8 +800,29 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 				// client's own recorded checkpoints and the server's re-simulation
 				// checkpoints parted ways (position/score/rng-state), instead of
 				// just the aggregate score-diff percentage above. Never affects
-				// the flagging decision itself — purely diagnostic logging.
-				game.LogCheckpointDivergence(sessionID, clientCkpt, result)
+				// the flagging decision itself — purely diagnostic. Its result is
+				// now folded into the archived entry below (see the "extra" map)
+				// instead of only being a log.Printf line — a log line rotates out
+				// of retention long before anyone notices a ~0.5%-rate issue is
+				// worth investigating; an archived, queryable field doesn't.
+				ckptDiv := game.LogCheckpointDivergence(sessionID, clientCkpt, result)
+				extra := map[string]any{
+					"client_score": clientScore,
+					"server_score": result.ServerScore,
+					"ticks":        ticks,
+				}
+				if ckptDiv != nil {
+					extra["ckpt_first_diverge_tick"] = ckptDiv.FirstDivergeTick
+					if ckptDiv.FirstDivergeDetail != "" {
+						extra["ckpt_first_diverge_detail"] = ckptDiv.FirstDivergeDetail
+					}
+					extra["ckpt_matched"] = ckptDiv.MatchedCheckpoints
+					extra["ckpt_client_count"] = ckptDiv.ClientCheckpoints
+					extra["ckpt_server_count"] = ckptDiv.ServerCheckpoints
+					if ckptDiv.Note != "" {
+						extra["ckpt_note"] = ckptDiv.Note
+					}
+				}
 				// İsteğe bağlı arşiv: score mismatch'leri de worker timeout'larıyla
 				// aynı failed_replays klasörüne kaydet — sebebi anlamak için elindeki
 				// log'lar kalıcı olsun, manuel olarak yeniden simüle edebilesin.
@@ -644,11 +835,7 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 					log64,
 					"score_mismatch",
 					simReason,
-					map[string]any{
-						"client_score": clientScore,
-						"server_score": result.ServerScore,
-						"ticks":        ticks,
-					},
+					extra,
 				)
 			} else {
 				stored.State = models.StateCompleted
@@ -665,9 +852,31 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 			// side sends the whole match to MANUAL REVIEW so no money moves until
 			// an admin has looked at it.
 			if vsRoomID != "" {
+				// BUG FIX ("vs sistemi ... webde oynasa bile tam ödemeyi
+				// alır ... asla düşürülmez"): this used to send the WHOLE
+				// match to manual review — no payout to either side — the
+				// instant simFlagged was true, even though at this point the
+				// replay itself already re-simulated successfully
+				// (result != nil, we're past the "replay_failed" branch
+				// above) and result.ServerScore is a real, independently
+				// server-computed, trusted score. simFlagged here only means
+				// the CLIENT's self-reported score didn't exactly match the
+				// server's — with the score-mismatch tolerance defaulting to
+				// 0% (admin-configurable), a single point of web/native
+				// platform rounding noise was enough to trip this and freeze
+				// a legitimately-won match's payout pending manual admin
+				// action. Same rule as everywhere else in this codebase: the
+				// server's own verified score is the ONLY thing that's ever
+				// trusted/used — a flag is for admin visibility (still
+				// logged below), never a reason to withhold money. Genuine
+				// problems (pre-replay anti-cheat catches, or a replay that
+				// couldn't be verified AT ALL) still go to manual review —
+				// see the "anti_cheat"/"replay_failed" FlagVSRoomForReview
+				// calls elsewhere in this handler, untouched by this fix.
 				if simFlagged {
-					s.Store.FlagVSRoomForReview(vsRoomID, vsRole, "score_mismatch: "+simReason)
-				} else if _, verr := s.Store.UpdateVSRoomScore(vsRoomID, vsRole, result.ServerScore, sessionID); verr != nil {
+					log.Printf("[VSROOM] score_mismatch flagged but settling normally with server-verified score room=%s role=%s reason=%s", vsRoomID, vsRole, simReason)
+				}
+				if _, verr := s.Store.UpdateVSRoomScore(vsRoomID, vsRole, result.ServerScore, sessionID); verr != nil {
 					log.Printf("[VSROOM] score update failed room=%s role=%s session=%s err=%v", vsRoomID, vsRole, sessionID[:8], verr)
 				}
 			}

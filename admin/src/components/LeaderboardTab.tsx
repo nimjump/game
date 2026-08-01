@@ -6,6 +6,7 @@ import {
   resetLeaderboard,
 } from "@/lib/api";
 import NimiqAvatar from "@/components/NimiqAvatar";
+import PlayerDetailModal from "@/components/PlayerDetailModal";
 
 type Period = "daily" | "weekly";
 
@@ -85,6 +86,7 @@ export default function LeaderboardTab() {
   const [error,   setError]   = useState("");
   const [resetting, setResetting] = useState(false);
   const [resetMsg,  setResetMsg]  = useState("");
+  const [detailPlayer, setDetailPlayer] = useState<string | null>(null);
 
   const load = async (p: Period) => {
     setLoading(true); setError("");
@@ -189,7 +191,11 @@ export default function LeaderboardTab() {
                       </span>
                     </td>
                     <td>
-                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                      <div
+                        style={{ display: "flex", alignItems: "center", gap: 10, cursor: e.player_id ? "pointer" : "default" }}
+                        onClick={() => e.player_id && setDetailPlayer(e.player_id)}
+                        title={e.player_id ? `${e.player_id} — click for details` : undefined}
+                      >
                         <NimiqAvatar address={e.player_id} size={34} />
                         <div>
                           <div style={{ fontWeight: 600, color: "var(--orange)" }}>
@@ -210,6 +216,10 @@ export default function LeaderboardTab() {
             </table>
           )}
         </div>
+      )}
+
+      {detailPlayer && (
+        <PlayerDetailModal playerID={detailPlayer} onClose={() => setDetailPlayer(null)} />
       )}
     </div>
   );

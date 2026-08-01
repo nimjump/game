@@ -191,11 +191,16 @@ var _replay_dir    : int = 0
 # time and replay time), a recording and its later replay/server-verify
 # always agree on which behavior to use, even if the player's live control
 # setting has since changed.
-var _move_ramp_ticks         := 0
-var _move_ramp_last_dir      := 0
 var _gyro_control_active_run := false   # set once via set_gyro_control_active(), not written per-tick
-const MOVE_RAMP_TICKS      := 10     # ~0.167s at 60 ticks/sec to reach full speed
-const MOVE_RAMP_START_FRAC := 0.45   # fraction of MOVE_SPEED at the very first tick of a new direction
+## TUNING (reduced per player feedback — "smoothingi abartmışsın", felt too
+## floaty/laggy vs. the old instant-snap feel): was 10 (~0.167s to reach full
+## speed from a standing start, ~0.333s for a full reversal). Cut to 4
+## (~0.067s from standstill, ~0.133s reversal) — GYRO-ONLY still (see
+## simulate_tick()'s `if _gyro_control_active_run:` branch; tap/keyboard
+## remains completely instant/unsmoothed, unaffected by this constant either
+## way), just a much shorter, snappier acceleration window instead of the
+## harsh instant-partial-speed-snap the smoothing was originally added to fix.
+const MOVE_RAMP_TICKS := 4
 
 
 ## Called once per match — by GameManager at match start when recording live
@@ -670,12 +675,13 @@ func activate() -> void:
 	# landing-adjacent gate from a clean, identical state.
 	_was_on_floor = false
 
-	# Same stale-across-replay-views risk class as the three resets above —
-	# the movement ramp counter (see its declaration comment) must start
-	# fresh for every new game/replay, not carry over whatever ramp
-	# progress the Player node happened to have from a previous run.
-	_move_ramp_ticks    = 0
-	_move_ramp_last_dir = 0
+	# NOTE: the old movement-ramp tick counter that used to be reset here
+	# (_move_ramp_ticks/_move_ramp_last_dir) was removed — turning
+	# acceleration is now driven by move_toward() on velocity.x directly (see
+	# simulate_tick()), which needs no separate counter state of its own:
+	# velocity itself is already reset to Vector2.ZERO alongside this function
+	# (see the reset a few lines above this one), so a fresh game/replay
+	# starts turning acceleration from a clean state automatically.
 
 	if !_is_headless:
 		_anim_sprite.scale = Vector2(0.28, 0.28)
@@ -764,7 +770,34 @@ func simulate_tick() -> void:
 	# Direct field access avoids .get() string lookup
 	if _game_manager != null:
 		_gm_in_replay = (_game_manager._replay_mode == 2)
-	if not _gm_in_replay and OS.is_debug_build():
+	# SECURITY/DETERMINISM FIX: this whole block reads Input.is_key_pressed()
+	# directly, INSIDE the deterministic per-tick simulation function. That
+	# makes it a hidden input channel that never goes through the recorded
+	# rdir/RLE replay log — the server's headless re-simulation of a match
+	# only ever replays logged rdir values, so it can NEVER see G/J/K being
+	# pressed, no matter how many times it re-runs the log.
+	#
+	# It used to be gated on `OS.is_debug_build()` alone. That is NOT a safe
+	# production gate: `is_debug_build()` is true for *any* debug-template
+	# export, not just editor runs, and it is easy to accidentally ship a
+	# debug-template Web build (this happened before — see export history).
+	# If that ever happens again, any live player could hold G to get
+	# god_mode (99 lives + a 1.5x JUMP_SPEED save-bounce every time they fall
+	# off-camera, applied every single fall for the rest of the run — see
+	# GameManager.gd's `if player.god_mode:` branch) or J/K for infinite
+	# jetpack/wings — all of which directly inflate `highest_y`/`score`
+	# every tick after activation, while the replay log the server verifies
+	# against contains no record of it ever happening. That reproduces
+	# EXACTLY the "client score dramatically higher than server, for the
+	# identical recorded input, every single retry" signature reported by
+	# the game owner (the server retry is deterministic because it never
+	# had access to the key-press in the first place).
+	#
+	# Fix: gate on `OS.has_feature("editor")` instead — true ONLY when
+	# actually running inside the Godot editor, never true in ANY exported
+	# build (debug or release, web/desktop/headless). This closes the gap
+	# without touching editor-based debugging workflows.
+	if not _gm_in_replay and OS.has_feature("editor"):
 		if Input.is_key_pressed(KEY_G) and not _god_key_held:
 			_god_key_held = true
 			god_mode = true
@@ -863,30 +896,47 @@ func simulate_tick() -> void:
 		dir_int = -dir_int
 	var dir := float(dir_int)
 
-	# Movement ramp — GYRO-ONLY (tap stays instant/snappy). Reset to the
-	# start of the ramp whenever direction goes neutral or flips sign (a
-	# fresh push), otherwise count up ticks held in the same direction.
-	# min(...) caps it at MOVE_RAMP_TICKS so this is a cheap O(1) counter,
-	# never grows unbounded over a long run. When gyro isn't active this
-	# match, ramp_frac is pinned to 1.0 (unchanged, full-speed-instantly
-	# behavior) but the tick counter itself still updates for free — cheap,
-	# and means flipping _gyro_control_active_run mid-tick-loop (which never
-	# actually happens — see its own doc comment) couldn't produce a stale
-	# ramp value either way.
-	if dir_int == 0 or dir_int != _move_ramp_last_dir:
-		_move_ramp_ticks = 0
-	else:
-		_move_ramp_ticks = mini(_move_ramp_ticks + 1, MOVE_RAMP_TICKS)
-	_move_ramp_last_dir = dir_int
-	var ramp_frac := 1.0
-	if _gyro_control_active_run:
-		var ramp_t : float = float(_move_ramp_ticks) / float(MOVE_RAMP_TICKS)
-		# ∈ [MOVE_RAMP_START_FRAC, 1.0] — never exceeds 1.0, so ramped speed
-		# can never exceed the normal full MOVE_SPEED, only approach it.
-		ramp_frac = MOVE_RAMP_START_FRAC + (1.0 - MOVE_RAMP_START_FRAC) * ramp_t
+	var current_move := MOVE_SPEED * (1.35 if _speed_boost else 1.0)
 
-	var current_move := MOVE_SPEED * (1.35 if _speed_boost else 1.0) * ramp_frac
-	velocity.x = dir * current_move
+	# Movement smoothing — GYRO-ONLY (tap stays instant/snappy, unchanged).
+	#
+	# BUG FIX (player feedback: gyro direction flips felt "sert/salakça" —
+	# harsh/jarring): the old scheme counted ticks-held-in-one-direction and
+	# snapped velocity.x to a FRACTION of full speed (MOVE_RAMP_START_FRAC,
+	# 45%) the INSTANT any new direction registered, THEN ramped from there up
+	# to 100% over MOVE_RAMP_TICKS. For a genuine direction reversal (say,
+	# moving full speed left, gyro tips right) that meant an instant one-tick
+	# jump from -MOVE_SPEED to +0.45*MOVE_SPEED — a visible "warp" rather than
+	# a turn, and since raw tilt naturally flickers near the trigger threshold
+	# (see GYRO_BASE_THRESHOLD_DEG in Main.gd), a wobbling hand could produce
+	# a series of these instant partial-speed snaps in quick succession,
+	# which read as jittery/unnatural.
+	#
+	# Replaced with move_toward() capping how much velocity.x can change in a
+	# single tick, continuously sliding from WHEREVER velocity.x already is
+	# toward the new target — including smoothly through zero and through a
+	# full sign flip — instead of snapping to a fixed fraction. Same overall
+	# acceleration budget as before (0 to full speed over MOVE_RAMP_TICKS
+	# ticks from a standing start: max_delta_v = current_move / MOVE_RAMP_TICKS
+	# per tick), so a deliberate hold-in-one-direction still reaches full
+	# speed in the same ~0.167s as before — only the FEEL of a direction
+	# change is smoother now, not the top speed or how fast it's reached from
+	# rest.
+	#
+	# DETERMINISM: still a pure function of state that's identical on live
+	# client and server replay-verification — velocity.x from the previous
+	# tick (itself built up tick-by-tick the same way on both sides) and this
+	# tick's discretized dir (the only gyro-derived value that ever enters the
+	# recorded replay log — see Main.gd's determinism note by
+	# GYRO_BASE_THRESHOLD_DEG). No wall-clock time, no client-only state, and
+	# no separate counter variable needed (unlike the old scheme) — velocity
+	# is already part of Player's per-tick simulated state on both sides.
+	if _gyro_control_active_run:
+		var target_vx := dir * current_move
+		var max_delta_v := current_move / float(MOVE_RAMP_TICKS)
+		velocity.x = move_toward(velocity.x, target_vx, max_delta_v)
+	else:
+		velocity.x = dir * current_move
 
 	# Platform collision active only when falling (checked with manual AABB)
 	var want_plat_col : bool = velocity.y > 0 and not is_powered_up
@@ -1025,12 +1075,26 @@ func simulate_tick() -> void:
 				_drunk_ghost_timer = 0
 				_spawn_drunk_ghost()
 
-	_prev_velocity_y = velocity.y
 	# Cross-platform determinism: snap physics state to fixed grid (WASM vs native drift)
 	global_position.x = snappedf(global_position.x, 0.01)
 	global_position.y = snappedf(global_position.y, 0.01)
 	velocity.x = snappedf(velocity.x, 0.01)
 	velocity.y = snappedf(velocity.y, 0.01)
+	# DETERMINISM FIX: capture _prev_velocity_y AFTER snapping, not before. This
+	# used to run one line above the snappedf() block, so it stored the RAW
+	# (pre-snap) velocity.y — the one float in this tick that was NOT forced
+	# onto the fixed 0.01 grid the rest of the physics state uses specifically
+	# to eliminate WASM-vs-native last-bit drift (see comment below). Next
+	# tick, the landing gate at `if _prev_velocity_y > 0.001:` (which decides
+	# whether a landing counts toward the platform's break counter) reads
+	# that unsnapped value — so a shallow/near-zero-velocity landing (the
+	# exact case the 0.0625→0.001 gate fix above was written for) could sit
+	# right at that tiny 0.001 threshold and tip a different way on the
+	# client (recording) than on the server (replay) purely from ULP-level
+	# float noise, silently miscounting a platform's hit total by one.
+	# Snapping before the capture makes _prev_velocity_y exactly reproduce
+	# the same grid-quantized value both sides already agree on.
+	_prev_velocity_y = velocity.y
 	# _update_animation / _update_overlays / _update_glow run in _physics_process (frame-rate)
 
 

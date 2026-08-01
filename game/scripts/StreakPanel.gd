@@ -124,7 +124,10 @@ func _build_ui() -> void:
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+		# Close on RELEASE not press — see LeaderboardPanel.gd's dim handler for
+		# the full explanation (press-triggered close lets the release half of
+		# the same tap leak through onto whatever's now exposed underneath).
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
 	)
 	_panel_ctrl.add_child(dim)
@@ -197,28 +200,55 @@ func _build_ui() -> void:
 	body.add_theme_constant_override("separation", int(ref * 0.020))
 	body_mc.add_child(body)
 
-	# Big streak-day number — BUG FIX: no longer paired with a redundant
-	# calendar icon (the header row above already has one right next to
-	# "DAILY STREAK") — plain and centered on its own now, and toned down
-	# from 0.060 to 0.052 so it doesn't dwarf the subtitle/countdown lines
-	# below it (see their own size bumps a few lines down — the goal is a
-	# readable size HIERARCHY, not one giant number next to unreadably tiny
-	# captions).
+	# Big streak-day number — REDESIGN: paired with a flame icon in its own
+	# row (the classic "streak flame" language every daily-login system uses)
+	# so the number reads as a streak counter at a glance instead of a bare
+	# digit floating in whitespace. This is the panel's visual centerpiece,
+	# so it also sits inside its own soft rounded card instead of directly on
+	# the panel background — that card is what actually fills the "dead
+	# empty middle" the flat number alone left behind.
+	var hero_card := PanelContainer.new()
+	var hero_style := StyleBoxFlat.new()
+	hero_style.bg_color = Color(0.895, 0.780, 0.620, 0.55)
+	hero_style.set_corner_radius_all(int(ref * 0.024))
+	hero_style.content_margin_left   = int(ref * 0.024)
+	hero_style.content_margin_right  = int(ref * 0.024)
+	hero_style.content_margin_top    = int(ref * 0.018)
+	hero_style.content_margin_bottom = int(ref * 0.018)
+	hero_card.add_theme_stylebox_override("panel", hero_style)
+	body.add_child(hero_card)
+
+	var hero_col := VBoxContainer.new()
+	hero_col.alignment = BoxContainer.ALIGNMENT_CENTER
+	hero_col.add_theme_constant_override("separation", int(ref * 0.006))
+	hero_card.add_child(hero_col)
+
+	var hero_row := HBoxContainer.new()
+	hero_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	hero_row.add_theme_constant_override("separation", int(ref * 0.014))
+	hero_col.add_child(hero_row)
+
+	# NOTE: no "flame" icon exists in this project's lucide icon set (see
+	# game/assets/icons/lucide/) — "zap" is the closest available match for
+	# the "streak energy" idea and is already used nowhere else in this panel.
+	hero_row.add_child(UITheme.lucide_icon("zap", int(ref * 0.056), Color(0.860, 0.420, 0.100)))
+
 	_day_lbl = Label.new()
 	_day_lbl.text = "Day 0"
 	_day_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	UITheme.apply_label(_day_lbl, Color(0.220, 0.130, 0.060), int(ref * 0.052))
-	body.add_child(_day_lbl)
+	UITheme.apply_label(_day_lbl, Color(0.220, 0.130, 0.060), int(ref * 0.058))
+	hero_row.add_child(_day_lbl)
 
 	# "current streak" caption under the big "Day N" — echoes the same
 	# "Day N" phrasing the calendar cards below already use (instead of a
 	# separate "N day streak" sentence), so the whole panel reads as one
-	# consistent day-counter idea instead of two different phrasings.
+	# consistent day-counter idea instead of two different phrasings. Now
+	# lives inside the hero card, right under the flame+number row.
 	_day_sub_lbl = Label.new()
 	_day_sub_lbl.text = "current streak"
 	_day_sub_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	UITheme.apply_label(_day_sub_lbl, Color(0.460, 0.300, 0.160), int(ref * 0.034))
-	body.add_child(_day_sub_lbl)
+	hero_col.add_child(_day_sub_lbl)
 
 	# Claimable amount
 	_amount_lbl = Label.new()
@@ -335,8 +365,15 @@ func _render_state() -> void:
 	_day_lbl.text = "Day %d" % _streak_day
 	_update_countdown()
 	if _streak_day <= 0:
+		# BUG FIX ("ortadaki kısım çok zayıf/boş gözüküyo"): both labels used to
+		# go blank here AND _refresh_calendar() below early-returned with no
+		# streak yet, so with no active streak this entire middle section
+		# rendered as dead whitespace between the hero card and the countdown.
+		# Now it always shows what day 1's reward actually is, so there's
+		# still concrete content (and a reason to tap Claim) even before any
+		# streak exists.
 		_amount_lbl.text = ""
-		_tomorrow_lbl.text = ""
+		_tomorrow_lbl.text = "Start today: +%.2f NIM" % _reward_for_day(1)
 		_status_lbl.text = "Play today to start a streak!"
 		_claim_btn.disabled = true
 		_claim_btn.text = "Claim"
@@ -443,15 +480,19 @@ func _refresh_calendar() -> void:
 		return
 	for c in _calendar_row.get_children():
 		c.queue_free()
-	if _streak_day <= 0:
-		return
-
+	# BUG FIX: this used to just `return` here with no active streak yet
+	# (_streak_day <= 0), leaving the whole calendar strip empty — exactly
+	# the "zayıf/boş ortadaki kısım" the panel was criticized for. Now it
+	# still renders a Day 1..N preview so there's always something concrete
+	# to look at, just entirely in the "future/locked" visual style since
+	# none of it is banked yet.
 	var ref := _ref_px if _ref_px > 0.0 else GameConstants.VW
 	var back : int = (CALENDAR_DAYS_SHOWN - 1) / 2
-	# Clamping start_day up to 1 on an early streak (day 1/2) and always
-	# deriving end_day FROM start_day (not independently) keeps the card
-	# count fixed at CALENDAR_DAYS_SHOWN in every case — the window just
-	# shifts forward instead of shrinking to fewer, off-center cards.
+	# Clamping start_day up to 1 on an early streak (day 1/2, or no streak at
+	# all) and always deriving end_day FROM start_day (not independently)
+	# keeps the card count fixed at CALENDAR_DAYS_SHOWN in every case — the
+	# window just shifts forward instead of shrinking to fewer, off-center
+	# cards.
 	var start_day : int = maxi(1, _streak_day - back)
 	var end_day   : int = start_day + CALENDAR_DAYS_SHOWN - 1
 

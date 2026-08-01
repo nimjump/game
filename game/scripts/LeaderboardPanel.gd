@@ -117,7 +117,17 @@ func _build_ui() -> void:
 	# panel missing it.
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+		# BUG FIX: close on RELEASE, not press. Godot's Button.pressed signal
+		# fires on release by default — closing (hide()) the instant the PRESS
+		# half of a tap lands here removes this CanvasLayer from the hit-test
+		# tree immediately, so the RELEASE half of that same tap "leaks"
+		# through onto whatever's now exposed underneath (e.g. a bottom-nav
+		# Button at the same screen position), instantly firing IT too —
+		# "tap outside to close" was actually "tap outside, then immediately
+		# activate whatever's behind it". Closing on release instead means
+		# this dim (still visible/hit-testable during the press) consumes
+		# BOTH halves of the tap, so nothing behind it ever sees either one.
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
 	)
 	_panel_ctrl.add_child(dim)
@@ -811,17 +821,25 @@ func _load_nimiq_avatar_async(target: Control, address: String, size: int) -> vo
 		await get_tree().create_timer(0.1).timeout
 		if not is_instance_valid(target): return
 
+	# SECURITY: address/key are JSON.stringify()'d before splicing into the JS
+	# literal (matches the pattern already used in NimiqJS.gd's start_payment/
+	# start_hub_sign) instead of naive '...'+var+'...' concatenation — address
+	# is normally format-constrained (a proven Nimiq address from a signed
+	# login), but this closes the injection path regardless of that constraint
+	# holding everywhere it's called from.
+	var js_addr := JSON.stringify(address)
+	var js_key := JSON.stringify(key)
 	var js_code := (
 		"(function(){"
 		+ "if(!window._nimiqPending) window._nimiqPending = {};"
-		+ "window._nimiqPending['" + key + "'] = null;"
+		+ "window._nimiqPending[" + js_key + "] = null;"
 		+ "if(typeof window.getNimiqAvatar !== 'function'){"
 		+ "  console.warn('[Avatar] not ready');"
-		+ "  window._nimiqPending['" + key + "'] = ''; return;"
+		+ "  window._nimiqPending[" + js_key + "] = ''; return;"
 		+ "}"
-		+ "window.getNimiqAvatar('" + address + "')"
+		+ "window.getNimiqAvatar(" + js_addr + ")"
 		+ "  .then(function(svgData){"
-		+ "    if(!svgData){ window._nimiqPending['" + key + "'] = ''; return; }"
+		+ "    if(!svgData){ window._nimiqPending[" + js_key + "] = ''; return; }"
 		+ "    console.log('[Avatar] got svg len=' + svgData.length);"
 		+ "    var img = new Image();"
 		+ "    img.onload = function(){"
@@ -829,21 +847,21 @@ func _load_nimiq_avatar_async(target: Control, address: String, size: int) -> vo
 		+ "        var c = document.createElement('canvas');"
 		+ "        c.width = " + str(size) + "; c.height = " + str(size) + ";"
 		+ "        c.getContext('2d').drawImage(img, 0, 0, " + str(size) + ", " + str(size) + ");"
-		+ "        window._nimiqPending['" + key + "'] = c.toDataURL('image/png');"
+		+ "        window._nimiqPending[" + js_key + "] = c.toDataURL('image/png');"
 		+ "        console.log('[Avatar] png ready');"
-		+ "      } catch(e){ window._nimiqPending['" + key + "'] = ''; }"
+		+ "      } catch(e){ window._nimiqPending[" + js_key + "] = ''; }"
 		+ "    };"
-		+ "    img.onerror = function(){ window._nimiqPending['" + key + "'] = ''; };"
+		+ "    img.onerror = function(){ window._nimiqPending[" + js_key + "] = ''; };"
 		+ "    img.src = svgData;"
 		+ "  })"
-		+ "  .catch(function(e){ console.warn('[Avatar] err:',e); window._nimiqPending['" + key + "'] = ''; });"
+		+ "  .catch(function(e){ console.warn('[Avatar] err:',e); window._nimiqPending[" + js_key + "] = ''; });"
 		+ "})();"
 	)
 	JavaScriptBridge.eval(js_code, true)
 	for _i in 50:
 		await get_tree().create_timer(0.1).timeout
 		if not is_instance_valid(target): return
-		var raw = JavaScriptBridge.eval("window._nimiqPending['%s']" % key, true)
+		var raw = JavaScriptBridge.eval("window._nimiqPending[%s]" % js_key, true)
 		if raw == null: continue
 		var result := str(raw)
 		if result == "" or result == "null" or result == "undefined":

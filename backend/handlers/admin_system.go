@@ -51,6 +51,10 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 		// VSFeePercent — system fee % taken from a VS pot (0..100). 0 is valid
 		// (no fee), so it's a pointer like the streak knobs.
 		VSFeePercent *float64 `json:"vs_fee_percent"`
+		// ScoreMismatchTolerancePercent — see AppConfig's doc comment. 0 (exact
+		// match) is valid and is the default, so this is a pointer like the
+		// streak/VS-fee knobs above — must accept an explicit 0, not just >0.
+		ScoreMismatchTolerancePercent *float64 `json:"score_mismatch_tolerance_percent"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
@@ -84,13 +88,16 @@ func (s *Server) handleAdminSetConfig(ctx *fasthttp.RequestCtx) {
 	if req.VSFeePercent != nil && *req.VSFeePercent >= 0 && *req.VSFeePercent <= 100 {
 		cfg.VSFeePercent = req.VSFeePercent
 	}
+	if req.ScoreMismatchTolerancePercent != nil && *req.ScoreMismatchTolerancePercent >= 0 && *req.ScoreMismatchTolerancePercent <= 100 {
+		cfg.ScoreMismatchTolerancePercent = req.ScoreMismatchTolerancePercent
+	}
 	if err := s.Store.SaveAppConfig(cfg); err != nil {
 		writeErr(ctx, 500, "save_error")
 		return
 	}
-	log.Printf("[ADMIN] config updated: daily=%v weekly=%v daily_earn_cap_nim=%.4f coin_nim_rate=%.6f streak_base=%v streak_extra=%v streak_max=%v max_accounts_per_ip=%v",
+	log.Printf("[ADMIN] config updated: daily=%v weekly=%v daily_earn_cap_nim=%.4f coin_nim_rate=%.6f streak_base=%v streak_extra=%v streak_max=%v max_accounts_per_ip=%v score_mismatch_tolerance_pct=%v",
 		cfg.DailyLeaderboardEnabled, cfg.WeeklyLeaderboardEnabled, cfg.DailyEarnCapNIM, cfg.CoinNIMRate,
-		cfg.StreakRewardBaseNIM, cfg.StreakRewardExtraPerDayNIM, cfg.StreakRewardMaxNIM, cfg.MaxRewardAccountsPerIP)
+		cfg.StreakRewardBaseNIM, cfg.StreakRewardExtraPerDayNIM, cfg.StreakRewardMaxNIM, cfg.MaxRewardAccountsPerIP, cfg.ScoreMismatchTolerancePercent)
 	writeJSON(ctx, 200, cfg)
 }
 
@@ -205,6 +212,12 @@ func (s *Server) handleAdminLeaderboardReset(ctx *fasthttp.RequestCtx) {
 // each platform (captured at wallet-auth verify time, see game/device.go).
 func (s *Server) handleAdminDeviceBreakdown(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, map[string]any{"platforms": s.Store.DeviceBreakdown()})
+}
+
+// GET /backend/admin/country-breakdown — how many distinct players last
+// connected from each country. See game/player_ip.go's CountryBreakdown.
+func (s *Server) handleAdminCountryBreakdown(ctx *fasthttp.RequestCtx) {
+	writeJSON(ctx, 200, map[string]any{"countries": s.Store.CountryBreakdown()})
 }
 
 // GET /backend/admin/quest-pool — every quest template in the pool

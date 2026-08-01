@@ -178,6 +178,14 @@ var _ping_retry_timer: SceneTreeTimer = null  # auto-retry handle
 var _torch_rects   : Array  = []     # [left_torch, right_torch] TextureRect nodes
 var _torch_tween   : Tween  = null   # torch flicker animation
 
+# Idle "breathing" loop tweens (title scale, PLAY button glow, character
+# selector bob) — see _build_start_ui(). Tracked as member vars (rather than
+# left as locals) + registered in _idle_loop_tweens so _notification() below
+# can pause/resume them around the app losing/regaining focus.
+var _title_tw : Tween = null
+var _play_tw  : Tween = null
+var _sel_tw   : Tween = null
+
 
 
 # ── Nimiq ─────────────────────────────────────────────────────────
@@ -237,6 +245,16 @@ var _ref : float = GameConstants.VW
 # "tap"  = tap left/right half of screen
 # "gyro" = tilt device to control
 var _control_mode       : String  = "tap"   # default: tap
+# TUNING (widened per player feedback — holding the phone dead-center still
+# triggered left/right flips from ordinary hand tremor): was 5.0. At the
+# default sensitivity (1.5 below) the ACTUAL trigger angle is this divided by
+# sensitivity — 5.0/1.5 ≈ 3.3° was genuinely tight enough for a resting-hand
+# tremor to cross it. 8.0/1.5 ≈ 5.3° to trigger, ≈2.7° hysteresis-release
+# (same 0.5x ratio as before) gives noticeably more "hold still" tolerance
+# before a turn registers, while a real deliberate tilt still triggers fast.
+# Single source of truth for all three duplicated threshold formulas (web JS
+# fallback, web JS live value sent via _ensure_gyro_js, native fallback).
+const GYRO_BASE_THRESHOLD_DEG := 8.0
 var _gyro_sensitivity   : float   = 1.5     # gyro sensitivity (0.5–3.0)
 var _gyro_auto_calib    : bool    = true    # auto-zero on start
 var _gyro_dead_zone     : float   = 0.08    # threshold — below this is treated as 0
@@ -354,8 +372,43 @@ func _ready() -> void:
 			window._gyroSmooth   = 0;
 			window._gyroDir      = 0;
 			window._gyroBase     = 0;
-			window._gyroCalibN   = 0;
 			window._gyroPermDenied = false;
+			// TIME-BASED SMOOTHING/CALIBRATION (bug fix — security/QA audit):
+			// both the EMA smoothing below and the calibration baseline average
+			// used to be driven purely by EVENT COUNT ("blend with alpha=0.5 per
+			// devicemotion event", "average the first 15 events") on the
+			// documented assumption that devicemotion fires at a steady ~60Hz.
+			// That assumption doesn't hold across real Android hardware —
+			// different OEMs/chipsets report devicemotion anywhere from ~15Hz to
+			// 200Hz+. At a lower real rate, "0.5 per event" is a much STRONGER
+			// smoothing pull per unit wall-clock time (fewer, bigger corrective
+			// jumps — feels laggy/sluggish); at a much higher rate it's a much
+			// WEAKER pull per unit time (barely smooths at all — noise gets
+			// through). Likewise "first 15 events" can take anywhere from ~75ms
+			// to ~1s of real time to complete depending on device, even though
+			// the game always assumes it settles in about the same ~250ms.
+			// Fixed by driving both off actual elapsed wall-clock time (dt)
+			// instead of a per-event count, so behavior is now consistent
+			// across devices regardless of their native sensor sample rate.
+			window._gyroLastEventMs  = 0;      // ms timestamp of the previous devicemotion sample
+			window._gyroCalibStartMs = 0;      // ms timestamp the current calibration window began
+			window._gyroCalibSum     = 0;      // Σ(g·dt) accumulated during the calibration window
+			window._gyroCalibDt      = 0;      // Σdt (seconds) accumulated during the calibration window
+			window._gyroCalibDone    = true;   // starts true so the raw-fallback path below is inert until a listener actually (re)starts a window
+			// EMA time-constant: chosen so that at the ORIGINAL tuning device's
+			// rate (~60Hz, dt≈16.7ms) this reproduces the exact same alpha≈0.5
+			// blend the smoothing was tuned against — i.e. this is not a feel
+			// change on typical hardware, only a consistency fix on atypical
+			// hardware. (alpha = 1 - e^(-dt/tau); solving alpha=0.5 at
+			// dt=1/60s gives tau = (1/60)/ln(2) ≈ 0.02405s.)
+			var GYRO_EMA_TAU_S     = 0.02405;
+			// Calibration window: 400ms post-start grace (unchanged — see the
+			// existing grace-window bug-fix comment below) + a 250ms sampling
+			// window, matching the ~250ms the old "15 events @ 60Hz" scheme
+			// took on the hardware it was tuned against — again a consistency
+			// fix, not a retune.
+			var GYRO_CALIB_GRACE_MS  = 400;
+			var GYRO_CALIB_WINDOW_MS = 250;
 			window._startGyroListener = function() {
 				if (window._gyroListenerSet) return;
 				window._gyroListenerSet = true;
@@ -373,6 +426,16 @@ func _ready() -> void:
 				// 400ms lets that transient settle before anything counts toward
 				// the baseline.
 				var _listenerStartMs = Date.now();
+				// Arm the time-windowed calibration (see the doc comment above
+				// GYRO_EMA_TAU_S/GYRO_CALIB_*): reset the accumulators and mark
+				// the window as "in progress" so the handler below actually
+				// collects samples for it. Also re-armed by the Settings
+				// "Auto Set" button on manual recalibration.
+				window._gyroCalibStartMs = _listenerStartMs;
+				window._gyroCalibSum     = 0;
+				window._gyroCalibDt      = 0;
+				window._gyroCalibDone    = false;
+				window._gyroLastEventMs  = 0;
 				// BUG FIX (iOS'ta gyro ters hareket ediyordu): iOS Safari/WebKit's
 				// devicemotion.accelerationIncludingGravity reports the OPPOSITE sign
 				// on the x-axis compared to Chrome/Android for the exact same physical
@@ -412,32 +475,61 @@ func _ready() -> void:
 					// single-sample spikes that used to go straight into `tilted`
 					// and could flip _gyroDir back and forth every other frame
 					// (character stutters/spins in place). A light EMA low-pass here
-					// smooths those spikes out while staying fast enough (devicemotion
-					// fires ~60Hz, alpha=0.5 settles in ~2-3 samples, <50ms) that it
-					// doesn't reintroduce the fusion-filter lag this code originally
-					// moved away from.
-					window._gyroSmooth = window._gyroSmooth + (g - window._gyroSmooth) * 0.5;
-					// Fast calibration: first 15 events, but only once the
-					// post-listener-start grace window (see _startGyroListener's
-					// doc comment above) has passed — skip samples that land
-					// during the initial gesture transient.
-					if (window._gyroCalibN < 15 && (Date.now() - _listenerStartMs) >= 400) {
-						var a = window._gyroCalibN < 5 ? 0.6 : 0.3;
-						window._gyroBase = g * a + window._gyroBase * (1 - a);
-						window._gyroCalibN++;
+					// smooths those spikes out.
+					//
+					// TIME-BASED (bug fix, see GYRO_EMA_TAU_S doc comment above):
+					// alpha is now derived from actual elapsed time since the last
+					// sample (dt) instead of being a flat 0.5-per-event blend, so
+					// the smoothing has the same real-world responsiveness whether
+					// this device's devicemotion fires at 15Hz or 200Hz. dt is
+					// clamped to a sane max so a stale reading after a long gap
+					// (tab backgrounded, sensor hiccup, app resume) doesn't get
+					// treated as if it just arrived at full weight.
+					var _now = Date.now();
+					var _dt = window._gyroLastEventMs ? (_now - window._gyroLastEventMs) / 1000 : (1 / 60);
+					if (_dt <= 0) _dt = 1 / 60;
+					if (_dt > 0.25) _dt = 0.25;
+					window._gyroLastEventMs = _now;
+					var _emaAlpha = 1 - Math.exp(-_dt / GYRO_EMA_TAU_S);
+					window._gyroSmooth = window._gyroSmooth + (g - window._gyroSmooth) * _emaAlpha;
+					// TIME-WINDOWED calibration (bug fix, see doc comment above):
+					// was "average the first 15 events" — now averages over a fixed
+					// WALL-CLOCK window instead (400ms post-start grace, then a
+					// 250ms sampling window), dt-weighted so a device that happens
+					// to fire devicemotion twice as often doesn't get twice the
+					// influence per sample. Converges to the same real-time result
+					// (~650ms after listener start) regardless of this device's
+					// actual sensor rate.
+					if (!window._gyroCalibDone) {
+						var _sinceStart = _now - window._gyroCalibStartMs;
+						if (_sinceStart >= GYRO_CALIB_GRACE_MS) {
+							if (_sinceStart <= GYRO_CALIB_GRACE_MS + GYRO_CALIB_WINDOW_MS) {
+								window._gyroCalibSum += g * _dt;
+								window._gyroCalibDt  += _dt;
+							} else {
+								if (window._gyroCalibDt > 0) {
+									window._gyroBase = window._gyroCalibSum / window._gyroCalibDt;
+								}
+								window._gyroCalibDone = true;
+							}
+						}
 					}
 					var tilted = window._gyroSmooth - window._gyroBase;
-					// TUNING: was 3.5° — twitchy in practice on a real phone (a small
-					// hand tremor or resting tilt was enough to flip direction).
-					// Bumped to 5.0° (with the same 0.5x hysteresis ratio, so the
-					// "stop moving" threshold rises to 2.5° too) — a more deliberate
-					// tilt is needed to trigger a turn, while the ramp in Player.gd's
-					// simulate_tick() still keeps the actual speed change smooth once
-					// triggered. Purely a live-input feel tweak — the discretized
-					// -1/0/1 direction is all that ever gets recorded, so this has
-					// zero effect on replay determinism (see Player.gd's set_gyro_
-					// control_active doc comment for the actual determinism boundary).
-					var thr    = window._gyroThreshold || 5.0;
+					// TUNING: was 3.5°, then 5.0° — both still twitchy in practice on
+					// a real phone (ordinary hand tremor holding it dead-center was
+					// enough to flip direction on its own). Bumped to
+					// GYRO_BASE_THRESHOLD_DEG (8.0, with the same 0.5x hysteresis
+					// ratio) — a more deliberate tilt is needed to trigger a turn,
+					// while the ramp in Player.gd's simulate_tick() still keeps the
+					// actual speed change smooth once triggered. Purely a live-input
+					// feel tweak — the discretized -1/0/1 direction is all that ever
+					// gets recorded, so this has zero effect on replay determinism
+					// (see Player.gd's set_gyro_control_active doc comment for the
+					// actual determinism boundary).
+					// 8.0 fallback here must match GYRO_BASE_THRESHOLD_DEG below —
+					// only used if _ensure_gyro_js() hasn't run yet (shouldn't
+					// normally happen, defense-in-depth default).
+					var thr    = window._gyroThreshold || 8.0;
 					var nthr   = thr * 0.5;
 					if (window._gyroDir !== 0 && Math.abs(tilted) < nthr)
 						window._gyroDir = 0;
@@ -459,12 +551,12 @@ func _ready() -> void:
 			// _gyro_baseline (used just for that screen's degree readout) while
 			// actual in-game direction (_getGyroDir above) kept reading purely
 			// from window._gyroBase, so a manual calibration never affected
-			// real gameplay at all. Pinning _gyroCalibN past the 15-sample
-			// auto-calibration window stops it from immediately drifting back
-			// over the value that was just explicitly set.
+			// real gameplay at all. Marking the calibration window done stops
+			// the time-windowed auto-calibration above from immediately
+			// drifting back over the value that was just explicitly set.
 			window._setGyroBase = function(v) {
-				window._gyroBase   = +v || 0;
-				window._gyroCalibN = 999;
+				window._gyroBase      = +v || 0;
+				window._gyroCalibDone = true;
 			};
 		""", true)
 		# Pre-compile getter functions — called per frame with zero string parsing
@@ -1673,6 +1765,36 @@ func _hide_landscape_overlay() -> void:
 	_landscape_overlay.queue_free()
 	_landscape_overlay = null
 
+## BUG FIX (crash log: "ERROR: Infinite loop detected. Check set_loops()
+## description for more info." at scene/animation/tween.cpp:420, correlated
+## with the lobby's idle "breathing" animations — title scale, PLAY button
+## glow, character-selector bob, torch flicker, all of which run forever via
+## set_loops() with no argument). Root cause: when a browser tab is
+## backgrounded (player switches tabs, or the OS suspends the WebView),
+## requestAnimationFrame stops firing entirely — no _process() calls happen
+## at all — but the moment the tab regains focus, the very next _process()
+## call reports however much wall-clock time actually passed as its delta,
+## which can be minutes. A tween with infinite loops tries to fast-forward
+## through that whole backlog of loop iterations in one step() call, and
+## Godot's own safety check aborts the tween with this error rather than
+## hang the engine trying to catch up. Fix: explicitly pause these tweens
+## the moment focus is lost (so they simply stop advancing at all while
+## backgrounded, instead of silently building up a multi-minute backlog)
+## and resume them cleanly on refocus — the same defensive pattern already
+## used for RESULT/network handling elsewhere in this file, just applied to
+## animation instead.
+func _notification(what: int) -> void:
+	match what:
+		NOTIFICATION_APPLICATION_FOCUS_OUT, NOTIFICATION_APPLICATION_PAUSED:
+			for t in [_title_tw, _play_tw, _sel_tw, _torch_tween]:
+				if t is Tween and is_instance_valid(t):
+					t.pause()
+		NOTIFICATION_APPLICATION_FOCUS_IN, NOTIFICATION_APPLICATION_RESUMED:
+			for t in [_title_tw, _play_tw, _sel_tw, _torch_tween]:
+				if t is Tween and is_instance_valid(t):
+					t.play()
+
+
 func _process(_delta: float) -> void:
 	# If calibration screen is open, update the angle label
 	if is_instance_valid(_calib_layer):
@@ -1946,7 +2068,7 @@ func _calib_cleanup() -> void:
 func _ensure_gyro_js() -> void:
 	if not OS.has_feature("web"):
 		return
-	JavaScriptBridge.eval("window._gyroThreshold = %f;" % (5.0 / maxf(_gyro_sensitivity, 0.1)), true)
+	JavaScriptBridge.eval("window._gyroThreshold = %f;" % (GYRO_BASE_THRESHOLD_DEG / maxf(_gyro_sensitivity, 0.1)), true)
 	JavaScriptBridge.eval("""
 		// iOS: request permission (non-iOS already started in _ready).
 		// Gated on DeviceMotionEvent now — see the latency-fix comment on
@@ -2078,10 +2200,11 @@ func _get_gyro_dir() -> int:
 		# path even before that one's own bump (see _startGyroListener's
 		# matching comment), since native had no hysteresis: a tilt sitting
 		# right at the boundary could flicker between 0 and ±1 every frame.
-		# Now matches web exactly — 5.0° to trigger a turn, hysteresis down
-		# to 2.5° to return to neutral, using _native_gyro_dir as the same
-		# kind of persisted state window._gyroDir already was on web.
-		var threshold := 5.0 / maxf(_gyro_sensitivity, 0.1)
+		# Now matches web exactly — GYRO_BASE_THRESHOLD_DEG to trigger a turn,
+		# half that as hysteresis to return to neutral, using _native_gyro_dir
+		# as the same kind of persisted state window._gyroDir already was on
+		# web.
+		var threshold := GYRO_BASE_THRESHOLD_DEG / maxf(_gyro_sensitivity, 0.1)
 		var nthr      := threshold * 0.5
 		if _native_gyro_dir != 0 and abs(tilted) < nthr:
 			_native_gyro_dir = 0
@@ -2112,7 +2235,7 @@ func _save_settings_flush() -> void:
 		# Nimiq Pay WebView reloads on backgrounding), silently falling back
 		# to the JS auto-calibration heuristic every time. Now it persists,
 		# while auto-calibration still runs fresh on top of it each session
-		# (see _startGyroListener's _gyroCalibN averaging) — so the player
+		# (see _startGyroListener's time-windowed calibration) — so the player
 		# gets both: a saved manual zero-point AND automatic fine-tuning.
 		"gyro_baseline":   _gyro_baseline,
 		"vibration":       _vibration,
@@ -3168,29 +3291,29 @@ func _build_start_ui() -> void:
 
 	# Title breathes — scale on label with pivot at centre
 	# pivot_offset was set above after the first process frame
-	var title_tw := create_tween()
-	if title_tw:
-		title_tw.set_loops()
-		title_tw.tween_property(title_lbl, "scale", Vector2(1.05, 1.05), 0.9).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		title_tw.tween_property(title_lbl, "scale", Vector2(0.95, 0.95), 0.9).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+	_title_tw = create_tween()
+	if _title_tw:
+		_title_tw.set_loops()
+		_title_tw.tween_property(title_lbl, "scale", Vector2(1.05, 1.05), 0.9).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		_title_tw.tween_property(title_lbl, "scale", Vector2(0.95, 0.95), 0.9).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
 	# Keep pivot centred if window resizes
 	title_lbl.resized.connect(func(): title_lbl.pivot_offset = title_lbl.size * 0.5)
 
 	# PLAY button glows
-	var play_tw := create_tween()
-	if play_tw:
-		play_tw.set_loops()
-		play_tw.tween_property(_play_btn, "modulate", Color(1.0, 1.0, 0.75, 1.0), 0.55).set_trans(Tween.TRANS_SINE)
-		play_tw.tween_property(_play_btn, "modulate", Color(1.0, 1.0, 1.0,  1.0), 0.55).set_trans(Tween.TRANS_SINE)
+	_play_tw = create_tween()
+	if _play_tw:
+		_play_tw.set_loops()
+		_play_tw.tween_property(_play_btn, "modulate", Color(1.0, 1.0, 0.75, 1.0), 0.55).set_trans(Tween.TRANS_SINE)
+		_play_tw.tween_property(_play_btn, "modulate", Color(1.0, 1.0, 1.0,  1.0), 0.55).set_trans(Tween.TRANS_SINE)
 
 	# Character selector bobs up and down slightly
-	var sel_tw := create_tween()
-	if sel_tw:
-		sel_tw.set_loops()
-		sel_tw.tween_property(sel_pc, "offset_top",    sel_pc.offset_top    - int(_p(0.012)), 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		sel_tw.tween_property(sel_pc, "offset_bottom", sel_pc.offset_bottom - int(_p(0.012)), 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		sel_tw.tween_property(sel_pc, "offset_top",    sel_pc.offset_top,                     0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		sel_tw.tween_property(sel_pc, "offset_bottom", sel_pc.offset_bottom,                  0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+	_sel_tw = create_tween()
+	if _sel_tw:
+		_sel_tw.set_loops()
+		_sel_tw.tween_property(sel_pc, "offset_top",    sel_pc.offset_top    - int(_p(0.012)), 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		_sel_tw.tween_property(sel_pc, "offset_bottom", sel_pc.offset_bottom - int(_p(0.012)), 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		_sel_tw.tween_property(sel_pc, "offset_top",    sel_pc.offset_top,                     0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		_sel_tw.tween_property(sel_pc, "offset_bottom", sel_pc.offset_bottom,                  0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
 
 	_build_settings_popup()
 	_build_bottom_bar()
@@ -3747,7 +3870,10 @@ func _build_settings_popup() -> void:
 	# other panels that all close on an outside tap.
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+		# Close on RELEASE not press — see LeaderboardPanel.gd's dim handler for
+		# the full explanation (press-triggered close lets the release half of
+		# the same tap leak through onto whatever's now exposed underneath).
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			_close_settings()
 	)
 	_settings_popup.add_child(dim)
@@ -4280,8 +4406,23 @@ func _build_settings_popup() -> void:
 			return
 		auto_calib_btn.disabled = true
 		auto_calib_btn.text = "Hold still..."
-		JavaScriptBridge.eval("window._gyroCalibN = 0;", true)
-		await get_tree().create_timer(0.6).timeout
+		# Re-arm the time-windowed calibration (see _startGyroListener's
+		# GYRO_EMA_TAU_S/GYRO_CALIB_* doc comment) — was just "_gyroCalibN = 0"
+		# under the old event-count scheme.
+		JavaScriptBridge.eval("""
+			window._gyroCalibStartMs = Date.now();
+			window._gyroCalibSum = 0;
+			window._gyroCalibDt = 0;
+			window._gyroCalibDone = false;
+		""", true)
+		# Grace (400ms) + sampling window (250ms) = 650ms until the window
+		# closes, PLUS the window only actually finalizes on the next
+		# devicemotion event to arrive after that point. At a very slow
+		# ~15Hz device (worst case assumed elsewhere in this file), that
+		# next event could land as late as ~717ms — 1.0s gives a solid
+		# margin past that on top (was 0.6s under the old fixed-event-count
+		# scheme).
+		await get_tree().create_timer(1.0).timeout
 		var b = JavaScriptBridge.eval("window._getGyroBase ? window._getGyroBase() : 0;", true)
 		_gyro_baseline = float(b) if b != null else 0.0
 		_save_settings()
@@ -5412,7 +5553,33 @@ func _start_bgm_if_needed() -> void:
 	# open, it doesn't make any sound by itself, so it's safe unconditionally.
 	JavaScriptBridge.eval("if (window._gdSound) window._gdSound('unlock');", true)
 	if _bgm_started:
-		return
+		# BUG FIX ("ses açıktı ama oyun açılınca çalmadı, nadiren oluyor"):
+		# _bgm_started only ever recorded that Godot SENT the bgm_play
+		# command, never whether the browser's autoplay policy actually let
+		# it play — its play() promise can silently reject (see index.html's
+		# "NATIVE AUDIO" block, .catch(function(){})), most often on exactly
+		# this first attempt right after boot. When that happens this flag
+		# was already true, so nothing here would ever retry — music just
+		# stayed dead until something else (e.g. toggling the Sound setting,
+		# which resets _bgm_started) happened to resend it. Cross-check the
+		# browser's own confirmed playback state (window._bgmActuallyPlaying,
+		# driven by the audio element's real 'playing'/'pause' events, not by
+		# our own outgoing command) and fall through to retry if it says the
+		# earlier attempt didn't actually take. (No need to re-check
+		# OS.has_feature("web") here — already returned above if not web.)
+		# BUG FIX (crash log: "Invalid operands 'int' and 'bool' in operator
+		# '=='"): JavaScriptBridge.eval's return type isn't guaranteed to be a
+		# GDScript bool even though the JS expression is `!!...` — if the JS
+		# side eval fails/isn't available for any reason (embedded iframe
+		# quirks, bridge not ready yet, etc.) it can come back as int 0
+		# instead, and Godot 4 GDScript's `==` does not allow comparing int
+		# and bool directly (unlike `if some_int:`, which works for any
+		# type). Explicitly cast to bool first so this never depends on
+		# JS-side typing.
+		var really_playing : bool = bool(JavaScriptBridge.eval("!!window._bgmActuallyPlaying", true))
+		if really_playing:
+			return
+		print("[AUDIO] bgm_started was true but browser reports not actually playing — retrying")
 	# BUG FIX: this used to send 'bgm_play' unconditionally too, every single
 	# time this function was called (and it's called from a LOT of places —
 	# any tap on _ui_root, opening the VS panel, pressing Play — with no
@@ -6531,6 +6698,16 @@ func _exit_replay_ui() -> void:
 			_restore_lobby_ui()
 			if is_instance_valid(_stats_panel):
 				_stats_panel.show_panel()
+		"vs":
+			# BUG FIX: "vs" was falling into the generic `_:` branch below, which
+			# only restores the plain lobby — so watching a VS match replay and
+			# returning dropped the player back at the lobby screen instead of
+			# back into the VS panel they watched it from. Every other replay
+			# source (leaderboard/stats) already reopens its own panel; VS is no
+			# different (show_panel() re-shows the room list too).
+			_restore_lobby_ui()
+			if is_instance_valid(_vs_panel):
+				_vs_panel.show_panel()
 		_:
 			_restore_lobby_ui()
 
@@ -6682,36 +6859,40 @@ func _load_watch_avatar_async(circle: TextureRect, letter_lbl: Label, address: S
 		await get_tree().create_timer(0.1).timeout
 		if not is_instance_valid(circle): return
 
+	# SECURITY: JSON.stringify()'d before splicing into JS (see LeaderboardPanel's
+	# _load_nimiq_avatar_async for the same fix + rationale).
+	var js_addr := JSON.stringify(address)
+	var js_key := JSON.stringify(key)
 	var js_code := (
 		"(function(){"
 		+ "if(!window._nimiqPending) window._nimiqPending = {};"
-		+ "window._nimiqPending['" + key + "'] = null;"
+		+ "window._nimiqPending[" + js_key + "] = null;"
 		+ "if(typeof window.getNimiqAvatar !== 'function'){"
-		+ "  window._nimiqPending['" + key + "'] = ''; return;"
+		+ "  window._nimiqPending[" + js_key + "] = ''; return;"
 		+ "}"
-		+ "window.getNimiqAvatar('" + address + "')"
+		+ "window.getNimiqAvatar(" + js_addr + ")"
 		+ "  .then(function(svgData){"
-		+ "    if(!svgData){ window._nimiqPending['" + key + "'] = ''; return; }"
+		+ "    if(!svgData){ window._nimiqPending[" + js_key + "] = ''; return; }"
 		+ "    var img = new Image();"
 		+ "    img.onload = function(){"
 		+ "      try {"
 		+ "        var c = document.createElement('canvas');"
 		+ "        c.width = " + str(size) + "; c.height = " + str(size) + ";"
 		+ "        c.getContext('2d').drawImage(img, 0, 0, " + str(size) + ", " + str(size) + ");"
-		+ "        window._nimiqPending['" + key + "'] = c.toDataURL('image/png');"
-		+ "      } catch(e){ window._nimiqPending['" + key + "'] = ''; }"
+		+ "        window._nimiqPending[" + js_key + "] = c.toDataURL('image/png');"
+		+ "      } catch(e){ window._nimiqPending[" + js_key + "] = ''; }"
 		+ "    };"
-		+ "    img.onerror = function(){ window._nimiqPending['" + key + "'] = ''; };"
+		+ "    img.onerror = function(){ window._nimiqPending[" + js_key + "] = ''; };"
 		+ "    img.src = svgData;"
 		+ "  })"
-		+ "  .catch(function(e){ window._nimiqPending['" + key + "'] = ''; });"
+		+ "  .catch(function(e){ window._nimiqPending[" + js_key + "] = ''; });"
 		+ "})();"
 	)
 	JavaScriptBridge.eval(js_code, true)
 	for _i in 50:
 		await get_tree().create_timer(0.1).timeout
 		if not is_instance_valid(circle): return
-		var raw = JavaScriptBridge.eval("window._nimiqPending['%s']" % key, true)
+		var raw = JavaScriptBridge.eval("window._nimiqPending[%s]" % js_key, true)
 		if raw == null: continue
 		var result := str(raw)
 		if result == "" or result == "null" or result == "undefined":
@@ -6740,35 +6921,39 @@ func _load_own_avatar_from_address_async(address: String) -> void:
 		if ready: break
 		await get_tree().create_timer(0.1).timeout
 
+	# SECURITY: JSON.stringify()'d before splicing into JS (see LeaderboardPanel's
+	# _load_nimiq_avatar_async for the same fix + rationale).
+	var js_addr := JSON.stringify(address)
+	var js_key := JSON.stringify(key)
 	var js_code := (
 		"(function(){"
 		+ "if(!window._nimiqPending) window._nimiqPending = {};"
-		+ "window._nimiqPending['" + key + "'] = null;"
+		+ "window._nimiqPending[" + js_key + "] = null;"
 		+ "if(typeof window.getNimiqAvatar !== 'function'){"
-		+ "  window._nimiqPending['" + key + "'] = ''; return;"
+		+ "  window._nimiqPending[" + js_key + "] = ''; return;"
 		+ "}"
-		+ "window.getNimiqAvatar('" + address + "')"
+		+ "window.getNimiqAvatar(" + js_addr + ")"
 		+ "  .then(function(svgData){"
-		+ "    if(!svgData){ window._nimiqPending['" + key + "'] = ''; return; }"
+		+ "    if(!svgData){ window._nimiqPending[" + js_key + "] = ''; return; }"
 		+ "    var img = new Image();"
 		+ "    img.onload = function(){"
 		+ "      try {"
 		+ "        var c = document.createElement('canvas');"
 		+ "        c.width = " + str(size) + "; c.height = " + str(size) + ";"
 		+ "        c.getContext('2d').drawImage(img, 0, 0, " + str(size) + ", " + str(size) + ");"
-		+ "        window._nimiqPending['" + key + "'] = c.toDataURL('image/png');"
-		+ "      } catch(e){ window._nimiqPending['" + key + "'] = ''; }"
+		+ "        window._nimiqPending[" + js_key + "] = c.toDataURL('image/png');"
+		+ "      } catch(e){ window._nimiqPending[" + js_key + "] = ''; }"
 		+ "    };"
-		+ "    img.onerror = function(){ window._nimiqPending['" + key + "'] = ''; };"
+		+ "    img.onerror = function(){ window._nimiqPending[" + js_key + "] = ''; };"
 		+ "    img.src = svgData;"
 		+ "  })"
-		+ "  .catch(function(e){ window._nimiqPending['" + key + "'] = ''; });"
+		+ "  .catch(function(e){ window._nimiqPending[" + js_key + "] = ''; });"
 		+ "})();"
 	)
 	JavaScriptBridge.eval(js_code, true)
 	for _i in 50:
 		await get_tree().create_timer(0.1).timeout
-		var raw = JavaScriptBridge.eval("window._nimiqPending['%s']" % key, true)
+		var raw = JavaScriptBridge.eval("window._nimiqPending[%s]" % js_key, true)
 		if raw == null: continue
 		var result := str(raw)
 		if result == "" or result == "null" or result == "undefined":

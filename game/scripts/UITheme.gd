@@ -580,7 +580,10 @@ static func confirm_external_link(parent: Node, url: String, ref: float) -> void
 	overlay.add_child(dim)
 	# Tap anywhere outside the dialog (on the dim) dismisses it — same as Cancel.
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+		# Close on RELEASE not press — see LeaderboardPanel.gd's dim handler for
+		# the full explanation (press-triggered close lets the release half of
+		# the same tap leak through onto whatever's now exposed underneath).
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			overlay.queue_free()
 	)
 
@@ -686,7 +689,10 @@ static func confirm_action(parent: Node, title_text: String, body_text: String, 
 	overlay.add_child(dim)
 	# Tap anywhere outside the dialog (on the dim) dismisses it — same as "No".
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+		# Close on RELEASE not press — see LeaderboardPanel.gd's dim handler for
+		# the full explanation (press-triggered close lets the release half of
+		# the same tap leak through onto whatever's now exposed underneath).
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			overlay.queue_free()
 	)
 

@@ -242,6 +242,9 @@ func main() {
 	printStartupBanner(store)
 	// Persistent Godot worker pool — önceden başlat, ilk submit beklemeden hazır olsun
 	game.GetWorkerPool()
+	// Periodic off-site DB backup (Cloudflare R2) — no-ops if R2_* env vars
+	// aren't set, see game/backup.go.
+	store.StartBackupScheduler()
 	srv := &handlers.Server{Store: store}
 	srv.StartBackgroundServices()
 

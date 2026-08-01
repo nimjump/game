@@ -3,6 +3,7 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 import { retryReplay, adminSessionAction, saveGoldenReplay, type Session, type SessionAction } from "@/lib/api";
 import NimiqAvatar from "@/components/NimiqAvatar";
+import PlayerDetailModal from "@/components/PlayerDetailModal";
 
 // ── Sorting ─────────────────────────────────────────────────────────────────
 // Backend always returns sessions pre-sorted by server_score desc (see
@@ -65,6 +66,7 @@ export default function SessionsTab({
   } | null>(null);
   const [sortKey, setSortKey] = useState<SortKey | null>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  const [detailPlayer, setDetailPlayer] = useState<string | null>(null);
 
   const toggleSort = (key: SortKey) => {
     if (sortKey === key) {
@@ -188,7 +190,11 @@ export default function SessionsTab({
                   >
                     <td style={{ color: "var(--text-muted)", fontSize: 11 }}>{i + 1}</td>
                     <td>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div
+                        style={{ display: "flex", alignItems: "center", gap: 8, cursor: s.player_id ? "pointer" : "default" }}
+                        onClick={() => s.player_id && setDetailPlayer(s.player_id)}
+                        title={s.player_id ? `${s.player_id} — click for details` : undefined}
+                      >
                         <NimiqAvatar address={s.player_id ?? ""} size={30} />
                         <div>
                           <div style={{ fontSize: 13, fontWeight: 600 }}>{s.nickname || "—"}</div>
@@ -288,6 +294,10 @@ export default function SessionsTab({
           </table>
         )}
       </div>
+
+      {detailPlayer && (
+        <PlayerDetailModal playerID={detailPlayer} onClose={() => setDetailPlayer(null)} />
+      )}
     </>
   );
 }

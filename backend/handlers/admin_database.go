@@ -16,10 +16,29 @@ func (s *Server) handleAdminDatabaseOverview(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, map[string]any{"categories": s.Store.DatabaseOverview()})
 }
 
-// POST /backend/admin/database/clear — body: {"category":"client_logs"}
+// POST /backend/admin/database/clear — body: {"category":"client_logs"}.
+// Dangerous categories (wallets, pending_rewards, auth_tokens, nicknames,
+// sessions, leaderboard_winners, app_config — see dbCategories'
+// Dangerous flag in game/db_admin.go) additionally require
+// {"confirm":"<category>"} echoing the category name back.
+//
+// BUG FIX (security audit): this used to delete an entire category — for
+// the dangerous ones, that's every player's wallet registrations, every
+// pending/sent reward record, every live session token, etc. — from a
+// single POST with nothing beyond "is this an authenticated admin session."
+// The `Dangerous` flag already existed on the category definition but was
+// only ever used to show an extra warning in the admin UI — never actually
+// checked server-side, so it did nothing to stop a CSRF that slipped past
+// the origin check, a hijacked/stolen admin session, or a simple misclick
+// on the wrong category from permanently destroying real financial
+// bookkeeping with zero recoverability and no server-side safety net.
+// Requiring the category name to be explicitly echoed back is a cheap,
+// effective "are you sure" that a blind/automated request can't satisfy by
+// accident.
 func (s *Server) handleAdminDatabaseClear(ctx *fasthttp.RequestCtx) {
 	var req struct {
 		Category string `json:"category"`
+		Confirm  string `json:"confirm"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
 		writeErr(ctx, 400, "bad_json")
@@ -28,6 +47,13 @@ func (s *Server) handleAdminDatabaseClear(ctx *fasthttp.RequestCtx) {
 	if req.Category == "" {
 		writeErr(ctx, 400, "missing_category")
 		return
+	}
+	for _, cat := range s.Store.DatabaseOverview() {
+		if cat.Key == req.Category && cat.Dangerous && req.Confirm != req.Category {
+			log.Printf("[ADMIN] database clear BLOCKED (missing confirm): %s", req.Category)
+			writeErr(ctx, 400, "confirm_required")
+			return
+		}
 	}
 	deleted, err := s.Store.ClearDBCategory(req.Category)
 	if err != nil {

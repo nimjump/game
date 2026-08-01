@@ -33,6 +33,7 @@ export default function SystemTab() {
   const [capInput, setCapInput] = useState("100");
   const [coinRateInput, setCoinRateInput] = useState("1");
   const [vsFeeInput, setVsFeeInput] = useState("5");
+  const [scoreTolInput, setScoreTolInput] = useState("0");
   const fileRef = useRef<HTMLInputElement | null>(null);
 
   // ── Quest reward overrides ──────────────────────────────────────────
@@ -194,6 +195,7 @@ export default function SystemTab() {
       setCapInput(String(c.daily_earn_cap_nim && c.daily_earn_cap_nim > 0 ? c.daily_earn_cap_nim : 100));
       setCoinRateInput(String(c.coin_nim_rate && c.coin_nim_rate > 0 ? c.coin_nim_rate : 1));
       setVsFeeInput(String(c.vs_fee_percent != null ? c.vs_fee_percent : 5));
+      setScoreTolInput(String(c.score_mismatch_tolerance_percent != null ? c.score_mismatch_tolerance_percent : 0));
       setBinary(b);
     } catch (e) {
       setError(String(e instanceof Error ? e.message : e));
@@ -238,6 +240,20 @@ export default function SystemTab() {
     setSaving(true);
     try {
       const updated = await saveAppConfig({ vs_fee_percent: n });
+      setCfg(updated);
+    } catch (e) {
+      alert("Error: " + String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveScoreTolerance() {
+    const n = parseFloat(scoreTolInput);
+    if (!Number.isFinite(n) || n < 0 || n > 100) { alert("Score mismatch tolerance must be a percentage between 0 and 100."); return; }
+    setSaving(true);
+    try {
+      const updated = await saveAppConfig({ score_mismatch_tolerance_percent: n });
       setCfg(updated);
     } catch (e) {
       alert("Error: " + String(e));
@@ -417,6 +433,22 @@ export default function SystemTab() {
             <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
               Fee kept from a VS match pot on settlement; the winner receives the rest.
               e.g. 5 = winner takes 95% of the pot. Default 5%.
+            </span>
+          </div>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <span style={{ fontSize: 13, color: "var(--text-muted)" }}>Score mismatch tolerance (%):</span>
+            <input type="number" min={0} max={100} step="any" value={scoreTolInput}
+              onChange={e => setScoreTolInput(e.target.value)}
+              style={{ width: 100, padding: "4px 8px", fontSize: 13 }} />
+            <button className="btn" disabled={saving || scoreTolInput === String(cfg.score_mismatch_tolerance_percent ?? 0)} onClick={saveScoreTolerance}>
+              Save
+            </button>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              How far a client&apos;s claimed score may differ from the server&apos;s own re-simulated
+              score before the run is flagged as suspicious. The score actually recorded is always
+              the server&apos;s number regardless of this setting — it only controls flagging.
+              Default 0 = exact match required.
             </span>
           </div>
         </div>

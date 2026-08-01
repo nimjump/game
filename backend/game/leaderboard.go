@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"sync"
 	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -16,6 +17,16 @@ const (
 	keyLBWinners  = "lb:winners:" // prefix + period key (e.g. "2026-06-17" or "2026-W25")
 	keyLBResetPfx = "lb:reset:"   // prefix + periodType ("daily" / "weekly")
 )
+
+// payoutPeriodLocks — per-period mutex so PayWinnersForPeriod's
+// check-then-act (IsPeriodPaid / queue rewards / MarkPeriodPaid) can't race
+// with itself for the same period. Same pattern as vsRoomLock in vsroom.go.
+var payoutPeriodLocks sync.Map // period string → *sync.Mutex
+
+func payoutPeriodLock(period string) *sync.Mutex {
+	v, _ := payoutPeriodLocks.LoadOrStore(period, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
 
 // UTC3 — fixed UTC+3 timezone used for all period calculations
 var UTC3 = time.FixedZone("UTC+3", 3*60*60)
@@ -270,11 +281,24 @@ func (s *Store) RankMapForPeriod(periodType, period string) map[string]int {
 
 	best := map[string]models.Session{}
 	for _, sess := range all {
-		// (StatePending removed — no session is ever saved with that state,
-		// every session is created as either Completed or Flagged at submit
-		// time; ServerScore<=0 already excludes anything that never got a
-		// real replay-verified score.)
-		if sess.Flagged || sess.ServerScore <= 0 {
+		// BUG FIX ("lider tablosuda ... asla düşürülmez"): this used to also
+		// skip sess.Flagged==true here. That flag covers two very different
+		// cases that both happened to set the same bool: (a) real pre-replay
+		// anti-cheat catches (impossible input timing/deltas) — those never
+		// reach the replay-sim step at all, so ServerScore stays 0 and
+		// they're excluded below regardless, independent of this Flagged
+		// check; (b) a session whose replay WAS successfully re-simulated by
+		// the server (ServerScore > 0, a real trusted result) but whose
+		// CLIENT-reported score didn't exactly match it — with the
+		// score-mismatch tolerance admin-configured to 0% by default (see
+		// AppConfig.ScoreMismatchTolerancePercent), even a single point of
+		// web/native platform rounding/determinism noise flips this. Per the
+		// same rule already applied everywhere else (the STORED score is
+		// always result.ServerScore, flagging never changes what's recorded
+		// — see server.go's replay-sim goroutine), a flag is for admin
+		// visibility only and must never silently exclude a legitimately
+		// server-verified score from the leaderboard/rank map.
+		if sess.ServerScore <= 0 {
 			continue
 		}
 		if startTs > 0 && (sess.SubmittedAt < startTs || sess.SubmittedAt >= endTs) {
@@ -316,11 +340,12 @@ func (s *Store) GetLeaderboardPaged(periodType, period string, limit, offset int
 	// Find best score per player
 	best := map[string]models.Session{}
 	for _, sess := range all {
-		// (StatePending removed — no session is ever saved with that state,
-		// every session is created as either Completed or Flagged at submit
-		// time; ServerScore<=0 already excludes anything that never got a
-		// real replay-verified score.)
-		if sess.Flagged || sess.ServerScore <= 0 {
+		// See the identical fix (and full explanation) in RankMapForPeriod
+		// above — a Flagged score-mismatch with a real ServerScore > 0 is a
+		// server-verified result and must not be silently excluded from the
+		// leaderboard; only ServerScore<=0 (never verified / real anti-cheat
+		// catch, which never reaches replay-sim) excludes an entry now.
+		if sess.ServerScore <= 0 {
 			continue
 		}
 		if startTs > 0 && (sess.SubmittedAt < startTs || sess.SubmittedAt >= endTs) {
@@ -607,6 +632,22 @@ func (s *Store) MarkPeriodPaid(period string) error {
 // queued (0 without error if the period was already paid, or had no
 // eligible winners).
 func (s *Store) PayWinnersForPeriod(periodType, period string) (int, error) {
+	// BUG FIX (security audit): IsPeriodPaid (read) and MarkPeriodPaid (write,
+	// only called at the very end of this function) used to have no lock
+	// between them — a classic check-then-act race. Firing multiple requests
+	// for the same not-yet-paid period concurrently (e.g. the now-admin-only
+	// manual endpoint hit twice, or racing the automatic background loop)
+	// let every one of them pass the IsPeriodPaid check before any of them
+	// got around to writing the paid marker, so each independently queued
+	// the full winner list — an N-fold multiplication of that period's real
+	// NIM payout. A per-period mutex (same pattern as vsRoomLock) makes the
+	// whole check-queue-mark sequence atomic, so only the first caller for a
+	// given period ever actually queues rewards; every later call for the
+	// same period sees IsPeriodPaid()==true and returns immediately.
+	lock := payoutPeriodLock(period)
+	lock.Lock()
+	defer lock.Unlock()
+
 	if s.IsPeriodPaid(period) {
 		return 0, nil
 	}

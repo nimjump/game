@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
@@ -195,4 +196,100 @@ func (s *Store) lookupIPGeoRemote(ip string) IPGeo {
 		return unknown
 	}
 	return IPGeo{IP: ip, CountryCode: body.CountryCode, CountryName: body.Country, ResolvedAt: now}
+}
+
+// ── Country breakdown (admin "where are our players from" view) ────────────
+
+// CountryBreakdownEntry — one row of the admin "players by country" view.
+type CountryBreakdownEntry struct {
+	CountryCode string `json:"country_code"`
+	CountryName string `json:"country_name"`
+	Count       int    `json:"count"`
+}
+
+// countryBreakdownResolveWorkers — how many IP→country lookups run
+// concurrently when this is called with a lot of never-before-seen IPs
+// (fresh deploy, or right after a traffic spike of new players). Each
+// individual lookup is capped at 3s (ipGeoHTTPClient's timeout) and, once
+// resolved, is cached forever (GetIPGeo) — so this concurrency limit only
+// ever matters for the FIRST admin page load after a batch of new IPs shows
+// up; every later call is pulling from cache and is effectively instant.
+const countryBreakdownResolveWorkers = 8
+
+// CountryBreakdown — how many distinct players last connected from each
+// country (by their most-recently-seen IP), sorted by count descending.
+// Mirrors DeviceBreakdown's shape/pattern (see device.go) but for
+// geography instead of platform. Resolves any not-yet-cached IPs
+// concurrently (bounded — see countryBreakdownResolveWorkers) rather than
+// one at a time, so a fresh install with many unresolved IPs doesn't make
+// the admin wait one network round-trip per player, sequentially.
+func (s *Store) CountryBreakdown() []CountryBreakdownEntry {
+	// 1. Pick each distinct player's most-recently-seen IP.
+	latestIPByPlayer := map[string]PlayerIPRecord{}
+	_ = s.db.View(func(txn *badger.Txn) error {
+		opts := badger.DefaultIteratorOptions
+		opts.Prefix = []byte(keyPlayerIPPfx)
+		it := txn.NewIterator(opts)
+		defer it.Close()
+		for it.Rewind(); it.ValidForPrefix(opts.Prefix); it.Next() {
+			_ = it.Item().Value(func(v []byte) error {
+				var rec PlayerIPRecord
+				if err := json.Unmarshal(v, &rec); err != nil {
+					return nil
+				}
+				if existing, ok := latestIPByPlayer[rec.PlayerID]; !ok || rec.LastSeen > existing.LastSeen {
+					latestIPByPlayer[rec.PlayerID] = rec
+				}
+				return nil
+			})
+		}
+		return nil
+	})
+
+	// 2. Resolve each distinct IP to a country — concurrently, bounded.
+	distinctIPs := map[string]struct{}{}
+	for _, rec := range latestIPByPlayer {
+		distinctIPs[rec.IP] = struct{}{}
+	}
+	geoByIP := make(map[string]IPGeo, len(distinctIPs))
+	var geoMu sync.Mutex
+	sem := make(chan struct{}, countryBreakdownResolveWorkers)
+	var wg sync.WaitGroup
+	for ip := range distinctIPs {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(ip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			geo := s.GetIPGeo(ip)
+			geoMu.Lock()
+			geoByIP[ip] = geo
+			geoMu.Unlock()
+		}(ip)
+	}
+	wg.Wait()
+
+	// 3. Aggregate distinct players by country.
+	type countryKey struct{ code, name string }
+	counts := map[countryKey]int{}
+	for _, rec := range latestIPByPlayer {
+		geo := geoByIP[rec.IP]
+		code, name := geo.CountryCode, geo.CountryName
+		if code == "" {
+			code, name = "??", "Unknown"
+		}
+		counts[countryKey{code, name}]++
+	}
+	out := make([]CountryBreakdownEntry, 0, len(counts))
+	for k, v := range counts {
+		out = append(out, CountryBreakdownEntry{CountryCode: k.code, CountryName: k.name, Count: v})
+	}
+	for i := 0; i < len(out)-1; i++ {
+		for j := i + 1; j < len(out); j++ {
+			if out[j].Count > out[i].Count {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	return out
 }

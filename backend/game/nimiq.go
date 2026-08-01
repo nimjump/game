@@ -306,6 +306,47 @@ func (s *Store) QueueRewardRaw(playerID string, amountNIM float64, reason string
 	return s.queueReward(playerID, amountNIM, reason, false)
 }
 
+// QueueRewardToAddress — like QueueRewardRaw, but for when the destination is
+// already a known raw Nimiq address instead of an internal player ID (e.g.
+// refunding a duplicate VS-room payment straight back to whoever sent it).
+//
+// BUG FIX: refundDuplicateVSSide used to call refundVSRoom(r, sender, ...)
+// with `sender` being the raw on-chain address of the tx we're refunding —
+// but refundVSRoom/QueueRewardRaw treat their playerID argument as an
+// internal game player ID and look it up via GetPlayerWallet(playerID). A
+// raw "NQ..." address is never a key in that wallet-registration table, so
+// the lookup always missed, the reward was saved with Status=RewardNoWallet
+// and NimiqAddress left EMPTY, and the retry loop kept re-checking the same
+// dead lookup forever — the refund could never actually send. Net effect:
+// a player who paid twice for a VS room had their duplicate payment
+// permanently stuck (still sitting in the house wallet, but with no
+// automated path back to them), while logs falsely said "refunded". This
+// function skips the player-ID/wallet-registration lookup entirely and
+// writes the known destination address straight onto the reward record, so
+// the send queue has everything it needs from the start.
+func (s *Store) QueueRewardToAddress(address string, amountNIM float64, reason string) (*models.PendingReward, error) {
+	if address == "" || amountNIM <= 0 {
+		return nil, fmt.Errorf("invalid address or amount")
+	}
+	reward := &models.PendingReward{
+		ID:           newRewardID(),
+		PlayerID:     address, // no internal player ID known — address doubles as the trace key
+		NimiqAddress: address,
+		AmountNIM:    amountNIM,
+		AmountLuna:   int64(math.Round(amountNIM * NimLunaMultiplier)),
+		Reason:       reason,
+		CreatedAt:    time.Now().Unix(),
+		Status:       models.RewardPending,
+	}
+	if err := s.saveReward(reward); err != nil {
+		return nil, fmt.Errorf("save_reward: %w", err)
+	}
+	log.Printf("[REWARD] saved (direct-address) id=%s to=%s amount=%.4f NIM reason=%s",
+		reward.ID, address, amountNIM, reason)
+	s.enqueueRewardSend(reward)
+	return reward, nil
+}
+
 func (s *Store) queueReward(playerID string, amountNIM float64, reason string, applyChannelMultiplier bool) (*models.PendingReward, error) {
 	// Look up player's wallet address
 	walletInfo, err := s.GetPlayerWallet(playerID)
@@ -745,6 +786,24 @@ func nimiqUserFriendlyToBytes(addr string) ([]byte, error) {
 		return nil, fmt.Errorf("address decode underflow: got %d bytes", byteIdx)
 	}
 	return out, nil
+}
+
+// ValidateNimiqAddressFormat is the exported entry point handlers should use
+// to validate a client-supplied Nimiq address string before storing it.
+//
+// SECURITY (security audit): handleWalletRegister used to only check
+// `len(addr) >= 4 && addr[:2] == "NQ"` — that lets a caller register any
+// string starting with "NQ" as their own wallet's display/payout address,
+// including quote/backtick characters. Today that value is only ever read
+// back to the SAME player (self-XSS at worst, since it's never rendered to
+// other players), but it's a landmine: nothing stops it from being surfaced
+// elsewhere later. This reuses the real address decoder (charset + length
+// whitelist via nimiqUserFriendlyToBytes) so a stored "address" can only
+// ever be exactly what it claims to be — 32 base32 characters (plus the
+// "NQ" + 2-digit checksum prefix, spaces optional) — never arbitrary text.
+func ValidateNimiqAddressFormat(addr string) error {
+	_, err := nimiqUserFriendlyToBytes(addr)
+	return err
 }
 
 // nimiqGetBlockNumber fetches current block height for validity_start_height

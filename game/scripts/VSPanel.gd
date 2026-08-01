@@ -31,7 +31,29 @@ var _has_wallet     : bool   = false
 
 var _panel_ctrl : Control
 var _view_root  : Control       # swapped between list view and detail view
+
+# ── Panel auto-fit ───────────────────────────────────────────────────────────
+# The outer panel used to always be the same tall fixed box (ph, see
+# _build_ui) no matter what was inside it — a short view like the match/pay
+# detail card left a big dead empty area below it ("vs sayfasına çok boş
+# gözüküyo"). These refs + _fit_panel_height() let each view shrink/grow the
+# panel to actually fit its own content, capped at the original max height
+# (still scrolls internally beyond that, e.g. a long room list) and floored
+# at a minimum so it never gets uncomfortably squat.
+var _pc         : PanelContainer
+var _content_mc : MarginContainer
+var _hdr_mc     : MarginContainer
+var _sep_rect   : ColorRect
+var _panel_pad  : float = 0.0
+var _panel_max_h : float = 0.0
+var _panel_min_h : float = 0.0
 var _anim_tween : Tween = null
+# Separate from _anim_tween (that one's the open/close fade+scale) — this one
+# animates _pc's offset_top/offset_bottom whenever the panel resizes itself
+# to fit a new view (list <-> detail), so the shrink/grow reads as a smooth
+# resize instead of an instant snap ("küçülürken güzel bir animasyonla
+# küçülse keşke").
+var _height_tween : Tween = null
 var _entry_apply_key : Callable = Callable()  # keypad key handler; physical
                                               # keyboard input is routed here too
 var _entry_close     : Callable = Callable()  # closes the keypad sheet (Enter key)
@@ -280,7 +302,10 @@ func _build_ui() -> void:
 		# On desktop the mouse wheel fires InputEventMouseButton (WHEEL_UP/DOWN,
 		# pressed=true) too, so the old "any button pressed" check slammed the
 		# panel shut the moment the user tried to scroll ("scrolladım UI kapandı").
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+		# Also close on RELEASE not press — see LeaderboardPanel.gd's dim
+		# handler for why (press-triggered close lets the release half of the
+		# same tap leak through onto whatever's now exposed underneath).
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
 	)
 	_panel_ctrl.add_child(dim)
@@ -299,6 +324,10 @@ func _build_ui() -> void:
 	pc_style.shadow_size  = 10
 	pc.add_theme_stylebox_override("panel", pc_style)
 	_panel_ctrl.add_child(pc)
+	_pc = pc
+	_panel_pad = pad
+	_panel_max_h = ph
+	_panel_min_h = vh * 0.34
 
 	var outer := VBoxContainer.new()
 	outer.add_theme_constant_override("separation", 0)
@@ -307,6 +336,7 @@ func _build_ui() -> void:
 	# ── Header ──
 	var hdr_mc := _mpad(pad, int(pad * 0.6))
 	outer.add_child(hdr_mc)
+	_hdr_mc = hdr_mc
 	var hdr := HBoxContainer.new()
 	hdr.alignment = BoxContainer.ALIGNMENT_CENTER
 	hdr.add_theme_constant_override("separation", int(ref * 0.012))
@@ -367,6 +397,7 @@ func _build_ui() -> void:
 	sep.color = Color(0.4, 0.4, 0.4, 0.3)
 	sep.custom_minimum_size.y = 1
 	outer.add_child(sep)
+	_sep_rect = sep
 
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical    = Control.SIZE_EXPAND_FILL
@@ -380,6 +411,7 @@ func _build_ui() -> void:
 	var content_mc := _mpad(pad, pad)
 	content_mc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.add_child(content_mc)
+	_content_mc = content_mc
 
 	_view_root = VBoxContainer.new()
 	_view_root.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -491,6 +523,41 @@ func _clear_view() -> void:
 		_entry_sheet_root = null
 
 
+## Shrinks/grows the panel to fit whatever's currently in _view_root instead
+## of always reserving the same tall fixed box — see the _panel_pad/_pc/etc.
+## member doc comment above for why. Call this once after populating a view
+## (after _clear_view() + adding this view's content). Async: waits a frame
+## so the freshly-added children have real minimum sizes before measuring —
+## fire-and-forget from callers (`_fit_panel_height()` with no `await`).
+func _fit_panel_height() -> void:
+	if not is_instance_valid(_pc) or not is_instance_valid(_content_mc):
+		return
+	await get_tree().process_frame
+	# The panel may have been closed/torn down while we were waiting a frame.
+	if not is_instance_valid(_pc) or not is_instance_valid(_content_mc) or not is_instance_valid(_hdr_mc) or not is_instance_valid(_sep_rect):
+		return
+	var content_h : float = _content_mc.get_combined_minimum_size().y
+	var chrome_h  : float = _hdr_mc.size.y + _sep_rect.size.y + _panel_pad * 2.0
+	var desired_h : float = clampf(content_h + chrome_h, _panel_min_h, _panel_max_h)
+	_animate_panel_height(desired_h)
+
+
+## Tweens _pc's offset_top/offset_bottom to the given target height instead of
+## snapping instantly — shared by _fit_panel_height() (list <-> detail resize)
+## and _show_room_list()'s reset-to-max-height. Kills any resize tween already
+## in flight first (e.g. rapid list -> detail -> list taps) so it always
+## starts clean from the panel's actual current size, not a stale target.
+func _animate_panel_height(target_h: float) -> void:
+	if not is_instance_valid(_pc):
+		return
+	if is_instance_valid(_height_tween):
+		_height_tween.kill()
+	_height_tween = create_tween()
+	_height_tween.set_parallel(true)
+	_height_tween.tween_property(_pc, "offset_top",    -target_h * 0.5, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+	_height_tween.tween_property(_pc, "offset_bottom",  target_h * 0.5, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+
+
 ## The real Nimiq hexagon icon (same asset StatsPanel's "Daily NIM Earned"
 ## card and the in-run HUD coin counter use) — used anywhere this panel shows
 ## a NIM amount, instead of a generic lucide icon or plain "NIM" text.
@@ -513,6 +580,15 @@ func _show_room_list() -> void:
 	_title_lbl.text = "VS"
 	_clear_view()
 	var ref := _ref()
+
+	# The list view (matches + open challenges, both paginated) is always the
+	# "full size" view — animate back to the max height instead of letting it
+	# stay shrunk from whatever the previous (possibly short) detail view fit
+	# itself to. Was an instant snap; now shares the same tween as the
+	# shrink-to-fit case in _fit_panel_height() so growing back reads just as
+	# smoothly as shrinking did.
+	if _panel_max_h > 0.0:
+		_animate_panel_height(_panel_max_h)
 
 	if _player_id == "":
 		# Same "not signed in" scheme as the Statistics panel: a single centered
@@ -897,7 +973,10 @@ func _show_room_list() -> void:
 	# outside a real on-screen keyboard — it just closes, it doesn't discard
 	# whatever amount was already typed.
 	sheet_dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+		# Close on RELEASE not press — see LeaderboardPanel.gd's dim handler for
+		# the full explanation (press-triggered close lets the release half of
+		# the same tap leak through onto whatever's now exposed underneath).
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			close_entry_sheet.call()
 	)
 
@@ -1205,13 +1284,17 @@ func _show_room_list() -> void:
 	)
 
 
-func _make_card() -> PanelContainer:
+## border_col/border_w/bg_col — let callers highlight a card (e.g. the "My
+## VS Matches" list) without duplicating the whole stylebox setup. Defaults
+## match the original plain warm-brown card exactly, so every existing call
+## site is unaffected unless it opts in.
+func _make_card(border_col: Color = Color(0.700, 0.520, 0.340), border_w: int = 2, bg_col: Color = Color(0.940, 0.878, 0.776)) -> PanelContainer:
 	var card := PanelContainer.new()
 	var st := StyleBoxFlat.new()
 	# Same card scheme as the Statistics panel (bg + solid warm border).
-	st.bg_color     = Color(0.940, 0.878, 0.776)
-	st.border_color = Color(0.700, 0.520, 0.340)
-	st.set_border_width_all(2)
+	st.bg_color     = bg_col
+	st.border_color = border_col
+	st.set_border_width_all(border_w)
 	st.set_corner_radius_all(10)
 	st.content_margin_left = 14; st.content_margin_right = 14
 	st.content_margin_top  = 12; st.content_margin_bottom = 12
@@ -1240,6 +1323,13 @@ func _make_status_pill(r: Dictionary, ref: float) -> Control:
 		else:
 			bg  = Color(0.905, 0.865, 0.785)   # tie / refunded / cancelled
 			col = _COL_TEXT_DARK
+	elif _status_text(r).begins_with("Your turn"):
+		# BUG FIX: this used to share the exact same pale tan as "Waiting for
+		# opponent" / "Match in progress" — the one status that actually
+		# needs the player to DO something read no differently from the ones
+		# that don't. Vivid orange fill + near-white text makes it pop.
+		bg  = Color(0.870, 0.420, 0.120)
+		col = Color(0.995, 0.960, 0.920)
 	else:
 		bg  = Color(0.980, 0.910, 0.820)
 		col = _COL_ICON
@@ -1430,7 +1520,19 @@ func _make_prize_row(ref: float, entry: float) -> Control:
 
 
 func _make_room_row(r: Dictionary, ref: float) -> Control:
-	var card := _make_card()
+	# BUG FIX: "your turn to play/pay" rows used to look IDENTICAL to
+	# "waiting on the opponent" rows — same warm-brown border, same pale
+	# status-pill tan, in the same overall warm theme, so the one thing that
+	# actually needs the player's attention didn't stand out at all
+	# ("aynı diş temada hiç belli olmuyolar"). Rows that need MY action now
+	# get a vivid orange border + a light warm-orange tint fill instead of
+	# the plain neutral one — everything else (waiting/in-progress/finished)
+	# keeps the original look, so this doesn't add visual noise elsewhere.
+	var needs_my_action := _status_text(r).begins_with("Your turn")
+	var card := _make_card(
+		Color(0.870, 0.420, 0.120) if needs_my_action else Color(0.700, 0.520, 0.340),
+		3 if needs_my_action else 2,
+		Color(0.980, 0.900, 0.800) if needs_my_action else Color(0.940, 0.878, 0.776))
 	# PASS (not STOP) so a drag STARTING on a row still scrolls the list — the
 	# event also reaches the ScrollContainer. We only open the room on a real
 	# TAP: press + release at (almost) the same spot. If the finger moved, it was
@@ -1651,6 +1753,7 @@ func _show_room_detail(room_id: String) -> void:
 			UITheme.apply_label(err_lbl, _COL_TEXT_MID, int(ref * 0.026))
 			_view_root.add_child(err_lbl)
 			UITheme.set_scroll_passthrough(_view_root)
+			_fit_panel_height()
 			return
 		_current_room = room
 		# room_id may have been a short ?vs= code (invite deeplink); from here on
@@ -1659,6 +1762,7 @@ func _show_room_detail(room_id: String) -> void:
 		var canonical_id := str(room.get("id", room_id))
 		_render_room_detail(room, ref)
 		UITheme.set_scroll_passthrough(_view_root)
+		_fit_panel_height()
 		# Poll while anything is still pending — cheap HTTP GET every 4s.
 		if not _is_terminal(str(room.get("status", ""))):
 			_detail_timer = Timer.new()
@@ -1673,6 +1777,7 @@ func _show_room_detail(room_id: String) -> void:
 						_clear_view()
 						_render_room_detail(room2, ref)
 						UITheme.set_scroll_passthrough(_view_root)
+						_fit_panel_height()
 				)
 			)
 	)
@@ -2192,11 +2297,35 @@ func _do_pay(room_id: String, role: String, amount_nim: float, btn: Button) -> v
 		if is_instance_valid(btn):
 			btn.disabled = false
 			btn.text = "Pay %.2f NIM" % amount_nim
+		# BUG FIX: a failed/declined wallet payment used to leave the room
+		# sitting unpaid (VSAwaitingCreatorPay) for up to ~10 minutes before
+		# the backend's own sweep cancelled it — silently eating one of the
+		# player's limited concurrent-room slots (VSMaxActiveCreatedRooms)
+		# every time they backed out of paying. Only relevant for the
+		# CREATOR's own room (role == "creator") — an opponent declining a
+		# join payment doesn't own a room to free. Fire-and-forget:
+		# best-effort, the backend sweep is still the real safety net if
+		# this fails too.
+		if role == "creator":
+			_cancel_room(room_id, func(_ok: bool): pass)
 		return
 	if is_instance_valid(btn):
 		btn.text = "Confirming..."
 	var tx : String = str(result.get("tx", ""))
+	# BUG FIX (crash log: "ERROR: Lambda capture at index 1 was freed. Passed
+	# 'null' instead." at VSPanel.gd:2684, i.e. inside _confirm_payment's own
+	# `cb.call(ok, err_reason)`): this callback implicitly captures `self`
+	# (every `_show_room_detail(...)`/`_show_room_list()`/`_show_toast_err(...)`
+	# call below is really `self._show_...`), but unlike every other async
+	# callback in this file it never checked whether VSPanel itself was still
+	# alive by the time the /pay confirm round-trip finished — the wallet
+	# popup + the confirm request together can easily take longer than the
+	# player stays on this panel (closes it, navigates elsewhere...). Same
+	# weakref-guard pattern used everywhere else here (_confirm_payment's own
+	# HTTPRequest callback, _request_forfeit, etc.).
+	var _alive : WeakRef = weakref(self)
 	_confirm_payment(room_id, tx, func(ok: bool, err_reason: String):
+		if _alive.get_ref() == null: return
 		if ok:
 			var t := Toast.get_instance()
 			if t: t.show_toast("Payment confirmed!", Toast.Kind.SUCCESS)
@@ -2212,16 +2341,53 @@ func _do_pay(room_id: String, role: String, amount_nim: float, btn: Button) -> v
 			# The backend also independently re-scans the wallet's incoming
 			# transactions every ~90s and will pick this payment up on its
 			# own even if this confirm call keeps failing — it is not lost.
-			_show_toast_err("Payment sent — confirming automatically, this can take up to a couple minutes. Reopen this room to check.")
+			# BUG FIX: this used to re-enable the button back to "Pay X NIM"
+			# immediately, which reads as "the payment didn't go through, try
+			# again" — a confused/impatient player would pay a SECOND time for
+			# the same entry. Real reported outcome: two genuine on-chain
+			# payments for one room, one of them stuck with no automatic way
+			# back (see refundDuplicateVSSide fix, backend/game/vsroom.go).
+			# Keep the button disabled and clearly labeled "still confirming"
+			# instead — the room auto-refreshes and rebuilds this button
+			# correctly once the backend reconciler catches up, no user action
+			# needed. Don't invite a second payment.
+			_show_toast_err("Payment sent — confirming automatically, this can take up to a couple minutes. Don't pay again — reopen this room to check status.")
 			if is_instance_valid(btn):
-				btn.disabled = false
-				btn.text = "Pay %.2f NIM" % amount_nim
+				btn.disabled = true
+				btn.text = "Confirming — please wait..."
 	)
 
 
 func _show_toast_err(msg: String) -> void:
 	var t := Toast.get_instance()
 	if t: t.show_toast(msg, Toast.Kind.ERROR)
+
+
+## Turns a failed /backend/vsroom/create response into a message a player can
+## actually act on, instead of a bare "code %d". The backend always replies
+## with {"error": "<code>"} (see handlers/server.go's writeErr) — read that
+## instead of just showing the raw HTTP status.
+func _create_room_error_message(code: int, body: PackedByteArray) -> String:
+	var err_code := ""
+	var j := JSON.new()
+	if j.parse(body.get_string_from_utf8()) == OK:
+		var d = j.get_data()
+		if d is Dictionary:
+			err_code = str(d.get("error", ""))
+	match err_code:
+		"too_many_active_rooms":
+			return "You already have too many open or unpaid matches waiting. Unpaid ones auto-cancel within a few minutes — cancel one from \"My Matches\" or try again shortly."
+		"bad_entry_amount":
+			return "Entry amount is out of range."
+		"entry_amount_must_be_whole":
+			return "Entry amount must be a whole number of NIM."
+		"auth_required":
+			return "Please sign in to create a match."
+		"create_failed":
+			return "Something went wrong on our end — please try again."
+	if code == 429:
+		return "Too many requests — please wait a moment and try again."
+	return "Could not create match (code %d)." % code
 
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -2262,7 +2428,7 @@ func _create_room(entry_nim: float, is_private: bool, cb: Callable) -> void:
 					if d.has("invite_url"): room["invite_url"] = d["invite_url"]
 			cb.call(true, room)
 		else:
-			_show_toast_err("Could not create room (code %d)" % code)
+			_show_toast_err(_create_room_error_message(code, body))
 			cb.call(false, {})
 	)
 	var body_str := JSON.stringify({"entry_nim": entry_nim, "is_private": is_private})
@@ -2456,7 +2622,17 @@ func _join_room(room_id: String, cb: Callable) -> void:
 				if d.has("viewer_is_pending_opponent"): room2["viewer_is_pending_opponent"] = d["viewer_is_pending_opponent"]
 				cb.call(true, room2)
 				return
-		cb.call(false, {})
+		# BUG FIX: used to always call cb.call(false, {}) on failure, discarding
+		# the backend's actual error code (e.g. "slot_reserved_by_another" vs.
+		# "room_expired") — callers had no way to show a specific message. Parse
+		# the error body (writeErr sends {"error": "..."}) and pass it through.
+		var _err_msg := ""
+		var ej := JSON.new()
+		if ej.parse(body.get_string_from_utf8()) == OK:
+			var ed = ej.get_data()
+			if typeof(ed) == TYPE_DICTIONARY:
+				_err_msg = str(ed.get("error", ""))
+		cb.call(false, {"err": _err_msg})
 	)
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/vsroom/" + room_id.uri_encode() + "/join"), _headers(true), HTTPClient.METHOD_POST, "{}")
 
@@ -2726,36 +2902,40 @@ func _load_nimiq_avatar_async(target: Control, address: String, size: int) -> vo
 		await get_tree().create_timer(0.1).timeout
 		if not is_instance_valid(target): return
 
+	# SECURITY: JSON.stringify()'d before splicing into JS (see LeaderboardPanel's
+	# _load_nimiq_avatar_async for the same fix + rationale).
+	var js_addr := JSON.stringify(address)
+	var js_key := JSON.stringify(key)
 	var js_code := (
 		"(function(){"
 		+ "if(!window._nimiqPending) window._nimiqPending = {};"
-		+ "window._nimiqPending['" + key + "'] = null;"
+		+ "window._nimiqPending[" + js_key + "] = null;"
 		+ "if(typeof window.getNimiqAvatar !== 'function'){"
-		+ "  window._nimiqPending['" + key + "'] = ''; return;"
+		+ "  window._nimiqPending[" + js_key + "] = ''; return;"
 		+ "}"
-		+ "window.getNimiqAvatar('" + address + "')"
+		+ "window.getNimiqAvatar(" + js_addr + ")"
 		+ "  .then(function(svgData){"
-		+ "    if(!svgData){ window._nimiqPending['" + key + "'] = ''; return; }"
+		+ "    if(!svgData){ window._nimiqPending[" + js_key + "] = ''; return; }"
 		+ "    var img = new Image();"
 		+ "    img.onload = function(){"
 		+ "      try {"
 		+ "        var c = document.createElement('canvas');"
 		+ "        c.width = " + str(size) + "; c.height = " + str(size) + ";"
 		+ "        c.getContext('2d').drawImage(img, 0, 0, " + str(size) + ", " + str(size) + ");"
-		+ "        window._nimiqPending['" + key + "'] = c.toDataURL('image/png');"
-		+ "      } catch(e){ window._nimiqPending['" + key + "'] = ''; }"
+		+ "        window._nimiqPending[" + js_key + "] = c.toDataURL('image/png');"
+		+ "      } catch(e){ window._nimiqPending[" + js_key + "] = ''; }"
 		+ "    };"
-		+ "    img.onerror = function(){ window._nimiqPending['" + key + "'] = ''; };"
+		+ "    img.onerror = function(){ window._nimiqPending[" + js_key + "] = ''; };"
 		+ "    img.src = svgData;"
 		+ "  })"
-		+ "  .catch(function(e){ window._nimiqPending['" + key + "'] = ''; });"
+		+ "  .catch(function(e){ window._nimiqPending[" + js_key + "] = ''; });"
 		+ "})();"
 	)
 	JavaScriptBridge.eval(js_code, true)
 	for _i in 50:
 		await get_tree().create_timer(0.1).timeout
 		if not is_instance_valid(target): return
-		var raw = JavaScriptBridge.eval("window._nimiqPending['%s']" % key, true)
+		var raw = JavaScriptBridge.eval("window._nimiqPending[%s]" % js_key, true)
 		if raw == null: continue
 		var result := str(raw)
 		if result == "" or result == "null" or result == "undefined":

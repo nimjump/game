@@ -4,6 +4,8 @@ import {
   fetchStreaks, fetchAppConfig, saveAppConfig,
   type StreakPlayerRow, type AppConfig,
 } from "@/lib/api";
+import NimiqAvatar from "@/components/NimiqAvatar";
+import PlayerDetailModal from "@/components/PlayerDetailModal";
 
 function nim(n?: number) { return (n ?? 0).toFixed(4); }
 function fmt(ts?: number) {
@@ -34,6 +36,7 @@ export default function StreakTab() {
   const [aggActive, setAggActive] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [detailPlayer, setDetailPlayer] = useState<string | null>(null);
 
   const load = useCallback(async (off: number) => {
     setLoading(true); setError("");
@@ -265,7 +268,14 @@ export default function StreakTab() {
             {players.map(p => (
               <tr key={p.player_id} style={{ borderTop: "1px solid var(--border)" }}>
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>
-                  {p.nickname || <span style={{ fontFamily: "monospace", color: "var(--text-muted)" }}>{p.player_id.slice(0, 12)}…</span>}
+                  <div
+                    style={{ display: "flex", alignItems: "center", gap: 8, cursor: p.player_id ? "pointer" : "default" }}
+                    onClick={() => p.player_id && setDetailPlayer(p.player_id)}
+                    title={p.player_id ? `${p.player_id} — click for details` : undefined}
+                  >
+                    <NimiqAvatar address={p.player_id} size={26} />
+                    {p.nickname || <span style={{ fontFamily: "monospace", color: "var(--text-muted)" }}>{p.player_id.slice(0, 12)}…</span>}
+                  </div>
                 </td>
                 <td style={{ padding: "10px 14px" }}>
                   {p.streak_day > 0 ? (
@@ -286,6 +296,10 @@ export default function StreakTab() {
           </tbody>
         </table>
       </div>
+
+      {detailPlayer && (
+        <PlayerDetailModal playerID={detailPlayer} onClose={() => setDetailPlayer(null)} />
+      )}
     </div>
   );
 }

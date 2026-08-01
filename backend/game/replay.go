@@ -743,38 +743,70 @@ func SummaryLine(result *GodotReplayResult, clientScore int) string {
 // swallowed, never propagated.
 type checkpointEntry = map[string]interface{}
 
+// CheckpointDivergence is LogCheckpointDivergence's finding, in a form
+// suitable for folding straight into a FailedReplayEntry's Extra map — see
+// that function's doc comment for why this exists (it used to ONLY log.Printf
+// this, which meant diagnosing a real occurrence required manually
+// correlating an archived entry's session ID against raw server logs that
+// may have already rotated out).
+type CheckpointDivergence struct {
+	// FirstDivergeTick is -1 if no divergence was found among the checked
+	// (matching) checkpoints — see Note for why (no data, no overlap, or a
+	// genuine full agreement where any real divergence must have happened
+	// strictly BETWEEN two sampled checkpoints).
+	FirstDivergeTick   int64  `json:"first_diverge_tick"`
+	FirstDivergeDetail string `json:"first_diverge_detail,omitempty"`
+	MatchedCheckpoints int    `json:"matched_checkpoints"`
+	ClientCheckpoints  int    `json:"client_checkpoints"`
+	ServerCheckpoints  int    `json:"server_checkpoints"`
+	// Note explains what FirstDivergeTick==-1 means in this specific case
+	// ("no checkpoint data at all", "no overlapping ticks", or "all matching
+	// checkpoints agree") — left empty when a real divergence WAS found,
+	// since FirstDivergeDetail already explains that case.
+	Note string `json:"note,omitempty"`
+}
+
 // LogCheckpointDivergence — best-effort forensic diff between the client's
 // own recorded checkpoint log and the server replay's checkpoint log for an
 // ALREADY-FLAGGED session. Finds the first tick where they disagree on
-// score/position/velocity/rng-state and logs it prominently, so a rare
-// client-vs-server (WASM vs native) desync leaves an actual diagnostic trail
-// instead of just the aggregate score-diff percentage from ParseFlagReason.
+// score/position/velocity/rng-state, logs it prominently, AND returns it so
+// the caller can attach it to the archived failed-replay entry — so a rare
+// client-vs-server desync (whether that's a genuine WASM-vs-native float/libm
+// difference, a rare simulate_tick() edge case, or a recording/encoding bug)
+// leaves an actual, queryable diagnostic trail instead of just the aggregate
+// score-diff percentage from ParseFlagReason and a log line that may have
+// already rotated out of the server's log retention by the time anyone looks.
 //
 // This function must NEVER be able to affect the flagging decision, crash
-// the calling goroutine, or block — it only reads already-computed data and
-// prints a log line. Wrapped in recover() as an extra safety net since it
-// runs inline in the live /submit verification path.
-func LogCheckpointDivergence(sessionID string, clientCkptRaw json.RawMessage, result *GodotReplayResult) {
+// the calling goroutine, or block — it only reads already-computed data,
+// prints a log line, and returns a plain data struct (nil on any parse
+// failure/panic). Wrapped in recover() as an extra safety net since it runs
+// inline in the live /submit verification path.
+func LogCheckpointDivergence(sessionID string, clientCkptRaw json.RawMessage, result *GodotReplayResult) (div *CheckpointDivergence) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("[CKPT_DIFF] session=%s recovered panic: %v", sessionID, r)
+			div = nil
 		}
 	}()
 
 	if len(clientCkptRaw) == 0 || result == nil || len(result.Checkpoints) == 0 {
 		log.Printf("[CKPT_DIFF] session=%s no checkpoints to compare (client=%d bytes, server=%d bytes) — likely an old client build or a very short run",
 			sessionID, len(clientCkptRaw), len(result.GetCheckpointsRaw()))
-		return
+		return &CheckpointDivergence{
+			FirstDivergeTick: -1,
+			Note:             "no checkpoint data (old client build or very short run)",
+		}
 	}
 
 	var clientCkpt, serverCkpt []checkpointEntry
 	if err := json.Unmarshal(clientCkptRaw, &clientCkpt); err != nil {
 		log.Printf("[CKPT_DIFF] session=%s client checkpoint parse error: %v", sessionID, err)
-		return
+		return &CheckpointDivergence{FirstDivergeTick: -1, Note: "client checkpoint parse error: " + err.Error()}
 	}
 	if err := json.Unmarshal(result.Checkpoints, &serverCkpt); err != nil {
 		log.Printf("[CKPT_DIFF] session=%s server checkpoint parse error: %v", sessionID, err)
-		return
+		return &CheckpointDivergence{FirstDivergeTick: -1, Note: "server checkpoint parse error: " + err.Error()}
 	}
 
 	// Index server checkpoints by tick for O(1) lookup regardless of ordering.
@@ -805,16 +837,27 @@ func LogCheckpointDivergence(sessionID string, clientCkptRaw json.RawMessage, re
 		}
 	}
 
+	result_ := &CheckpointDivergence{
+		FirstDivergeTick:   firstDivergeTick,
+		FirstDivergeDetail: firstDivergeDetail,
+		MatchedCheckpoints: matched,
+		ClientCheckpoints:  len(clientCkpt),
+		ServerCheckpoints:  len(serverCkpt),
+	}
+
 	if firstDivergeTick >= 0 {
 		log.Printf("[CKPT_DIFF] session=%s FIRST DIVERGENCE at tick=%d: %s (checked %d/%d matching checkpoints)",
 			sessionID, firstDivergeTick, firstDivergeDetail, matched, len(clientCkpt))
 	} else if matched == 0 {
 		log.Printf("[CKPT_DIFF] session=%s no overlapping checkpoint ticks between client(%d) and server(%d) — cannot compare",
 			sessionID, len(clientCkpt), len(serverCkpt))
+		result_.Note = "no overlapping checkpoint ticks between client and server logs"
 	} else {
 		log.Printf("[CKPT_DIFF] session=%s all %d matching checkpoints agree — divergence (if real) happened between checkpoints, not caught by the %d-tick sampling interval",
 			sessionID, matched, matched)
+		result_.Note = "all matching checkpoints agree — any real divergence happened strictly between two sampled checkpoints"
 	}
+	return result_
 }
 
 // GetCheckpointsRaw — nil-safe accessor, used only for the byte-length log above.

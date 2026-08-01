@@ -3,6 +3,7 @@
 import { useEffect, useState, useMemo } from "react";
 import { fetchPlayersList, searchPlayer, type RegisteredPlayer, type PlayerProfile } from "@/lib/api";
 import DeviceBreakdownCard from "./DeviceBreakdownCard";
+import CountryBreakdownCard from "./CountryBreakdownCard";
 import NimiqAvatar from "./NimiqAvatar";
 
 function fmtDate(ts: number) {
@@ -125,7 +126,10 @@ export default function PlayersListTab() {
         </button>
       </div>
 
-      <DeviceBreakdownCard />
+      <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
+        <div style={{ flex: 1, minWidth: 320 }}><DeviceBreakdownCard /></div>
+        <div style={{ flex: 1, minWidth: 320 }}><CountryBreakdownCard /></div>
+      </div>
 
       {/* Controls */}
       <div style={{ display: "flex", gap: 10, marginBottom: 16, flexWrap: "wrap", alignItems: "center" }}>

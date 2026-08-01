@@ -1,5 +1,19 @@
 # NimJump — Full Export & Deploy Guide
 
+> **⚠️ QA Disclaimer — Anti-Cheat Testing**
+> A set of test cheat codes has been intentionally left in the build so
+> the council can stress-test the anti-cheat system. They should try
+> every possible method of cheating, not just these — including
+> in-game/memory cheats (code injection, memory editing, value
+> manipulation), network cheats (intercepting or modifying packet data),
+> and any other method they can find.
+>
+> Built-in test shortcuts:
+> - **G** — God Mode ⚠️ *(Can't toggle off — do not press. Player becomes unkillable and the game will not end.)*
+> - **J** — Jetpack *(press again to toggle off)*
+> - **K** — Give Wings *(press again to toggle off)*
+
+
 This is not just a web export guide — it covers the full setup: the web
 build for the browser, the native build the backend needs for replay
 verification, wasm splitting, and deployment to Cloudflare Pages.
@@ -54,7 +68,6 @@ NimJump/
 - Know which OS the backend/replay-verifier host runs — it determines
   which native export preset you use (see section 3.2)
 
----
 
 ## 2. Open the Project
 
@@ -92,10 +105,6 @@ Then, **before** exporting from Godot:
     python setup/apply_urls.py            # writes them into ApiConfig.gd
     python setup/apply_urls.py --check    # verify only, exit 1 if drifted
 
-The constants are compiled into the build, which is why this runs first.
-The SEO tags, `robots.txt` and `sitemap.xml` use `__GAME_URL__` /
-`__API_BASE__` placeholders that `setup/build.py` fills in after the
-export.
 
 Runtime overrides for testing: `?api=` / `?game_url=` query params, or
 `nj_api_base` / `nj_game_url` in localStorage.
@@ -232,7 +241,7 @@ Run it from the **repo root**, after the web export and before
     python patch_safari.py
 
 Safe to re-run — it only matches unpatched patterns. Skip it and
-Safari/iOS players can fail to load the game while everyone else is fine.
+Should run mandatorily or game can fail to load.
 
 ---
 

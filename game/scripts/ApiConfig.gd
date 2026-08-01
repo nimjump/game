@@ -196,16 +196,28 @@ func base_url() -> String:
 
 func _resolve() -> String:
 	if OS.has_feature("web"):
-		var q : String = str(JavaScriptBridge.eval(
-			"(new URLSearchParams(window.location.search)).get('api') || ''", true))
-		q = q.strip_edges()
-		if q != "":
-			return _trim_slash(q)
-		var ls : String = str(JavaScriptBridge.eval(
-			"localStorage.getItem('nj_api_base') || ''", true))
-		ls = ls.strip_edges()
-		if ls != "":
-			return _trim_slash(ls)
+		# SECURITY (security audit): the ?api= override lets a crafted link
+		# redirect a victim's client to an attacker-controlled "backend" -
+		# every request the client makes afterward, including the Hub sign
+		# challenge/response and later the Authorization: Bearer session
+		# token, would go straight to the attacker instead of the real
+		# backend. That's fine as a dev/test convenience but was live in
+		# production with no gating at all. Now restricted to debug
+		# (non-release) exports only - OS.is_debug_build() is false for a
+		# real Release web export (what actually gets deployed to
+		# production), matching the same dev-only gating convention already
+		# used elsewhere in this codebase (see GameManager.gd/Player.gd).
+		if OS.is_debug_build():
+			var q : String = str(JavaScriptBridge.eval(
+				"(new URLSearchParams(window.location.search)).get('api') || ''", true))
+			q = q.strip_edges()
+			if q != "":
+				return _trim_slash(q)
+			var ls : String = str(JavaScriptBridge.eval(
+				"localStorage.getItem('nj_api_base') || ''", true))
+			ls = ls.strip_edges()
+			if ls != "":
+				return _trim_slash(ls)
 		# Dev-tunnel injection: devtools/start-dev-tunnels.js sets
 		# window.NJ_API_BASE fresh into index.html on EVERY serve (see its
 		# injectApiBase()). Read here at runtime — BEFORE the compiled-in

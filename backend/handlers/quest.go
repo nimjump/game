@@ -64,148 +64,19 @@ func (s *Server) handleQuests(ctx *fasthttp.RequestCtx) {
 	writeJSON(ctx, 200, map[string]any{"quests": result, "day": day, "reset_at": resetAt})
 }
 
-// POST /bj/quests/progress
-// Validates the request using the server score stored in DB for the given session_id
-type questProgressReq struct {
-	PlayerID  string `json:"player_id"`
-	SessionID string `json:"session_id"` // required — for server-side validation
-}
-
-func (s *Server) handleQuestProgress(ctx *fasthttp.RequestCtx) {
-	authedPlayer := s.tokenPlayerID(ctx)
-	if authedPlayer == "" {
-		writeErr(ctx, 401, "auth_required")
-		return
-	}
-
-	var req questProgressReq
-	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
-		writeErr(ctx, 400, "bad_json")
-		return
-	}
-	if req.SessionID == "" {
-		writeErr(ctx, 400, "session_id is required")
-		return
-	}
-	// Always use the token's player, ignore client-sent player_id
-	req.PlayerID = authedPlayer
-
-	// Fetch session from DB — real values are here
-	sess, err := s.Store.Get(req.SessionID)
-	if err != nil {
-		writeErr(ctx, 404, "session_not_found")
-		return
-	}
-
-	// Session must belong to the authenticated player
-	if sess.PlayerID != "" && sess.PlayerID != authedPlayer {
-		log.Printf("[QUEST_PROGRESS] player_mismatch session=%s authed=%s sess=%s",
-			req.SessionID[:min8(req.SessionID)], authedPlayer[:min8(authedPlayer)], sess.PlayerID[:min8(sess.PlayerID)])
-		writeErr(ctx, 403, "forbidden")
-		return
-	}
-
-	// Don't grant quest progress from flagged or invalid sessions
-	if sess.Flagged || sess.ServerScore <= 0 {
-		log.Printf("[QUEST_PROGRESS] skipped — flagged=%v server_score=%d session=%s",
-			sess.Flagged, sess.ServerScore, req.SessionID[:min8(req.SessionID)])
-		writeJSON(ctx, 200, map[string]any{"ok": true, "completed": []string{}, "skipped": "flagged_or_zero"})
-		return
-	}
-
-	// Server-validated values
-	serverScore := sess.ServerScore
-	ticks := sess.Ticks // total ticks = game duration proxy
-
-	quests, qerr := s.Store.GetOrCreatePlayerQuests(req.PlayerID)
-	if qerr != nil {
-		writeErr(ctx, 500, "failed to load quests")
-		return
-	}
-	day := time.Now().In(game.UTC3).Format("2006-01-02")
-	updated := []string{}
-
-	for _, q := range quests {
-		prog, _ := s.Store.GetProgress(req.PlayerID, q.ID)
-		if prog == nil {
-			prog = &models.PlayerQuestProgress{
-				PlayerID:  req.PlayerID,
-				QuestID:   q.ID,
-				Day:       day,
-				Target:    q.Target,
-				RewardNIM: q.RewardNIM,
-			}
-		}
-		if prog.Completed {
-			continue
-		}
-
-		switch q.Type {
-		// ── Score-based (single match peak) ──────────────────────────────
-		case models.QuestScore:
-			if serverScore > prog.Progress {
-				prog.Progress = serverScore
-			}
-
-		// ── Cumulative score across matches ───────────────────────────────
-		case models.QuestTotalScore:
-			prog.Progress += serverScore
-
-		// ── Match count — only counts matches that scored at least 300 ─────
-		case models.QuestGames, models.QuestGames5, models.QuestGames10:
-			if serverScore >= 300 {
-				prog.Progress += 1
-			}
-
-		// ── Altitude (New logic: Reach score X in a single match) ─────────
-		case models.QuestAltitude:
-			if serverScore > prog.Progress {
-				prog.Progress = serverScore
-			}
-
-		// ── Speedrun ──────────────────────────────────────────────────────
-		case models.QuestSpeedrun:
-			if serverScore >= 1000 && ticks <= 90*60 {
-				prog.Progress = 1
-			}
-
-		// ── Streak (New logic: Pass 500 points in 3 separate matches today)
-		case models.QuestStreak:
-			if serverScore >= 500 {
-				prog.Progress += 1
-			}
-
-		// ── Kill/coin/item based — handled exclusively by server-side replay (UpdateQuestProgressFromReplay)
-		// This proxy endpoint only has basic score+ticks, no detailed game-simulation context.
-		case models.QuestKills, models.QuestKillsTotal, models.QuestMosquito,
-			models.QuestFlying, models.QuestNoDmgKill, models.QuestMultiKill,
-			models.QuestCoinTotal, models.QuestCoinMatch, models.QuestGoldenCarot,
-			models.QuestItemHunter, models.QuestPowerup, models.QuestNoCoins,
-			models.QuestPacifist, models.QuestNoDmgMatch, models.QuestHighJumpOnly,
-			models.QuestMirrorRun, models.QuestNoHit:
-			// noop — rich context simulation handles these safely
-		}
-
-		if prog.Progress >= q.Target {
-			prog.Progress = q.Target
-			prog.Completed = true
-			updated = append(updated, q.ID)
-			log.Printf("[QUEST_DONE] player=%s quest=%s reward=%.3f NIM",
-				req.PlayerID[:min8(req.PlayerID)], q.ID, q.RewardNIM)
-		}
-
-		_ = s.Store.SaveProgress(prog)
-	}
-
-	log.Printf("[QUEST_PROGRESS] player=%s session=%s server_score=%d ticks=%d completed=%v",
-		req.PlayerID[:min8(req.PlayerID)], req.SessionID[:min8(req.SessionID)],
-		serverScore, ticks, updated)
-
-	writeJSON(ctx, 200, map[string]any{
-		"ok":        true,
-		"completed": updated,
-	})
-}
+// NOTE: There used to be a POST /bj/quests/progress endpoint here, callable
+// directly by the client after a run, which re-derived quest progress from a
+// session's server-validated score/ticks. It's been removed — quest progress
+// is now applied EXCLUSIVELY as a side effect of replay verification, inside
+// the /backend/submit handler (see server.go's call to
+// Store.UpdateQuestProgressFromReplay, which covers every quest type,
+// including the score/altitude/speedrun/streak ones this endpoint used to
+// handle itself). The client never triggers quest progress directly anymore;
+// it only ever submits a replay, and the server updates quests as part of
+// verifying it. This removes an entire client-facing attack surface (no more
+// need for the ClaimQuestProgressForSession idempotency guard either, since
+// UpdateQuestProgressFromReplay only ever runs once per submitted session,
+// from server code, not from a repeatable client-triggered request).
 
 // POST /bj/quests/claim
 func (s *Server) handleQuestClaim(ctx *fasthttp.RequestCtx) {
@@ -310,6 +181,15 @@ func (s *Server) handleQuestClaimAll(ctx *fasthttp.RequestCtx) {
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil || len(req.QuestIDs) == 0 {
 		writeErr(ctx, 400, "quest_ids are required")
+		return
+	}
+	// BUG FIX (security audit): quest_ids was unbounded — a large client-
+	// supplied array forced one DB GetProgress lookup + lock attempt per
+	// entry, letting a single request drive unbounded DB/CPU load (there are
+	// only a handful of real daily quests, so any legitimate call is tiny).
+	const maxClaimAllQuestIDs = 64
+	if len(req.QuestIDs) > maxClaimAllQuestIDs {
+		writeErr(ctx, 400, "too_many_quest_ids")
 		return
 	}
 	req.PlayerID = authedPlayer

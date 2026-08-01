@@ -1,7 +1,9 @@
 "use client";
 import Link from "next/link";
+import { useState } from "react";
 import type { Overview, Session } from "@/lib/api";
 import NimiqAvatar from "@/components/NimiqAvatar";
+import PlayerDetailModal from "@/components/PlayerDetailModal";
 
 function fmtDur(sec: number) {
   if (!sec) return "—";
@@ -38,6 +40,7 @@ function UsageBar({ label, used, total }: { label: string; used: number; total: 
 interface Props { ov: Overview; }
 
 export default function OverviewTab({ ov }: Props) {
+  const [detailPlayer, setDetailPlayer] = useState<string | null>(null);
   return (
     <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
 
@@ -52,7 +55,11 @@ export default function OverviewTab({ ov }: Props) {
             {(ov.recent_sessions ?? []).map((s: Session) => (
               <tr key={s.session_id} style={s.flagged ? { background: "#1a0d0d" } : {}}>
                 <td>
-                  <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+                  <div
+                    style={{ display: "flex", alignItems: "center", gap: 7, cursor: s.player_id ? "pointer" : "default" }}
+                    onClick={() => s.player_id && setDetailPlayer(s.player_id)}
+                    title={s.player_id ? `${s.player_id} — click for details` : undefined}
+                  >
                     <NimiqAvatar address={s.player_id ?? ""} size={24} />
                     <span style={{ fontSize: 12 }}>{s.nickname || "—"}</span>
                   </div>
@@ -133,6 +140,9 @@ export default function OverviewTab({ ov }: Props) {
         </div>
       )}
 
+      {detailPlayer && (
+        <PlayerDetailModal playerID={detailPlayer} onClose={() => setDetailPlayer(null)} />
+      )}
     </div>
   );
 }

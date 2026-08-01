@@ -348,6 +348,53 @@ func canSeeVSSeed(r *models.VSRoom, viewerID string) bool {
 	return r.CreatorPaid && r.OpponentPaid
 }
 
+// StripVSUnearnedScore returns a copy of r with whichever score(s) viewerID
+// hasn't "earned" the right to see yet cleared.
+//
+// NOT CURRENTLY WIRED IN (product decision): a security-audit pass initially
+// applied this everywhere StripVSSeed is applied, on the theory that seeing
+// the opponent's score before playing your own round is a competitive-
+// integrity leak analogous to seed-scouting. Explicitly overruled — seeing
+// the score ahead of time is fine by design here (only the opponent's actual
+// REPLAY, gated separately, needs to stay hidden). Left defined rather than
+// deleted in case a future feature wants "hide until earned" semantics for
+// something else, but nothing should call this today.
+//
+// BUG FIX (security audit): the room JSON always included CreatorScore /
+// OpponentScore in full, with no equivalent of StripVSSeed's gating. Because
+// score is recorded as soon as the FIRST side's replay finishes server-side
+// verification — which can be well before the second side has even started
+// their own run (UpdateVSRoomScore only requires the readiness gate, not
+// "both have played") — the side who plays second could simply poll
+// GET /backend/vsroom/{id} before pressing Play and see exactly what score
+// they need to beat. That's a genuine competitive-integrity leak in the same
+// family as the seed-scouting issue StripVSSeed/canSeeVSSeed already closes:
+// knowing the target score in advance lets a player choose a materially
+// different, safer-or-riskier strategy than someone going in blind, which is
+// not supposed to be possible in an "async but simultaneous-information"
+// 1v1. Once the viewer has recorded their OWN score (or the match is
+// terminal, so the outcome is already decided and public either way),
+// there's nothing left to protect — reveal normally.
+func StripVSUnearnedScore(r models.VSRoom, viewerID string) models.VSRoom {
+	if isVSTerminalStatus(r.Status) {
+		return r // match is over — outcome is already decided, safe to reveal
+	}
+	if viewerID != r.CreatorID && viewerID != r.OpponentID {
+		// Not a participant — pre-settlement, a non-participant has no
+		// business seeing either side's score at all.
+		r.CreatorScore = nil
+		r.OpponentScore = nil
+		return r
+	}
+	if viewerID == r.CreatorID && r.CreatorScore == nil {
+		r.OpponentScore = nil // creator hasn't played yet — don't leak the target
+	}
+	if viewerID == r.OpponentID && r.OpponentScore == nil {
+		r.CreatorScore = nil // opponent hasn't played yet — don't leak the target
+	}
+	return r
+}
+
 // PaginateVSRooms slices an already-filtered/sorted room list into a page,
 // returning the page plus the pre-pagination total count (so a caller can
 // show "X of Y" or decide whether to offer a "load more" control). limit<=0
@@ -503,6 +550,52 @@ func (s *Store) ListOpenVSRooms(excludePlayerID string, limit int) ([]models.VSR
 
 // ── Create / Join ────────────────────────────────────────────────────────────
 
+// VSMaxActiveCreatedRooms — cap on how many non-terminal rooms a single
+// player can have created at once (see CountActiveCreatedVSRooms).
+//
+// BUMPED 5 -> 8: the original 5 turned out too easy to hit legitimately —
+// every "create room, then back out of / cancel the wallet payment popup"
+// used to leave the unpaid room occupying a slot for up to
+// vsOpponentPayWindow (10 min) with no way for the player to know why, since
+// the client didn't proactively free the slot on a failed/declined payment
+// (see the now-added _cancel_room call in VSPanel.gd's _do_pay failure
+// branch, which fixes that root cause). 8 is extra headroom on top of that
+// fix for players genuinely juggling several open challenges at once.
+const VSMaxActiveCreatedRooms = 8
+
+// CountActiveCreatedVSRooms — how many non-terminal rooms this player is
+// currently the CREATOR of (paid or not, matched or still open — anything
+// that isn't settled/cancelled yet). Used to cap room-creation spam.
+//
+// BUG FIX (security audit): room creation was completely free and
+// unthrottled beyond the generic per-IP rate limiter — a signed-in player
+// could create rooms as fast as the rate limiter allowed (every unpaid one
+// auto-cancels after 10 minutes, but until then each is a live BadgerDB
+// record). This doesn't cost the spammer anything (no payment happens at
+// creation, only reservation), and isn't visible to other players (unpaid
+// rooms are hidden even from the creator's own "My Matches" list, and never
+// appear in the public open-room browse list — both already correctly
+// require Status==VSWaitingOpponent / CreatorPaid), so it was purely a
+// database-growth / resource-exhaustion concern rather than a way to trick
+// anyone — but still worth capping.
+func (s *Store) CountActiveCreatedVSRooms(playerID string) (int, error) {
+	all, err := s.ListVSRooms()
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for _, r := range all {
+		if r.CreatorID != playerID {
+			continue
+		}
+		if isVSTerminalStatus(r.Status) {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (s *Store) CreateVSRoom(creatorID, creatorNickname string, entryNIM float64, isPrivate bool) (*models.VSRoom, error) {
 	if entryNIM < 0 {
 		entryNIM = 0
@@ -584,8 +677,19 @@ func (s *Store) JoinVSRoom(roomID, playerID, nickname string) (*models.VSRoom, e
 		// only reserve this player as the pending payer (used by the reconciler
 		// and to show them their own Pay button). OpponentID stays empty and the
 		// room stays "waiting_opponent" for everyone until the payment confirms
-		// (see ConfirmVSRoomPayment). Concurrent joiners are allowed; whoever
-		// pays first wins the slot and any later payer is auto-refunded.
+		// (see ConfirmVSRoomPayment). Concurrent joiners are allowed — deliberately
+		// NOT blocked here. (An earlier version of this fix tried blocking a
+		// second joiner while someone else's reservation was still live, but
+		// that just traded a rare misattribution bug for a much more common,
+		// easily-griefed one: anyone could lock a paid room for the whole pay
+		// window by tapping join with zero intention of ever paying, blocking
+		// every real payer behind them. The actual fix belongs at CREDIT time,
+		// not at join time — see ReconcileVSPayments' opponent branch and
+		// SweepExpiredVSRooms' last-chance check, which now verify the tx's
+		// real on-chain sender against the reserved player's own registered
+		// wallet before crediting anyone, and search ALL matching payments (not
+		// just the first) so a genuine payer is never shadowed by someone
+		// else's stale/duplicate entry for the same memo.)
 		r.PendingOpponentID = playerID
 		r.PendingOpponentNickname = nickname
 		r.PendingOpponentSince = now
@@ -846,8 +950,23 @@ func (s *Store) ReconcileVSPayments() {
 				if hash := findMatchingTx(txs, cfg.WalletAddress, vsRoomMemo(r.ID, "c"), int64(entryLuna(r.EntryNIM))); hash != "" {
 					r.CreatorPaid = true
 					r.CreatorPayTx = hash
+					// BUG FIX ("yan hesaba girdim, open challenge'a düşmedi"): this
+					// used to set VSAwaitingCreatorPlay here — a status left over
+					// from the OLD "creator plays first" flow. The room's normal,
+					// client-driven confirm path (ConfirmVSRoomPayment, see its
+					// "Creator paying OPENS the room for an opponent" comment) has
+					// long since moved to the NEW flow, where a paid creator's room
+					// goes straight to VSWaitingOpponent — nobody plays until the
+					// opponent has also joined. This reconciler is just the
+					// fallback for when the client's own confirm call never landed
+					// (network hiccup, tab closed mid-payment, etc.); it must set
+					// the SAME status the normal path would have, or a room whose
+					// payment only got picked up by this background sweep gets
+					// stuck forever at a status IsOpen()/JoinVSRoom never treat as
+					// joinable — invisible in the public "Open Challenges" list and
+					// rejected by anyone trying to join via the direct link too.
 					if r.Status == models.VSAwaitingCreatorPay {
-						r.Status = models.VSAwaitingCreatorPlay
+						r.Status = models.VSWaitingOpponent
 					}
 					changed = true
 					log.Printf("[VSROOM] reconcile: found creator payment room=%s tx=%s (client never confirmed it)", r.ID, hash)
@@ -858,28 +977,8 @@ func (s *Store) ReconcileVSPayments() {
 			// tx is on-chain but their confirm call was lost — commit them as the
 			// opponent now. (If the slot is already filled, nothing to do; a
 			// losing racer's refund is handled at confirm time.)
-			if r.OpponentID == "" && r.PendingOpponentID != "" && !r.OpponentPaid {
-				if hash := findMatchingTx(txs, cfg.WalletAddress, vsRoomMemo(r.ID, "o"), int64(entryLuna(r.EntryNIM))); hash != "" {
-					nickname := r.PendingOpponentNickname
-					if nickname == "" {
-						if pn, gerr := s.GetNickname(r.PendingOpponentID); gerr == nil && pn != nil && pn.Nickname != "" {
-							nickname = pn.Nickname
-						} else {
-							nickname = "Player"
-						}
-					}
-					r.OpponentID = r.PendingOpponentID
-					r.OpponentNickname = nickname
-					r.OpponentPaid = true
-					r.OpponentPayTx = hash
-					r.PendingOpponentID = ""
-					r.PendingOpponentNickname = ""
-					r.PendingOpponentSince = 0
-					r.Status = models.VSAwaitingOppPlay
-					r.ExpiresAt = time.Now().Add(vsRoomPlayWindow).Unix()
-					changed = true
-					log.Printf("[VSROOM] reconcile: committed pending opponent room=%s player=%s tx=%s (confirm was lost)", r.ID, r.OpponentID, hash)
-				}
+			if s.resolvePendingOpponentPayment(r, txs, cfg.WalletAddress) {
+				changed = true
 			}
 			// Refund any DUPLICATE entry payments (same memo, extra tx) for either
 			// paid side back to whoever sent them — the "player double-paid because
@@ -901,18 +1000,113 @@ func (s *Store) ReconcileVSPayments() {
 	}
 }
 
+// resolvePendingOpponentPayment — for a room with a live, unpaid
+// PendingOpponentID, scans ALL on-chain txs matching the room's opponent-role
+// memo/amount (not just the first/newest one) and:
+//   - if one of them was actually sent by the currently-reserved player's own
+//     registered wallet, commits that player as the opponent (using THAT
+//     tx's hash specifically — never a different matching tx from someone
+//     else, even if it happened to be found first in the scan);
+//   - refunds every OTHER matching tx straight to its own sender.
+//
+// This replaces an earlier version that only ever looked at the single
+// first-matching tx in scan order: if that first match happened to belong to
+// someone whose reservation had since moved on (a stale/duplicate entry for
+// the same memo), the code would refund it and then just stop — never
+// looking further to find the CURRENT reserved player's own, perfectly valid
+// payment sitting right there in the same tx list. That could leave a real,
+// correctly-paid opponent stuck unrecognized indefinitely. Scanning every
+// match and picking the one that actually belongs to the reserved player
+// (by wallet address, not by list position) fixes that.
+//
+// Returns true if it modified r (caller must save). Safe to call repeatedly
+// (idempotent via RefundedDupTxs, same as refundDuplicateVSSide).
+func (s *Store) resolvePendingOpponentPayment(r *models.VSRoom, txs []map[string]any, wantAddress string) bool {
+	if r.OpponentID != "" || r.PendingOpponentID == "" || r.OpponentPaid {
+		return false
+	}
+	memo := vsRoomMemo(r.ID, "o")
+	expectedLuna := int64(entryLuna(r.EntryNIM))
+	matches := findAllMatchingVSTxs(txs, wantAddress, memo, expectedLuna)
+	if len(matches) == 0 {
+		return false
+	}
+	// NOTE: deliberately does NOT require the tx's sender to match the
+	// reserved player's own registered/login wallet. An earlier version of
+	// this function did — but Nimiq's Hub checkout popup lets a player pay
+	// from ANY of their Hub-managed accounts, not necessarily the one they
+	// signed into the game with, so that check would have wrongly refunded
+	// perfectly legitimate payments from a different (but still the same
+	// real player's) wallet. The room+role memo is itself the identifier
+	// tying a payment to a specific reservation — that's sufficient; who
+	// physically sent the transaction doesn't need to match anything else.
+	// The first (newest, since txs are newest-first) matching payment is
+	// credited to whoever currently holds the reservation; every other
+	// matching tx is treated as a genuine duplicate/stale entry and refunded
+	// straight back to its own sender.
+	ownHash := ""
+	for _, tx := range matches {
+		hash, _ := tx["hash"].(string)
+		if hash == "" {
+			hash = "found"
+		}
+		if ownHash == "" {
+			ownHash = hash
+			continue
+		}
+		sender, _ := tx["from"].(string)
+		if sender != "" && !sliceContainsStr(r.RefundedDupTxs, hash) {
+			log.Printf("[VSROOM] extra opponent-memo payment room=%s pending=%s tx_from=%s hash=%s — refunding as duplicate",
+				r.ID, r.PendingOpponentID, sender, hash)
+			s.refundVSRoomToAddress(r, sender, r.EntryNIM)
+			r.RefundedDupTxs = append(r.RefundedDupTxs, hash)
+		}
+	}
+	nickname := r.PendingOpponentNickname
+	if nickname == "" {
+		if pn, gerr := s.GetNickname(r.PendingOpponentID); gerr == nil && pn != nil && pn.Nickname != "" {
+			nickname = pn.Nickname
+		} else {
+			nickname = "Player"
+		}
+	}
+	r.OpponentID = r.PendingOpponentID
+	r.OpponentNickname = nickname
+	r.OpponentPaid = true
+	r.OpponentPayTx = ownHash
+	r.PendingOpponentID = ""
+	r.PendingOpponentNickname = ""
+	r.PendingOpponentSince = 0
+	r.Status = models.VSAwaitingOppPlay
+	r.ExpiresAt = time.Now().Add(vsRoomPlayWindow).Unix()
+	log.Printf("[VSROOM] committed pending opponent room=%s player=%s tx=%s", r.ID, r.OpponentID, ownHash)
+	return true
+}
+
 // findMatchingTx — returns the tx hash of the first transaction in txs that
 // matches the given memo/amount to wantAddress, or "" if none match.
 func findMatchingTx(txs []map[string]any, wantAddress, expectedMemo string, expectedLuna int64) string {
+	hash, _ := findMatchingTxWithSender(txs, wantAddress, expectedMemo, expectedLuna)
+	return hash
+}
+
+// findMatchingTxWithSender — same as findMatchingTx, but also returns the
+// tx's "from" address (currently unused by findMatchingTx's own callers,
+// which only need the hash — the reconciler/sweep opponent-credit paths use
+// resolvePendingOpponentPayment/findAllMatchingVSTxs instead, since they need
+// to check EVERY matching tx's sender, not just the first one found).
+func findMatchingTxWithSender(txs []map[string]any, wantAddress, expectedMemo string, expectedLuna int64) (hash string, sender string) {
 	for _, tx := range txs {
 		if ok, _ := txMatchesVSPayment(tx, wantAddress, expectedMemo, expectedLuna); ok {
-			if hash, _ := tx["hash"].(string); hash != "" {
-				return hash
+			h, _ := tx["hash"].(string)
+			if h == "" {
+				h = "found" // matched but node didn't echo a hash field — still a valid confirmation
 			}
-			return "found" // matched but node didn't echo a hash field — still a valid confirmation
+			from, _ := tx["from"].(string)
+			return h, from
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // findAllMatchingVSTxs — every transaction matching the given memo/amount to
@@ -965,7 +1159,14 @@ func (s *Store) refundDuplicateVSSide(r *models.VSRoom, txs []map[string]any, wa
 		if sender == "" {
 			continue // can't refund what we can't attribute
 		}
-		s.refundVSRoom(r, sender, r.EntryNIM)
+		// BUG FIX: was refundVSRoom(r, sender, ...) — that treats its 2nd arg
+		// as an internal player ID and looks it up via GetPlayerWallet, which
+		// a raw on-chain address ("sender" here) never matches. The refund
+		// used to get queued with Status=RewardNoWallet and just sit there
+		// forever with no automated way to actually send it — real reported
+		// symptom: "paid twice, one payment never came back." See
+		// refundVSRoomToAddress/QueueRewardToAddress for the fix.
+		s.refundVSRoomToAddress(r, sender, r.EntryNIM)
 		r.RefundedDupTxs = append(r.RefundedDupTxs, hash)
 		changed = true
 		log.Printf("[VSROOM] duplicate %s payment refunded room=%s to=%s tx=%s", role, r.ID, sender, hash)
@@ -1069,6 +1270,26 @@ func (s *Store) UpdateVSRoomScore(roomID, role string, score int, sessionID stri
 	if err != nil || r == nil {
 		return nil, fmt.Errorf("room_not_found")
 	}
+	// BUG FIX (security audit — expiry-race double payout): every other VS
+	// room mutator (ClaimVSRoomPlay, RequestVSForfeit, CancelVSRoom, the admin
+	// resolvers) refuses to touch a room once it's terminal — this one didn't.
+	// Sequence that exploited the gap: player submits their run right as the
+	// room's ExpiresAt ticks over; the 5-minute sweep happens to settle the
+	// room as a "forfeit" (other side already scored, this side hadn't called
+	// MarkVSRoomPlayed yet) BEFORE this side's async replay verification
+	// finishes and reaches here. Since this function never checked terminal
+	// status, it would still record the late score, and because that made
+	// CreatorScore/OpponentScore BOTH non-nil while r.Status was already the
+	// terminal VSExpiredPayout (not VSCompleted), the "both sides done →
+	// settle" branch below would fire AGAIN — re-running settleVSRoom on an
+	// already-paid-out room and queuing a SECOND payout on top of the forfeit
+	// payout that had already been sent. Refusing to touch a terminal room at
+	// all closes this: a genuinely-late score submission is simply dropped
+	// (logged, no money moves), matching how every other post-settlement
+	// mutator already behaves.
+	if isVSTerminalStatus(r.Status) {
+		return nil, fmt.Errorf("match_over")
+	}
 	now := time.Now().Unix()
 	// NEW FLOW readiness gate: NOBODY may play until the opponent has joined
 	// AND (for paid rooms) BOTH sides have paid. This is what enforces "you
@@ -1130,6 +1351,17 @@ func (s *Store) MarkVSRoomPlayed(roomID, role, sessionID string) {
 	defer lock.Unlock()
 	r, err := s.GetVSRoom(roomID)
 	if err != nil || r == nil {
+		return
+	}
+	// BUG FIX (security audit — expiry-race hygiene): same reasoning as the
+	// terminal-status guard added to UpdateVSRoomScore — a room already
+	// settled (sweep forfeit, admin resolution, mutual forfeit, ...) must
+	// never be mutated again by a late-arriving submission. This alone
+	// wouldn't have caused the double-payout (only UpdateVSRoomScore's
+	// re-settle branch could do that), but writing a played-at timestamp onto
+	// an already-closed room is still incorrect state and worth refusing
+	// outright, consistent with every other mutator in this file.
+	if isVSTerminalStatus(r.Status) {
 		return
 	}
 	switch role {
@@ -1425,6 +1657,21 @@ func (s *Store) refundVSRoom(r *models.VSRoom, playerID string, amountNIM float6
 	}
 }
 
+// refundVSRoomToAddress — same as refundVSRoom, but for refunding straight to
+// a known raw on-chain address rather than an internal player ID (see
+// QueueRewardToAddress's doc comment for why refundVSRoom/QueueRewardRaw
+// can't be reused here — this is the fix for the duplicate-payment refund
+// bug where refunds silently got stuck in "no_wallet" forever).
+func (s *Store) refundVSRoomToAddress(r *models.VSRoom, address string, amountNIM float64) {
+	if address == "" || amountNIM <= 0 {
+		return
+	}
+	_, err := s.QueueRewardToAddress(address, amountNIM, fmt.Sprintf("vsroom:%s:refund_dup", r.ID))
+	if err != nil {
+		log.Printf("[VSROOM] duplicate refund failed room=%s to=%s err=%v", r.ID, address, err)
+	}
+}
+
 // ── Expiry sweep ──────────────────────────────────────────────────────────────
 
 // SweepExpiredVSRooms — settles any room whose 24h window has passed and
@@ -1485,6 +1732,35 @@ func (s *Store) SweepExpiredVSRooms() {
 					r.PendingOpponentSince == 0 || now-r.PendingOpponentSince <= payWindowSecs {
 					return
 				}
+				// BUG FIX (real reported symptom: "paid to join, money gone, never
+				// got in, room shows nobody joined"): ReconcileVSPayments ran once
+				// at the top of SweepExpiredVSRooms, but that was a single snapshot
+				// in time — if the player's on-chain payment only lands (or only
+				// gets indexed) in the gap between that reconcile pass and this
+				// drop, the old code cleared PendingOpponentID unconditionally.
+				// Once cleared, ReconcileVSPayments' opponent-credit branch
+				// requires PendingOpponentID != "" to attribute a matching tx to
+				// anyone — so a real, on-chain, memo-matching payment that arrives
+				// a few seconds too late would sit there forever: never credited
+				// (nobody to credit it to) and never refunded either (that only
+				// triggers once OpponentPaid is true). One more live chain check
+				// right before dropping closes that gap — if their payment is
+				// actually sitting on-chain, commit them as the opponent instead
+				// of dropping the reservation out from under them.
+				cfg := s.GetNimiqConfig()
+				if cfg.WalletAddress != "" {
+					if txs, terr := nimiqGetTransactionsByAddress(cfg.RPCURL, cfg.WalletAddress, 500); terr == nil {
+						// Reuses the exact same "scan every matching tx, only credit the
+						// one that's actually from the reserved player's own wallet"
+						// logic as ReconcileVSPayments (see resolvePendingOpponentPayment's
+						// doc comment) — this is just one more chance to catch it right
+						// before the reservation would otherwise be dropped.
+						if s.resolvePendingOpponentPayment(r, txs, cfg.WalletAddress) {
+							_ = s.saveVSRoom(r)
+							return
+						}
+					}
+				}
 				log.Printf("[VSROOM] dropping stale unpaid pending opponent id=%s player=%s (%ds unpaid)",
 					r.ID, r.PendingOpponentID, now-r.PendingOpponentSince)
 				r.PendingOpponentID = ""
@@ -1516,6 +1792,32 @@ func (s *Store) SweepExpiredVSRooms() {
 					r.OpponentID != "" || r.PendingOpponentID != "" ||
 					now-r.CreatedAt <= payWindowSecs {
 					return
+				}
+				// BUG FIX: same gap as the pending-opponent drop above — cancelling
+				// straight to VSCancelled (a terminal status) means
+				// ReconcileVSPayments will never look at this room again, so a
+				// creator payment that only lands/gets indexed in the gap between
+				// the reconcile pass at the top of this sweep and this cancel would
+				// be orphaned forever (matches the memo, but nothing ever checks
+				// again). One more live chain check right before cancelling closes
+				// that gap.
+				cfg := s.GetNimiqConfig()
+				if cfg.WalletAddress != "" {
+					if txs, terr := nimiqGetTransactionsByAddress(cfg.RPCURL, cfg.WalletAddress, 500); terr == nil {
+						if hash := findMatchingTx(txs, cfg.WalletAddress, vsRoomMemo(r.ID, "c"), int64(entryLuna(r.EntryNIM))); hash != "" {
+							log.Printf("[VSROOM] last-chance chain check found creator payment for room=%s tx=%s — committing instead of cancelling", r.ID, hash)
+							r.CreatorPaid = true
+							r.CreatorPayTx = hash
+							// Same fix as ReconcileVSPayments above (this is the same
+							// class of "recover a payment the client never itself
+							// confirmed" fallback) — VSWaitingOpponent, not the
+							// old-flow VSAwaitingCreatorPlay, matching
+							// ConfirmVSRoomPayment's own normal-path status.
+							r.Status = models.VSWaitingOpponent
+							_ = s.saveVSRoom(r)
+							return
+						}
+					}
 				}
 				log.Printf("[VSROOM] cancelling abandoned unpaid creator room id=%s (%ds unpaid)", r.ID, now-r.CreatedAt)
 				r.Status = models.VSCancelled

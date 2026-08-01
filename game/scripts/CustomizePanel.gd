@@ -165,7 +165,11 @@ func _build_ui() -> void:
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+		# Close on RELEASE not press — see LeaderboardPanel.gd's dim handler for
+		# the full explanation (press-triggered close lets the release half of
+		# the same tap leak through onto whatever's now exposed underneath,
+		# e.g. instantly firing a bottom-nav button at that screen position).
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
 	)
 	_panel_ctrl.add_child(dim)

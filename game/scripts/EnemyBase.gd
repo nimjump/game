@@ -477,7 +477,15 @@ func _ease_t(t: float, ein: bool, eout: bool, bounce: bool) -> float:
 			var s := (t - 0.9) / 0.1
 			return 1.0175 - s * 0.0175
 	if ein and eout:
-		return (1.0 - cos(t * PI)) * 0.5
+		# DETERMINISM: lut_cos, not cos() — see GameConstants.gd's big comment.
+		# _ease_t feeds _tick_move()'s global_position.lerp()/lerpf() every tick
+		# for any enemy move segment created with ein=eout=true (e.g. Enemy.gd's
+		# land/climb segments: `_move_to(..., true, true, ...)`), and that
+		# position is gameplay-relevant (player-overlap/stomp AABB checks) even
+		# though it also gets the end-of-tick snappedf() treatment below. A raw
+		# libm cos() ULP difference here is exactly the class of bug this whole
+		# file's DETERMINISM comments warn about — same fix as lut_sin/lut_acos.
+		return (1.0 - GameConstants.lut_cos(t * PI)) * 0.5
 	if ein:
 		return t * t
 	if eout:

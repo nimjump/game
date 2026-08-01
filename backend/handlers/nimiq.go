@@ -30,7 +30,11 @@ func (s *Server) handleWalletRegister(ctx *fasthttp.RequestCtx) {
 		writeErr(ctx, 400, "nimiq_address is required")
 		return
 	}
-	if len(req.NimiqAddress) < 4 || req.NimiqAddress[:2] != "NQ" {
+	// SECURITY (security audit): was `len(addr) >= 4 && addr[:2] == "NQ"` — far
+	// too loose, let a caller store arbitrary text (including quote chars) as
+	// their own wallet address. Now runs the real address decoder so only a
+	// well-formed Nimiq address (correct charset + length) is ever accepted.
+	if err := game.ValidateNimiqAddressFormat(req.NimiqAddress); err != nil {
 		writeErr(ctx, 400, "invalid_nimiq_address")
 		return
 	}

@@ -2065,7 +2065,6 @@ func _on_player_died() -> void:
 			main_node.call("show_game_over", score, best_score, _go_stats)
 
 	_submit_session()
-	_submit_quest_progress()
 
 
 const LS_PENDING := "nj_pending_submissions"
@@ -2855,60 +2854,15 @@ func reset_for_lobby() -> void:
 
 
 # ── Speed hack guard: stamp game start on server the moment first tick is recorded ──
-# ── Quest progress (server-side validated) ──────────────────────────────────
-func _submit_quest_progress() -> void:
-	if session_id == "":
-		return
-	var pid := ""
-	var main_node = get_tree().get_root().get_node_or_null("Main")
-	if main_node and main_node.get("nimiq_address") != null:
-		pid = str(main_node.get("nimiq_address"))
-	if pid == "" or pid == "Guest":
-		return
-
-	var body := JSON.stringify({
-		"player_id":  pid,
-		"session_id": session_id,
-	})
-
-	var http := HTTPRequest.new()
-	add_child(http)
-	# BUG FIX: "Lambda capture at index 0 was freed" — GameManager (self) or
-	# this http node can be freed mid-flight (e.g. "Play Again" ->
-	# reload_current_scene) before the response lands. `main_node` is also
-	# captured here and can independently go stale if Main itself is freed
-	# (e.g. scene reload) while this request is in flight.
-	var _alive : WeakRef = weakref(self)
-	http.request_completed.connect(ApiConfig.check_clock_skew)
-	http.request_completed.connect(func(result: int, code: int, _h, body_resp: PackedByteArray):
-		if not is_instance_valid(http): return
-		http.queue_free()
-		if _alive.get_ref() == null: return
-		if code == 401:
-			# 401 here means token was missing or expired — don't trigger re-sign,
-			# quest progress is best-effort and server processes it via submit anyway
-			print("[GM] quests/progress 401 — skipping, no re-sign")
-			return
-		if result == HTTPRequest.RESULT_SUCCESS and code == 200:
-			var j := JSON.new()
-			if j.parse(body_resp.get_string_from_utf8()) == OK:
-				var data = j.get_data()
-				if data is Dictionary and data.has("completed"):
-					var done : Array = data["completed"]
-					if done.size() > 0:
-						print("[GM] Quest completed: ", done)
-						if is_instance_valid(main_node) and main_node.has_method("_on_quests_updated"):
-							main_node.call("_on_quests_updated")
-	)
-	var headers := PackedStringArray(["Content-Type: application/json"])
-	var _qtok := ""
-	var _qmn = get_tree().get_root().get_node_or_null("Main")
-	if _qmn and _qmn.get("_auth_token") != null:
-		_qtok = str(_qmn.get("_auth_token"))
-	if _qtok == "":
-		return  # no token — skip, will retry via flush_pending after sign-in
-	headers.append("Authorization: Bearer " + _qtok)
-	var _e := http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/quests/progress"), headers, HTTPClient.METHOD_POST, body)
+# ── Quest progress ──────────────────────────────────────────────────────────
+# NOTE: There used to be a separate _submit_quest_progress() here that POSTed
+# to /backend/quests/progress right after _submit_session(). That endpoint is
+# gone — the server now applies quest progress itself, as a side effect of
+# verifying the replay inside the /backend/submit handler, so the client
+# never needs to trigger it. All that's left client-side is refreshing the
+# quest panel UI once the submit response confirms the server has processed
+# the run — see the `code == 200` branch in _send_submit_with_retry() below,
+# which calls Main._on_quests_updated() to re-fetch GET /bj/quests.
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -3046,17 +3000,38 @@ func _send_submit_with_retry(sid: String, body: String) -> void:
 		# 0 / 5xx / 429 → network/server error → keep in queue, retry
 		if code == 200:
 			_pending_remove(sid)
+			# Server has finished verifying the replay and, as part of that,
+			# already applied any quest progress from this run
+			# (Store.UpdateQuestProgressFromReplay). Just refresh the quest
+			# panel UI so completed quests show up — no separate progress
+			# request needed.
+			var _qmn2 = get_tree().get_root().get_node_or_null("Main")
+			if is_instance_valid(_qmn2) and _qmn2.has_method("_on_quests_updated"):
+				_qmn2.call("_on_quests_updated")
 		elif code == 401:
 			# Not authenticated — keep in queue, notify Main to show sign-in
 			print("[GM] submit 401 — no auth, keeping in queue until signed in")
 			_notify_auth_expired()
 			_ensure_retry_timer()
-		elif code >= 400 and code < 500:
+		elif code >= 400 and code < 500 and code != 429:
 			# 400/403/409 etc. — permanent rejection, drop
+			# BUG FIX: 429 used to fall into THIS branch (it's inside 400..500)
+			# even though the comment on the final `else` below always claimed
+			# 429 was treated as transient/retried — it never actually was,
+			# because this `elif` caught it first and dropped the submission
+			# from the pending queue for good. In practice: if a player's
+			# replay-verification concurrency cap was hit
+			# (too_many_pending_replays — see maxReplayInFlightPerPlayer in
+			# backend/handlers/server.go) or the generic per-IP rate limiter
+			# briefly rejected a submit, the run's score was silently
+			# discarded instead of retried a moment later. 429 now falls
+			# through to the retry branch below, matching what the comment
+			# always said should happen.
 			print("[GM] submit %d — permanent rejection, dropping sid=%s" % [code, sid.left(8)])
 			_pending_remove(sid)
 		else:
-			# 0 (network err), 5xx, 429 — transient, retry
+			# 0 (network err), 5xx, 429 (rate-limited — transient, not a
+			# rejection of the submission itself) — retry.
 			print("[GM] submit failed (code=%d), staying in queue" % code)
 			Toast.network_error("submit code=%d" % code)
 			_ensure_retry_timer()

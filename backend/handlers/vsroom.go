@@ -53,6 +53,14 @@ func (s *Server) handleVSRoomCreate(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// BUG FIX (security audit): cap how many rooms a player can have open at
+	// once — see game.CountActiveCreatedVSRooms's doc comment for why this
+	// was previously unthrottled.
+	if activeCount, cerr := s.Store.CountActiveCreatedVSRooms(playerID); cerr == nil && activeCount >= game.VSMaxActiveCreatedRooms {
+		writeErr(ctx, 429, "too_many_active_rooms")
+		return
+	}
+
 	nick := "Player"
 	if pn, err := s.Store.GetNickname(playerID); err == nil && pn != nil && pn.Nickname != "" {
 		nick = pn.Nickname
@@ -275,6 +283,21 @@ func (s *Server) handleVSRoomMine(ctx *fasthttp.RequestCtx) {
 	if err != nil {
 		writeErr(ctx, 500, "list_failed")
 		return
+	}
+	// BUG FIX (security audit): this endpoint used to return the raw stored
+	// rooms with no stripping at all — unlike every other room-returning route
+	// (create/get/join/pay/start/forfeit), which all route through
+	// StripVSSeed. Since every room here has playerID as a participant, it's
+	// tempting to assume "it's their own match, nothing to hide" — but a
+	// player's OWN room can still be one they haven't earned the seed for yet
+	// (e.g. a still-open free room with no opponent joined yet: Seed is set
+	// at creation regardless of payment/opponent state).
+	// Without this, a player could create a free VS room, hit /mine to read
+	// its Seed, then Cancel and repeat — reopening the exact
+	// create->peek-seed->cancel scouting exploit canSeeVSSeed exists to close,
+	// just via this endpoint instead of create/get/join.
+	for i, r := range rooms {
+		rooms[i] = game.StripVSSeed(r, playerID)
 	}
 	writeJSON(ctx, 200, map[string]any{
 		"ok": true, "rooms": rooms, "total": total, "offset": offset, "limit": limit,

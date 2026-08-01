@@ -4,21 +4,22 @@
   "private": true,
   "scripts": {
     "dev": "node scripts/run.js dev",
-    "build": "next build",
+    "build": "node scripts/run.js build",
     "start": "node scripts/run.js start"
   },
   "dependencies": {
     "@nimiq/identicons": "^1.6.2",
-    "next": "^16.2.7",
+    "next": "^16.2.12",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "sharp": "^0.35.3"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4.3.0",
     "@types/node": "^22",
     "@types/react": "^19",
     "@types/react-dom": "^19",
-    "postcss": "^8",
+    "postcss": "^8.5.25",
     "tailwindcss": "^4.3.0",
     "typescript": "^5.8.3"
   }

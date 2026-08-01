@@ -102,6 +102,13 @@ func start_sign(challenge: String) -> void:
 	if not OS.has_feature("web"):
 		return
 	# DOM dataset kullan: async callback da buraya yazabilir, eval da okuyabilir
+	# SECURITY: challenge is JSON.stringify()'d before splicing into the JS
+	# literal (same defense-in-depth pattern as start_payment()/start_hub_sign()
+	# below) — challenge is always server-generated plain ASCII in practice, but
+	# this closes the naive-concatenation injection path regardless, in case
+	# that ever changes or a MITM'd/compromised backend response ever reaches
+	# here.
+	var js_challenge := JSON.stringify(challenge)
 	var js : String = (
 		"(function(){"
 		+ "document.body.dataset.nimiqSign = '';"
@@ -110,7 +117,7 @@ func start_sign(challenge: String) -> void:
 		+   "document.body.dataset.nimiqSign = JSON.stringify({ok:false,err:'no_provider'});"
 		+   "return;"
 		+ "}"
-		+ "_prov.sign('" + challenge + "')"
+		+ "_prov.sign(" + js_challenge + ")"
 		+   ".then(function(r){"
 		+     "document.body.dataset.nimiqSign = JSON.stringify({ok:true,publicKey:r.publicKey,signature:r.signature});"
 		+     "console.log('[sign] DOM written ok publicKey='+r.publicKey.slice(0,8)+' siglen='+r.signature.length);"
