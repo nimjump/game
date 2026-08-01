@@ -1,17 +1,11 @@
 # NimJump — Full Export & Deploy Guide
 
 > **⚠️ QA Disclaimer — Anti-Cheat Testing**
-> A set of test cheat codes has been intentionally left in the build so
 > the council can stress-test the anti-cheat system. They should try
 > every possible method of cheating, not just these — including
 > in-game/memory cheats (code injection, memory editing, value
 > manipulation), network cheats (intercepting or modifying packet data),
 > and any other method they can find.
->
-> Built-in test shortcuts:
-> - **G** — God Mode ⚠️ *(Can't toggle off — do not press. Player becomes unkillable and the game will not end.)*
-> - **J** — Jetpack *(press again to toggle off)*
-> - **K** — Give Wings *(press again to toggle off)*
 
 
 This is not just a web export guide — it covers the full setup: the web
