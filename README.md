@@ -2,7 +2,7 @@
 
 > **⚠️ QA Disclaimer — Anti-Cheat Testing**
 > the council can stress-test the anti-cheat system. They should try
-> every possible method of cheating, not just these — including
+> every possible method of cheating, — including
 > in-game/memory cheats (code injection, memory editing, value
 > manipulation), network cheats (intercepting or modifying packet data),
 > and any other method they can find.
