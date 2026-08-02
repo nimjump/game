@@ -6,6 +6,9 @@
 > in-game/memory cheats (code injection, memory editing, value
 > manipulation), network cheats (intercepting or modifying packet data),
 > and any other method they can find.
+> This game was built to bring a gaming audience into the Nimiq ecosystem,
+> and to give Nimiq a way to distribute rewards safely —
+> without having to worry about cheaters stealing them.
 
 
 This is not just a web export guide — it covers the full setup: the web
