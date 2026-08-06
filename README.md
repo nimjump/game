@@ -19,7 +19,8 @@
 
 >
 
-> 1. **Gameplay automation (bot).** While technically possible, developing a competitive bot is expected to require significant effort for relatively little practical benefit. The game is primarily skill-based, making this attack economically unattractive.
+> 1. **Gameplay automation (bot).** While technically possible, developing and maintaining a competitive bot would require significant effort. The game features a wide variety of enemies whose behavior, movement, and speed are determined dynamically based on the score and deterministic RNG. Very little of the gameplay is static or follows fixed patterns, meaning a bot would need to continuously adapt rather than rely on scripted inputs. Even if such a bot were developed, future gameplay updates would likely require substantial rework, making the approach costly and impractical relative to the potential rewards.
+
 
 >
 
