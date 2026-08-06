@@ -13,11 +13,11 @@
 
 > ### Known Limitations
 
->
+>NimJump is complete and fully functional. A significant portion of the development effort was dedicated to designing a minimal client-authority architecture, centered around deterministic map generation and server-side replay verification.
 
 > There are currently two known cheating vectors:
 
->NimJump is complete and fully functional. A significant portion of the development effort was dedicated to designing a minimal client-authority architecture, centered around deterministic map generation and server-side replay verification.
+>
 
 > 1. **Gameplay automation (bot).** While technically possible, developing a competitive bot is expected to require significant effort for relatively little practical benefit. The game is primarily skill-based, making this attack economically unattractive.
 
