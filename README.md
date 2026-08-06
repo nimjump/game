@@ -17,13 +17,13 @@
 
 > There are currently two known cheating vectors:
 
->
+>NimJump is complete and fully functional. A significant portion of the development effort was dedicated to designing a minimal client-authority architecture, centered around deterministic map generation and server-side replay verification.
 
 > 1. **Gameplay automation (bot).** While technically possible, developing a competitive bot is expected to require significant effort for relatively little practical benefit. The game is primarily skill-based, making this attack economically unattractive.
 
 >
 
-> 2. **Arbitrary seed generation.** To support offline play, the current implementation generates the game seed on the client. A malicious user could repeatedly generate seeds until finding one that produces a favorable game. This limitation is currently accepted because offline play is considered a core feature of the game. Given the complexity of this attack and the importance of offline play, this tradeoff was considered acceptable for the current release.
+> 2. **Arbitrary seed generation.** To support offline play, the current implementation generates the game seed on the client. A malicious user could repeatedly generate seeds until finding one that produces a favorable game. This limitation is currently accepted because offline play is considered a core feature of the game. Given the complexity of this attack and the importance of offline play, this tradeoff was considered acceptable by me for the current release.
 
 >
 
