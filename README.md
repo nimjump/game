@@ -23,7 +23,7 @@
 
 >
 
-> 2. **Arbitrary seed generation.** To support offline play, the current implementation generates the game seed on the client. A malicious user could repeatedly generate seeds until finding one that produces a favorable game. This limitation is currently accepted because offline play is considered a core feature of the game.
+> 2. **Arbitrary seed generation.** To support offline play, the current implementation generates the game seed on the client. A malicious user could repeatedly generate seeds until finding one that produces a favorable game. This limitation is currently accepted because offline play is considered a core feature of the game. Given the complexity of this attack and the importance of offline play, this tradeoff was considered acceptable for the current release.
 
 >
 
