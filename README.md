@@ -11,6 +11,34 @@
 > without having to worry about cheaters stealing them.
 
 
+> ### Known Limitations
+
+>
+
+> There are currently two known cheating vectors:
+
+>
+
+> 1. **Gameplay automation (bot).** While technically possible, developing a competitive bot is expected to require significant effort for relatively little practical benefit. The game is primarily skill-based, making this attack economically unattractive.
+
+>
+
+> 2. **Arbitrary seed generation.** To support offline play, the current implementation generates the game seed on the client. A malicious user could repeatedly generate seeds until finding one that produces a favorable game. This limitation is currently accepted because offline play is considered a core feature of the game.
+
+>
+
+> ### Planned Solution
+
+>
+
+> The planned solution is to replace arbitrary client-generated seeds with **server-issued seed batches**. While the player is online, the server will issue a batch of signed seeds (for example, 100). These seeds can then be consumed during offline gameplay. When the player reconnects and claims rewards, the server will verify that every submitted seed is authentic, unused, and was originally issued by the server.
+
+>
+
+> This approach preserves offline play while preventing players from generating arbitrary seeds in search of favorable outcomes.
+
+
+
 This is not just a web export guide — it covers the full setup: the web
 build for the browser, the native build the backend needs for replay
 verification, wasm splitting, and deployment to Cloudflare Pages.
