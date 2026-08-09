@@ -366,8 +366,33 @@ func _tick_player_overlap() -> void:
 	# Use dist_sq to avoid sqrt; cache _overlap_v_offset avoids Vector2 alloc per tick.
 	var p := _get_player()
 	if not p: return
-	var dx : float = (p.global_position.x) - global_position.x
-	var dy : float = (p.global_position.y + _overlap_v_offset.y) - global_position.y
+	# TUNNEL FIX: test the player's swept path this tick (entry position →
+	# current position) against this enemy, not just the current point. A
+	# fast fall/jump can otherwise cross this enemy's entire overlap
+	# threshold within a single tick — the post-move point alone lands
+	# clean on one side while the straight-line path between the two ticks
+	# still passed through, which used to silently skip the stomp/hit
+	# entirely (same class of bug as GameManager's interactable tunneling
+	# fix). p.get() is used instead of a typed cast since Enemy only knows
+	# Player as a loosely-typed body reference.
+	var p_entry : Vector2 = p.get("_tick_entry_position")
+	var ex0 : float = p_entry.x
+	var ey0 : float = p_entry.y + _overlap_v_offset.y
+	var ex1 : float = p.global_position.x
+	var ey1 : float = p.global_position.y + _overlap_v_offset.y
+	var ax  : float = global_position.x
+	var ay  : float = global_position.y
+	var ex  : float = ex1 - ex0
+	var ey  : float = ey1 - ey0
+	var seg_len_sq : float = ex * ex + ey * ey
+	var t : float = 0.0
+	if seg_len_sq > 0.0000001:
+		t = ((ax - ex0) * ex + (ay - ey0) * ey) / seg_len_sq
+		t = clamp(t, 0.0, 1.0)
+	var cx : float = ex0 + ex * t
+	var cy : float = ey0 + ey * t
+	var dx : float = cx - ax
+	var dy : float = cy - ay
 	var dist_sq   : float = dx * dx + dy * dy
 	# HARDENING: +0.05 — same float-boundary tie-break fix applied to the
 	# platform-landing check and item-pickup overlap tests (see Player.gd

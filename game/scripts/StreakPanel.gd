@@ -20,6 +20,22 @@ var _auth_token : String = ""
 var _panel_ctrl : Control
 var _anim_tween : Tween = null
 
+# ── Panel auto-fit ───────────────────────────────────────────────────────────
+# Same shrink/grow-to-content mechanism as VSPanel.gd (see the member doc
+# comment there). This panel has no ScrollContainer (see the "no scroll at
+# all" bug-fix comment on _calendar_row below) — content_mc here is body_mc,
+# the single MarginContainer wrapping everything below the header, so a
+# longer _status_lbl message (e.g. a blocked/error line) grows the panel
+# instead of silently overflowing a fixed-height box like it used to.
+var _pc          : PanelContainer = null
+var _content_mc  : MarginContainer = null
+var _hdr_mc      : MarginContainer = null
+var _sep_rect    : Control = null
+var _panel_pad   : float = 0.0
+var _panel_max_h : float = 0.0
+var _panel_min_h : float = 0.0
+var _height_tween : Tween = null
+
 var _day_lbl        : Label
 var _day_sub_lbl     : Label
 var _amount_lbl     : Label
@@ -146,6 +162,10 @@ func _build_ui() -> void:
 	pc_style.shadow_size  = 10
 	pc.add_theme_stylebox_override("panel", pc_style)
 	_panel_ctrl.add_child(pc)
+	_pc = pc
+	_panel_pad = pad
+	_panel_max_h = ph
+	_panel_min_h = vh * 0.34
 
 	var outer := VBoxContainer.new()
 	outer.add_theme_constant_override("separation", int(ref * 0.018))
@@ -154,6 +174,7 @@ func _build_ui() -> void:
 	# ── Header ──
 	var hdr_mc := _mpad(pad, int(pad * 0.6))
 	outer.add_child(hdr_mc)
+	_hdr_mc = hdr_mc
 	var hdr := HBoxContainer.new()
 	hdr.alignment = BoxContainer.ALIGNMENT_CENTER
 	hdr.add_theme_constant_override("separation", int(ref * 0.012))
@@ -191,10 +212,12 @@ func _build_ui() -> void:
 	sep.color = Color(0.4, 0.4, 0.4, 0.3)
 	sep.custom_minimum_size.y = 1
 	outer.add_child(sep)
+	_sep_rect = sep
 
 	# ── Body ──
 	var body_mc := _mpad(pad, int(pad * 0.6))
 	outer.add_child(body_mc)
+	_content_mc = body_mc
 	var body := VBoxContainer.new()
 	body.alignment = BoxContainer.ALIGNMENT_CENTER
 	body.add_theme_constant_override("separation", int(ref * 0.020))
@@ -356,6 +379,7 @@ func _refresh() -> void:
 				return
 		_status_lbl.text = "Could not load streak status."
 		Toast.network_error("streak_status code=%d" % code)
+		_fit_panel_height()
 	)
 	var headers : PackedStringArray = ["Authorization: Bearer " + _auth_token]
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/streak/status"), headers)
@@ -378,6 +402,7 @@ func _render_state() -> void:
 		_claim_btn.disabled = true
 		_claim_btn.text = "Claim"
 		_refresh_calendar()
+		_fit_panel_height()
 		return
 	if _already_claimed:
 		_amount_lbl.text = ""
@@ -386,6 +411,7 @@ func _render_state() -> void:
 		_claim_btn.text = "Claimed"
 		_tomorrow_lbl.text = "Tomorrow: +%.2f NIM" % _reward_for_day(_streak_day + 1)
 		_refresh_calendar()
+		_fit_panel_height()
 		return
 	if _claimable_nim > 0.0:
 		_amount_lbl.text = "+%.2f NIM" % _claimable_nim
@@ -402,6 +428,7 @@ func _render_state() -> void:
 	# player always has a reason to come back, not just today's.
 	_tomorrow_lbl.text = "Tomorrow: +%.2f NIM" % _reward_for_day(_streak_day + 1)
 	_refresh_calendar()
+	_fit_panel_height()
 
 
 ## Ticks the "resets in HH:MM:SS" countdown once a second while the panel
@@ -654,6 +681,39 @@ static func _warm_btn(btn: Button, r: float = 8.0) -> void:
 	btn.add_theme_color_override("font_hover_color",   Color(1.0, 1.0, 1.0))
 	btn.add_theme_color_override("font_pressed_color", Color(0.957, 0.898, 0.800))
 	btn.add_theme_color_override("font_disabled_color", Color(0.480, 0.420, 0.360))
+
+
+## Shrinks/grows the panel to fit whatever's currently in the body (see the
+## _pc/_content_mc/etc. member doc comment above for why) instead of always
+## reserving the same tall fixed box. Call this once after _render_state()
+## updates the labels (in particular _status_lbl, whose wrapped line count is
+## the one thing that actually varies here). Async: waits a frame so the
+## freshly-updated content has real minimum sizes before measuring —
+## fire-and-forget from callers (`_fit_panel_height()` with no `await`).
+func _fit_panel_height() -> void:
+	if not is_instance_valid(_pc) or not is_instance_valid(_content_mc):
+		return
+	await get_tree().process_frame
+	# The panel may have been closed/torn down while we were waiting a frame.
+	if not is_instance_valid(_pc) or not is_instance_valid(_content_mc) or not is_instance_valid(_hdr_mc) or not is_instance_valid(_sep_rect):
+		return
+	var content_h : float = _content_mc.get_combined_minimum_size().y
+	var chrome_h  : float = _hdr_mc.size.y + _sep_rect.size.y + _panel_pad * 2.0
+	var desired_h : float = clampf(content_h + chrome_h, _panel_min_h, _panel_max_h)
+	_animate_panel_height(desired_h)
+
+
+## Tweens _pc's offset_top/offset_bottom to the given target height instead of
+## snapping instantly — shared by every _fit_panel_height() call.
+func _animate_panel_height(target_h: float) -> void:
+	if not is_instance_valid(_pc):
+		return
+	if is_instance_valid(_height_tween):
+		_height_tween.kill()
+	_height_tween = create_tween()
+	_height_tween.set_parallel(true)
+	_height_tween.tween_property(_pc, "offset_top",    -target_h * 0.5, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+	_height_tween.tween_property(_pc, "offset_bottom",  target_h * 0.5, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 
 
 func _mpad(h: int, v: int) -> MarginContainer:

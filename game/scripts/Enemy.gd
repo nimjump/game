@@ -116,6 +116,15 @@ const BARNACLE_ATTACK_INTERVAL := 1.5
 var _slime_attack_cd := 0.0
 var _slime_nodes     : Array[Node] = []
 
+# user request: thrown/spat particle attacks (green slime rock, purple slime
+# mini, worm dirt block, cloud rain) shouldn't fire until score 2000+ — most
+# creatures use this same _biome_particle_tex() projectile, not just slime.
+# `difficulty` here is GameManager._difficulty() = score/3000 clamped [0,1],
+# so score 2000 == difficulty 2000/3000. Deterministic pure function of
+# difficulty (no RNG involved in the gate itself), so this stays replay-safe.
+const RANGED_ATK_MIN_SCORE      := 2000.0
+const RANGED_ATK_MIN_DIFFICULTY := RANGED_ATK_MIN_SCORE / 3000.0
+
 # ── SNAIL ────────────────────────────────────────────────────────────
 var _in_shell    := false
 var _shell_timer := 0.0
@@ -1252,7 +1261,11 @@ func _cloud_ai(_delta: float) -> void:
 	# Rain: player is below us (dy > 0) and close on X
 	_cloud_rain_timer = maxf(0.0, _cloud_rain_timer - FIXED_DELTA)
 	if dy > 0.0 and abs(p.global_position.x - global_position.x) < CLOUD_RAIN_RANGE_X and _cloud_rain_timer <= 0.0:
-		_cloud_spawn_rain()
+		# user request: rain-drop particle attack locked out below score 2000,
+		# same as the other thrown-particle attacks — cooldown still rolls so
+		# pacing stays identical whether or not it actually fires.
+		if difficulty >= RANGED_ATK_MIN_DIFFICULTY:
+			_cloud_spawn_rain()
 		_cloud_rain_timer = CLOUD_RAIN_CD
 
 
@@ -1703,11 +1716,18 @@ func _slime_ai(_delta: float) -> void:
 				# BUG FIX: eskiden "if not _is_headless:" ile çağrılıyordu, yani
 				# headless'ta bu saldırının kaydettiği gerçek proj_damage hiç
 				# oluşmuyordu (bkz. _init_tex_cache'teki not). Artık her modda çağrılıyor.
-				_slime_green_spit(p)
+				# user request: rock-spit particle attack locked out below score 2000
+				# — cooldown still rolls every time so RNG stream/pacing stays identical
+				# whether or not the spit itself fires.
+				if difficulty >= RANGED_ATK_MIN_DIFFICULTY:
+					_slime_green_spit(p)
 				_slime_attack_cd = _rng_range(4.0, 6.0) * (1.0 - difficulty * 0.2)
 		EnemyType.SLIME_PURPLE:
 			var r := _vw * 0.167; if dist_sq < r * r:
-				_slime_purple_spawn_mini(p)   # BUG FIX: aynı şekilde artık her modda çalışıyor
+				# user request: mini-spawn particle attack locked out below score 2000,
+				# same as the other thrown-particle attacks.
+				if difficulty >= RANGED_ATK_MIN_DIFFICULTY:
+					_slime_purple_spawn_mini(p)   # BUG FIX: aynı şekilde artık her modda çalışıyor
 				_slime_attack_cd = _rng_range(4.5, 7.0) * (1.0 - difficulty * 0.3)
 
 
@@ -1930,7 +1950,11 @@ func _worm_ai(_delta: float) -> void:
 	var p := _get_player()
 	if not p: return
 	if global_position.distance_squared_to(p.global_position) < WORM_DIRT_RANGE * WORM_DIRT_RANGE and _worm_dirt_timer <= 0.0:
-		_worm_throw_dirt(p)
+		# user request: dirt-block particle throw locked out below score 2000,
+		# same as the other thrown-particle attacks — cooldown still rolls so
+		# pacing/RNG stream stays identical whether or not it actually fires.
+		if difficulty >= RANGED_ATK_MIN_DIFFICULTY:
+			_worm_throw_dirt(p)
 		_worm_dirt_timer = WORM_DIRT_COOLDOWN * (1.0 - difficulty * 0.3)
 
 

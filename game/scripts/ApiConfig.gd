@@ -55,8 +55,8 @@ const CONFIG_FILE_NAME := "config.cfg"
 #  robots.txt / sitemap.xml read urls.ini instead, so editing only here
 #  silently leaves the rest pointing elsewhere.
 # ════════════════════════════════════════════════════════════════════════
-const PROD_BASE     := "https://backbone.zetashare.com"   # backend API URL (urls.ini: api_base)
-const PROD_GAME_URL := "https://nimjump.zetashare.com"    # public game URL (urls.ini: game_url)
+const PROD_BASE     := "https://questionnaire-break-calculator-done.trycloudflare.com"   # backend API URL (urls.ini: api_base)
+const PROD_GAME_URL := "https://equal-increasing-missouri-apparent.trycloudflare.com"    # public game URL (urls.ini: game_url)
 
 # Local-dev-only last-resort values. These are intentionally NOT "the"
 # production backend — real deployments must set NIMJUMP_API_BASE / --api=

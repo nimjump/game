@@ -56,7 +56,7 @@ func _ready() -> void:
 
 	# CollisionShape2D is always added — required for mechanics in headless mode
 	var cs := CircleShape2D.new()
-	cs.radius = int(_vw * 0.027)
+	cs.radius = int(_vw * 0.027 * 1.2)   # 1.2x bigger hitbox (user request) — easier pickup
 	var col := CollisionShape2D.new()
 	col.shape = cs
 	add_child(col)

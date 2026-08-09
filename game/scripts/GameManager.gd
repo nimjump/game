@@ -74,6 +74,21 @@ var _highest_plat_y := 0.0
 # Replaces Area2D.body_entered signal (which is frame-based, not tick-based)
 var _interactables  : Array[Dictionary] = []
 
+# TUNNEL FIX: player's position at the end of the PREVIOUS tick, captured
+# right before _check_interactables() runs. At high fall speed the player
+# can move further in one tick than an interactable's touch radius/rect —
+# a pure "am I overlapping right now" test (position-only, no sweep) can
+# then find the player already past the spring/item/spike on the very
+# first tick it would have overlapped, so the pickup/trigger is silently
+# skipped entirely. This mirrors the exact class of bug Player.gd's
+# platform landing check already guards against with p_bottom_prev — see
+# the "Sweep check handles tunneling at high velocity" comment there.
+# _ci_prev_pos is Vector2.ZERO-initialized and refreshed to "invalid" on
+# every scene reset below so the very first tick after spawn never sweeps
+# from a stale/zeroed position (that would falsely test from (0,0)).
+var _ci_prev_pos       : Vector2 = Vector2.ZERO
+var _ci_prev_pos_valid : bool    = false
+
 # ── Texture cache ───────────────────────────────────────────────────
 var _ground_sets    : Array[Dictionary] = []
 var _enemy_frames   : Dictionary = {}
@@ -504,6 +519,12 @@ func _run_one_tick() -> void:
 	_simulate_gm_tick()
 	# GM-RT: compute player_ready once; direct field access avoids .get() string lookup
 	var player_ready : bool = is_instance_valid(player) and player._initialized
+	# TUNNEL FIX: snapshot position BEFORE this tick's physics move, so
+	# _check_interactables() below can sweep prev→current instead of testing
+	# only the post-move point. Must be captured here, not inside
+	# _check_interactables(), since that's the only place we still have
+	# "where the player was before simulate_tick() ran this tick".
+	var ci_pos_before : Vector2 = player.global_position if player_ready else Vector2.ZERO
 	if player_ready:
 		player.simulate_tick()
 		# Enemies ticked only when player is ready — keeps tick count equal in NORMAL and REPLAY
@@ -522,6 +543,14 @@ func _run_one_tick() -> void:
 	# replay speed. At 2x/4x/8x this causes missed or delayed pickups.
 	# Instead: check AABB overlap every tick manually.
 	if player_ready:
+		if _ci_prev_pos_valid:
+			_ci_prev_pos = ci_pos_before
+		else:
+			# First tick after spawn/reset: no real "previous" position yet —
+			# sweep from the current position (degenerates to a point test,
+			# same as before) rather than from a stale/zeroed one.
+			_ci_prev_pos = player.global_position
+			_ci_prev_pos_valid = true
 		_check_interactables()
 	_tick_spring_resets()
 
@@ -1223,7 +1252,7 @@ func _add_spring(plat: StaticBody2D) -> void:
 			area.add_child(anim)
 
 	var cs := CircleShape2D.new()
-	cs.radius = int(VW * 0.023 * 1.3)   # 1.3x bigger hitbox (user request)
+	cs.radius = int(VW * 0.023 * 1.6)   # bumped 1.3x -> 1.6x (user request) — 1.3x still felt too small
 	var col := CollisionShape2D.new()
 	col.shape    = cs
 	col.position = Vector2.ZERO
@@ -1276,7 +1305,7 @@ func _enemies_for_biome(p_score: int = -1) -> Array[Enemy.EnemyType]:
 				Enemy.EnemyType.WINGMAN,
 				Enemy.EnemyType.BARNACLE,
 				Enemy.EnemyType.WORM_PINK,
-				Enemy.EnemyType.CLOUD,
+				# user request: cloud enemy disabled — removed from spawn pool
 				Enemy.EnemyType.GHOST,
 			]
 		"sky":
@@ -1529,6 +1558,19 @@ func _check_interactables() -> void:
 	var p_half_w : float = VW * player.HITBOX_W_RATIO
 	var p_half_h : float = VH * player.HITBOX_H_RATIO
 
+	# TUNNEL FIX: this tick's movement segment, prev→current player center.
+	# Every overlap test below checks the player's swept path against the
+	# interactable instead of only the single post-move point — the same
+	# fix Player.gd's platform landing already applies (p_bottom_prev), now
+	# applied to springs/items/spikes/cards. At high fall speed the
+	# post-move-only point can land clean past a small interactable's
+	# radius/rect while the segment connecting the two ticks still passed
+	# straight through it — that tick was a full skip, not a near-miss.
+	var seg_x0 : float = _ci_prev_pos.x
+	var seg_y0 : float = _ci_prev_pos.y
+	var seg_x1 : float = px
+	var seg_y1 : float = py
+
 	_ci_to_remove.clear()
 
 	for i in _interactables.size():
@@ -1575,7 +1617,7 @@ func _check_interactables() -> void:
 			radius = entry["_r"]
 		else:
 			# First time: scan children once and cache shape data
-			radius = VW * 0.027
+			radius = VW * 0.027 * 1.2   # matches Item.gd's actual 1.2x hitbox — only hit if the real child shape is somehow missing
 			for child in area.get_children():
 				if child is CollisionShape2D and child.shape is CircleShape2D:
 					radius = (child.shape as CircleShape2D).radius
@@ -1599,8 +1641,16 @@ func _check_interactables() -> void:
 			# replay. Small epsilon (see Player.gd LAND_EPS) makes the trigger
 			# consistent instead of knife-edge.
 			const _OVERLAP_EPS := 0.05
+			# TUNNEL FIX: swept AABB — X range unchanged (horizontal speed is
+			# never large enough in one tick to matter here), Y range widened
+			# to cover the whole prev→current vertical span instead of just
+			# the current tick's Y. A fast fall can otherwise cross a thin
+			# rect (spike strip) entirely within one tick and never register
+			# as "inside" on either endpoint.
+			var seg_y_min : float = min(seg_y0, seg_y1) - p_half_h
+			var seg_y_max : float = max(seg_y0, seg_y1) + p_half_h
 			if (px + p_half_w > ax - rsize.x * 0.5 - _OVERLAP_EPS and px - p_half_w < ax + rsize.x * 0.5 + _OVERLAP_EPS and
-				py + p_half_h > ay - rsize.y * 0.5 - _OVERLAP_EPS and py - p_half_h < ay + rsize.y * 0.5 + _OVERLAP_EPS):
+				seg_y_max > ay - rsize.y * 0.5 - _OVERLAP_EPS and seg_y_min < ay + rsize.y * 0.5 + _OVERLAP_EPS):
 				var etype2 : String = entry["type"]
 				var is_spring2     : bool = (etype2 == "spring")
 				var is_spike2      : bool = (etype2 == "spike")
@@ -1612,12 +1662,32 @@ func _check_interactables() -> void:
 				_trigger_interactable(entry, area)
 			continue
 
-		# Circle overlap: distance from player center to area center
+		# Circle overlap vs the player's swept path (mid-body line from
+		# prev tick's position to this tick's position), not just the
+		# current point. TUNNEL FIX: at high fall speed the current-point-
+		# only test can find the player already past the circle on the
+		# very first tick that would have overlapped it — the segment
+		# still passed through even though neither endpoint sits inside.
 		var ax : float = area.global_position.x
 		var ay : float = area.global_position.y
-		# Use player center vs circle center, expanded by player half-width
-		var dx : float = px - ax
-		var dy : float = (py - p_half_h * 0.5) - ay   # mid-body
+		# Mid-body line endpoints (same -p_half_h*0.5 offset the old point
+		# test used, applied to both ends of the segment).
+		var mx0 : float = seg_x0
+		var my0 : float = seg_y0 - p_half_h * 0.5
+		var mx1 : float = seg_x1
+		var my1 : float = seg_y1 - p_half_h * 0.5
+		# Closest point on segment [m0,m1] to the circle center (ax, ay).
+		var ex : float = mx1 - mx0
+		var ey : float = my1 - my0
+		var seg_len_sq : float = ex * ex + ey * ey
+		var t : float = 0.0
+		if seg_len_sq > 0.0000001:
+			t = ((ax - mx0) * ex + (ay - my0) * ey) / seg_len_sq
+			t = clamp(t, 0.0, 1.0)
+		var cx : float = mx0 + ex * t
+		var cy : float = my0 + ey * t
+		var dx : float = cx - ax
+		var dy : float = cy - ay
 		var dist_sq : float = dx * dx + dy * dy
 		# HARDENING: +0.05 before squaring — same tie-break fix as the rect
 		# overlap above and Player.gd's platform-landing check.
@@ -1641,8 +1711,19 @@ func _check_interactables() -> void:
 			# looked/felt exactly like triggering it from underneath. Requiring
 			# velocity.y >= 0 (actually falling, not still rising) closes that
 			# gap — the spring now only fires while genuinely descending onto it.
+			#
+			# TUNNEL-FIX UPDATE: this direction check now uses seg_y0 (the
+			# player's position at the START of this tick, i.e. before this
+			# tick's move) instead of py (the position AFTER this tick's
+			# move). With the swept test above, the tick that finally
+			# registers contact can be one where the player has already
+			# moved past the spring's center (py <= ay) despite genuinely
+			# falling onto it from above all tick — using the pre-move Y
+			# preserves "was above it a moment ago" as the real signal for
+			# "approached from above", instead of re-introducing the exact
+			# from-below false-trigger the original bugfix above closed.
 			var falling : bool = player.velocity.y >= 0.0
-			if is_spring and (py > ay + 0.05 or not falling):
+			if is_spring and (seg_y0 > ay + 0.05 or not falling):
 				continue
 			if not is_spring and not is_spike and not is_persistent:
 				entry["used"] = true
@@ -1812,7 +1893,13 @@ func _spawn_card_fx(pos: Vector2, col: Color) -> void:
 #  DIFFICULTY
 # ─────────────────────────────────────────────────────────────────
 func _difficulty() -> float:
-	return clampf(float(score) / 3000.0, 0.0, 1.0)
+	# user request: first 500 points should feel noticeably easier — ramp
+	# very gently from 0 to 0.10 over that stretch, then continue the climb
+	# to 1.0 at score 3000 same as before (curve is continuous at score=500,
+	# 0.10 there either way it's computed).
+	if score < 500:
+		return clampf(float(score) / 500.0, 0.0, 1.0) * 0.10
+	return clampf(0.10 + (float(score) - 500.0) / 2500.0 * 0.90, 0.0, 1.0)
 
 
 func _biome_name_for_score(s: int) -> String:
@@ -2035,6 +2122,28 @@ func _on_player_died() -> void:
 			child.queue_free()
 		_platforms.clear()
 		_enemies.clear()
+		# BUG FIX ("watched own replay to the end, went back — leftover
+		# projectiles/particles still flying, character still showing
+		# hurt-flash/invincibility tint/debuffs"): this is the ONE cleanup
+		# block in the whole file that queue_free()'s the scene without
+		# also clearing _interactables (the tick-driven trajectory table
+		# still-in-flight rocks/dirt/rain read from every physics tick —
+		# see _check_interactables()) and without resetting the player's
+		# transient state. Every other reset path in this file (stop_replay,
+		# reset_for_lobby, _init_game_from_seed, start_replay, seek_to_tick,
+		# prep_worker_job) clears all of these; this one was the odd one out.
+		_drunk_plat_timer = 0.0
+		_interactables.clear()
+		_ci_prev_pos_valid = false  # TUNNEL FIX: next tick must not sweep from stale pos
+		_pending_spring_resets.clear()
+		_biome_enemy_cache.clear()
+		_last_biome_score = -1
+		if is_instance_valid(player):
+			player.velocity = Vector2.ZERO
+			if player.has_method("reset_transient_state"):
+				player.call("reset_transient_state")
+		if is_instance_valid(camera):
+			camera.offset = Vector2.ZERO
 		replay_finished.emit()
 		return
 
@@ -2132,6 +2241,249 @@ func _ls_set_str(key: String, val: String) -> void:
 	JavaScriptBridge.eval("localStorage.setItem('%s','%s')" % [key, val], true)
 
 
+# ───────────────────────────────────────────────────────────────────
+#  SERVER-ISSUED OFFLINE SEED QUEUE
+# ───────────────────────────────────────────────────────────────────
+# See backend/game/seed_batch.go for the full design rationale. Short
+# version: while online, the client asks POST /backend/seeds/issue for a
+# small batch of server-signed (seed, expiry, sig) tuples and stores them
+# locally. Play then consumes one at a time, fully offline, with zero
+# further server contact — but because the signature can only ever be
+# produced by the server (the signing key never ships to the client), the
+# player can only ever play a seed we actually handed them, not one they
+# picked or generated themselves. This replaces the old pure-client-side
+# seed generation, which let anyone locally pre-simulate unlimited
+# candidate seeds and only ever submit the best one ("seed shopping").
+#
+# Guests (not signed in) are exempt entirely — see the _is_authed() branch
+# in _start_session below — and keep the old fully-local generation, since
+# /backend/seeds/issue requires an auth token. A guest run that somehow
+# gets flushed to /backend/submit after later signing in will just come
+# back bad_seed_signature (no seed_sig/seed_expiry attached) and get
+# dropped by the existing pending-queue permanent-rejection handling in
+# flush_pending() — no special-casing needed for that, it falls out for
+# free from the existing code path.
+
+const LS_SEED_QUEUE   := "nj_seed_queue"
+const SEED_BATCH_SIZE := 10   # MUST match backend/game/seed_batch.go's SeedBatchSize
+
+var _seed_queue            : Array = []   # [{seed:String, expiry:String, sig:String, player_id:String}, ...]
+var _seed_queue_loaded     : bool  = false
+var _seed_refill_in_flight : bool  = false
+
+## seed_sig / seed_expiry for the CURRENTLY ACTIVE game_seed. Empty string
+## for guest play or VS-room forced seeds — neither goes through the
+## issued-seed path (see submitReq.SeedSig's doc comment on the server for
+## why both are exempt from the signature check). Attached to the submit
+## payload in _submit_session() below.
+var _current_seed_sig    : String = ""
+var _current_seed_expiry : String = ""
+
+## BUG FIX ("legitimate run rejected as bad_seed_signature even though the
+## player WAS signed in"): a run that starts as a guest (seed generated
+## locally, sig/expiry correctly left blank) can have wallet sign-in
+## complete mid-run — e.g. a background Hub sign resolving a few seconds
+## after Play. _submit_session() used to read player_id live off main_node
+## at SUBMIT time, while _current_seed_sig/_current_seed_expiry stay frozen
+## at whatever they were when the seed was chosen (START time). That
+## produces an internally-inconsistent payload: a real, current, authed
+## player_id paired with the blank sig/expiry from before that auth
+## existed — server-side this is indistinguishable from a forged seed and
+## gets correctly rejected, even though the run itself was legitimate; it
+## was just unlucky timing (signed in mid-flight).
+## Fix: snapshot the player_id (and nickname) at the exact moment the seed
+## is locked in (same instant _current_seed_sig/_current_seed_expiry are
+## set), and have _submit_session() use THIS snapshot instead of re-reading
+## live auth state later. Empty string here means "was a guest at seed
+## pick time" — submit correctly sends blank player_id + blank sig/expiry
+## together in that case, which the server accepts as an honest guest run.
+var _session_player_id   : String = ""
+var _session_nickname    : String = ""
+
+func _current_player_id() -> String:
+	if not is_instance_valid(main_node): return ""
+	var v = main_node.get("nimiq_address")
+	return str(v) if v != null else ""
+
+## Snapshots player_id/nickname at the exact moment a run's seed is locked
+## in — called from every branch of _start_session() right alongside where
+## _current_seed_sig/_current_seed_expiry are set, so the two can never
+## drift apart. See the doc comment on _session_player_id above for why
+## this exists. Guest-at-start-time correctly snapshots as "" — that's the
+## honest state to submit under, even if the player signs in mid-run.
+func _snapshot_session_identity() -> void:
+	_session_player_id = _current_player_id()
+	_session_nickname  = ""
+	if is_instance_valid(main_node) and main_node.get("_nickname") != null:
+		_session_nickname = str(main_node.get("_nickname"))
+
+func _load_seed_queue() -> void:
+	if _seed_queue_loaded: return
+	_seed_queue_loaded = true
+	_seed_queue = _ls_get(LS_SEED_QUEUE)
+
+func _save_seed_queue() -> void:
+	_ls_set(LS_SEED_QUEUE, _seed_queue)
+
+## Drops any entry that doesn't belong to the currently signed-in player
+## (e.g. a device shared between two accounts — a seed signed for player A
+## will always fail VerifyIssuedSeed if submitted under player B) or that
+## has already expired. Both would only ever get rejected server-side
+## anyway, so there's no point holding onto them.
+func _prune_seed_queue() -> void:
+	var pid := _current_player_id()
+	var now := Time.get_unix_time_from_system()
+	var kept : Array = []
+	for e in _seed_queue:
+		if not (e is Dictionary): continue
+		if str(e.get("player_id", "")) != pid: continue
+		if int(str(e.get("expiry", "0"))) <= now: continue
+		kept.append(e)
+	if kept.size() != _seed_queue.size():
+		_seed_queue = kept
+		_save_seed_queue()
+
+## Pops one seed tuple off the front of the queue (oldest-issued first).
+## Returns {} if the queue is empty.
+func _consume_seed_from_queue() -> Dictionary:
+	_load_seed_queue()
+	_prune_seed_queue()
+	if _seed_queue.is_empty():
+		return {}
+	var e : Dictionary = _seed_queue.pop_front()
+	_save_seed_queue()
+	return e
+
+## Fetches a fresh SEED_BATCH_SIZE batch from POST /backend/seeds/issue and
+## appends it to the local queue. Returns true on success. If a request is
+## already in flight, returns false immediately rather than firing a
+## second one.
+func _request_seed_batch() -> bool:
+	if _seed_refill_in_flight:
+		return false
+	var pid := _current_player_id()
+	if pid == "":
+		return false
+	var _mn = get_tree().get_root().get_node_or_null("Main")
+	var tok := ""
+	if _mn and _mn.get("_auth_token") != null:
+		tok = str(_mn.get("_auth_token"))
+	if tok == "":
+		return false
+
+	_seed_refill_in_flight = true
+	var headers := PackedStringArray(["Content-Type: application/json", "Authorization: Bearer " + tok])
+	var http := HTTPRequest.new()
+	add_child(http)
+	http.timeout = 12.0
+	http.request_completed.connect(ApiConfig.check_clock_skew)
+	var _e := http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/seeds/issue"), headers, HTTPClient.METHOD_POST, "")
+	if _e != OK:
+		http.queue_free()
+		_seed_refill_in_flight = false
+		return false
+
+	var result : Array = await http.request_completed
+	_seed_refill_in_flight = false
+	if not is_instance_valid(http):
+		return false
+	http.queue_free()
+	var code : int = result[1]
+	var body : PackedByteArray = result[3]
+	if code != 200:
+		print("[GM] seed batch issue failed code=%d" % code)
+		if code == 401:
+			_notify_auth_expired()
+		return false
+
+	var j := JSON.new()
+	if j.parse(body.get_string_from_utf8()) != OK:
+		print("[GM] seed batch issue — bad JSON response")
+		return false
+	var data = j.get_data()
+	if not (data is Dictionary) or not (data.get("seeds") is Array):
+		print("[GM] seed batch issue — unexpected response shape")
+		return false
+
+	_load_seed_queue()
+	for s in data["seeds"]:
+		if not (s is Dictionary): continue
+		_seed_queue.append({
+			"seed":      str(s.get("seed", "")),
+			"expiry":    str(s.get("expiry", "")),
+			"sig":       str(s.get("sig", "")),
+			"player_id": pid,
+		})
+	_save_seed_queue()
+	print("[GM] seed batch issued — queue size now %d" % _seed_queue.size())
+	return true
+
+## Background top-up — fires when the queue drops below POOL_MIN, but never
+## blocks the caller (fire-and-forget; by the time this is called the game
+## already has a seed to play from — see _start_session_from_issued_seed
+## below). Skips quietly if we're offline or a request is already running.
+func _maybe_refill_seed_queue() -> void:
+	_load_seed_queue()
+	_prune_seed_queue()
+	if _seed_queue.size() >= POOL_MIN: return
+	if _seed_refill_in_flight: return
+	if OS.has_feature("web"):
+		var v = JavaScriptBridge.eval("navigator.onLine", true)
+		if v != null and not bool(v): return
+	await _request_seed_batch()
+
+## Authed play path: consume one seed from the local server-issued queue,
+## topping it up first in the background if it's running low, or blocking
+## (with a fetch-and-wait, or a clear offline message) if it's completely
+## empty. Returns false if the caller should NOT start a game yet — true
+## once game_seed / session_id / _current_seed_sig / _current_seed_expiry
+## are all set and ready for _init_game_from_seed().
+func _start_session_from_issued_seed() -> bool:
+	_load_seed_queue()
+	_prune_seed_queue()
+
+	var online := true
+	if OS.has_feature("web"):
+		var v = JavaScriptBridge.eval("navigator.onLine", true)
+		online = bool(v) if v != null else true
+
+	if _seed_queue.is_empty():
+		if not online:
+			print("[GM] seed queue empty + offline — blocking new run until reconnect")
+			if is_instance_valid(main_node) and main_node.has_method("_on_offline_no_seeds"):
+				main_node.call("_on_offline_no_seeds")
+			else:
+				Toast.network_error("offline — no saved runs available, reconnect to fetch more")
+			return false
+		# Online but empty (first-ever launch, or a long-offline stretch that
+		# fully drained the queue) — fetch a batch right now and wait for it,
+		# since there's nothing else to play from.
+		var got := await _request_seed_batch()
+		if not got or _seed_queue.is_empty():
+			Toast.network_error("couldn't fetch a new run — try again")
+			return false
+	elif _seed_queue.size() < POOL_MIN and online:
+		# Already have enough to play NOW — top up in the background, don't
+		# make the player wait for a request they don't need yet.
+		_maybe_refill_seed_queue()
+
+	var entry := _consume_seed_from_queue()
+	if entry.is_empty():
+		Toast.network_error("couldn't fetch a new run — try again")
+		return false
+
+	var seed_val : int = int(str(entry.get("seed", "0")))
+	if seed_val == 0:
+		return false
+	game_seed            = seed_val & 0x7FFFFFFFFFFFFFFF
+	session_id           = _make_local_session_id(game_seed)
+	_current_seed_sig    = str(entry.get("sig", ""))
+	_current_seed_expiry = str(entry.get("expiry", ""))
+	_snapshot_session_identity()
+	print("[GM] _start_session ISSUED seed=%d session=%s queue_remaining=%d" % [game_seed, session_id, _seed_queue.size()])
+	return true
+
+
 ## forced_seed: used by VS Rooms — both sides of a match MUST play the exact
 ## same seed, provided by the server at room-create time (see Main._vs_room_seed).
 ## When set, skips local entropy generation entirely and just derives a
@@ -2141,9 +2493,31 @@ func _start_session(forced_seed: int = 0) -> void:
 	if forced_seed != 0:
 		game_seed  = forced_seed & 0x7FFFFFFFFFFFFFFF
 		session_id = _make_local_session_id(game_seed)
+		_current_seed_sig    = ""
+		_current_seed_expiry = ""
+		_snapshot_session_identity()
 		print("[GM] _start_session VS forced_seed=%d session=%s" % [game_seed, session_id])
 		_init_game_from_seed()
 		return
+
+	if _is_authed():
+		# NOTE: this function is itself a coroutine now (it awaits inside
+		# _start_session_from_issued_seed when the queue needs a network
+		# round-trip). Callers that don't `await _start_session(...)` are
+		# fine — GDScript runs a coroutine synchronously up to its first
+		# actual suspension point, so the common case (queue already has a
+		# seed, nothing to await) behaves exactly like before. Only the
+		# empty-queue-while-online case visibly waits before platforms spawn.
+		var ok := await _start_session_from_issued_seed()
+		if not ok:
+			return  # blocked — see _start_session_from_issued_seed for why
+		_init_game_from_seed()
+		return
+
+	# ── Guest (signed-out): fully local generation, unchanged from before ──
+	_current_seed_sig    = ""
+	_current_seed_expiry = ""
+	_snapshot_session_identity()
 
 	# ── OFFLINE SEED: 128-bit entropy, fully local, zero server contact at play time ──
 	# hi and lo are independent 64-bit halves; game_seed = hi ^ lo (positive 63-bit).
@@ -2188,6 +2562,7 @@ func _init_game_from_seed() -> void:
 	_enemies.clear()
 	_drunk_plat_timer = 0.0
 	_interactables.clear()
+	_ci_prev_pos_valid = false  # TUNNEL FIX: next tick must not sweep from stale pos
 	_pending_spring_resets.clear()
 	_biome_enemy_cache.clear()
 	_last_biome_score = -1
@@ -2209,28 +2584,22 @@ func _init_game_from_seed() -> void:
 	# path that starts a game, no matter how the player got back to the menu.
 	if is_instance_valid(player):
 		player.velocity = Vector2.ZERO
-		player.set("is_dead",          false)
-		player.set("has_shield",       false)
-		player.set("is_powered_up",    false)
-		player.set("powerup_timer",    0.0)
-		player.set("powerup_type",     "")
-		player.set("lives",            3)
-		player.set("_mirror_active",   false)
-		player.set("_mirror_timer",    0.0)
-		player.set("_drunk_active",    false)
-		player.set("_drunk_timer",     0.0)
-		player.set("_drunk_t",         0.0)
-		player.set("_eq_active",       false)
-		player.set("_eq_timer",        0.0)
-		player.set("_eq_debuff_timer", 0.0)
-		player.set("_eq_offset",       Vector2.ZERO)
-		player.set("_speed_boost",       false)
-		player.set("_jump_boost",        false)
-		player.set("_speed_boost_timer", 0.0)
-		player.set("_jump_boost_timer",  0.0)
-		player.set("_invincible",      0.0)
-		player.set("_hurt_flash",      0.0)
-		player.set("god_mode",         false)
+		# BUG FIX ("replay izledim sonra oyun başlattım kalp replayin son
+		# durumundaydı, 3'ten başlamadı" / "hiçbir eksik kalmasın... tam
+		# reset"): this used to be its own third hand-written copy of the
+		# lives/shield/powerup/debuff field list — a THIRD place (alongside
+		# stop_replay() and Main.gd's shortcut belt-and-suspenders reset)
+		# that had to be kept manually in sync, exactly the class of drift
+		# risk reset_transient_state() was created to kill. Now routes
+		# through the same single shared helper as the other two call
+		# sites, so every field it resets (lives + signal emit, shield,
+		# powerup, mirror/drunk/earthquake debuffs, speed/jump boosts,
+		# hurt-flash, invincibility, god_mode) is guaranteed identical here
+		# too — this function runs on every real game start (normal PLAY
+		# from the menu, any VS round, anything that reaches
+		# _start_session()), not just the replay-return paths.
+		if player.has_method("reset_transient_state"):
+			player.call("reset_transient_state")
 
 	_rng.seed       = game_seed
 	_shake_rng.seed = game_seed ^ 0xCAFEBABE
@@ -2326,6 +2695,7 @@ func start_replay() -> void:
 	_enemies.clear()
 	_drunk_plat_timer = 0.0
 	_interactables.clear()
+	_ci_prev_pos_valid = false  # TUNNEL FIX: next tick must not sweep from stale pos
 	_pending_spring_resets.clear()
 
 	if is_instance_valid(player):
@@ -2367,6 +2737,12 @@ func start_replay() -> void:
 		player.set("god_mode",        false)
 		player.set("_powerup_is_jetpack", false)
 		player.set("_powerup_is_wings",   false)
+		# Same HUD-desync fix as _init_game_from_seed's identical reset block
+		# above — direct player.set("lives", 3) doesn't emit lives_changed,
+		# so the heart HUD wouldn't reflect the reset back to 3 at the start
+		# of THIS replay either without this.
+		if player.has_signal("lives_changed"):
+			player.emit_signal("lives_changed", 3)
 		player.velocity = Vector2.ZERO
 		if is_instance_valid(camera):
 			camera.offset = Vector2.ZERO
@@ -2454,6 +2830,7 @@ func seek_to_tick(target_tick: int) -> void:
 	_enemies.clear()
 	_drunk_plat_timer = 0.0
 	_interactables.clear()
+	_ci_prev_pos_valid = false  # TUNNEL FIX: next tick must not sweep from stale pos
 	_pending_spring_resets.clear()
 
 	if is_instance_valid(player):
@@ -2481,6 +2858,11 @@ func seek_to_tick(target_tick: int) -> void:
 		player.set("god_mode",         false)
 		player.set("_powerup_is_jetpack", false)
 		player.set("_powerup_is_wings",   false)
+		# Same HUD-desync fix as start_replay()/_init_game_from_seed() —
+		# direct player.set("lives", 3) doesn't emit lives_changed, so
+		# seeking back to an earlier tick wouldn't refresh the heart HUD.
+		if player.has_signal("lives_changed"):
+			player.emit_signal("lives_changed", 3)
 		player.velocity = Vector2.ZERO
 		if is_instance_valid(camera): camera.offset = Vector2.ZERO
 		if player.has_method("set_char"): player.call("set_char", _replay_char)
@@ -2634,6 +3016,7 @@ func prep_worker_job() -> void:
 	_platforms.clear()
 	_enemies.clear()
 	_interactables.clear()
+	_ci_prev_pos_valid = false  # TUNNEL FIX: next tick must not sweep from stale pos
 	_pending_spring_resets.clear()
 
 	# ── Camera ──────────────────────────────────────────────────────
@@ -2723,24 +3106,31 @@ func stop_replay() -> void:
 	_enemies.clear()
 	_drunk_plat_timer = 0.0
 	_interactables.clear()
+	_ci_prev_pos_valid = false  # TUNNEL FIX: next tick must not sweep from stale pos
 	_pending_spring_resets.clear()
 	_biome_enemy_cache.clear()
 	_last_biome_score = -1
 
 	if is_instance_valid(player):
 		player.velocity = Vector2.ZERO
-		player.set("has_shield",      false)
-		player.set("is_powered_up",   false)
-		player.set("powerup_timer",   0.0)
-		player.set("powerup_type",    "")
-		player.set("_mirror_active",  false)
-		player.set("_mirror_timer",   0.0)
-		player.set("_drunk_active",   false)
-		player.set("_drunk_timer",    0.0)
-		player.set("_eq_active",      false)
-		player.set("_eq_debuff_timer",0.0)
-		player.set("_eq_offset",      Vector2.ZERO)
-		player.set("god_mode",        false)
+		# BUG FIX ("replay izledim çıktım, playe bastım ama replay
+		# izlediğim versiyondaki son candan başladım... sadece can değil
+		# özel güç/hasar animasyonu falan herşey resetlenmeli"): this used
+		# to hand-clear only a subset of fields (shield/powerup/debuffs),
+		# missing is_dead/lives entirely and ALSO missing _hurt_flash (red
+		# damage flash), _invincible (post-damage i-frames), speed/jump
+		# boosts and a couple debuff timers — any of which could leak
+		# straight through into whatever session gets reactivated next
+		# (e.g. still LOOKING freshly hurt from a replay that ended
+		# mid-damage-flash). Now calls Player.gd's own
+		# reset_transient_state(), the single shared source of truth for
+		# "every leftover match-transient flag/timer is cleared" — see its
+		# doc comment. The lobby's seed/background is deliberately left
+		# untouched below (same seed as before you watched a replay — Play
+		# instantly continuing that exact scene is the intended, non-jarring
+		# UX, not a bug), so this only resets state, never the seed.
+		if player.has_method("reset_transient_state"):
+			player.call("reset_transient_state")
 		if player.has_method("set_char"):
 			player.call("set_char", _pre_replay_char)
 	if is_instance_valid(camera):
@@ -2750,6 +3140,17 @@ func stop_replay() -> void:
 	if _pre_replay_seed != 0:
 		highest_y  = 0
 		score      = 0
+		# BUG FIX ("sol üstte gösterilen toplanan nim sayısı replaydan
+		# çıkınca silinmedi"): score/highest_y were already reset above, but
+		# _quest_coins (the counter behind the top-left NIM icon display) —
+		# and every other per-match quest counter (kills, platforms,
+		# powerups, etc.) — never was. _reset_quest_counters() already
+		# existed and already calls update_nimiq_display(0) itself, it was
+		# just never called from this, the actual "exit replay" path (it
+		# was only wired into the unused reset_for_lobby()). Call it here
+		# too so the NIM counter — and everything else it tracks — goes
+		# back to 0 the moment the lobby is rebuilt, not just score.
+		_reset_quest_counters()
 		game_seed  = _pre_replay_seed
 		_rng.seed       = _pre_replay_seed
 		_shake_rng.seed = _pre_replay_seed ^ 0xCAFEBABE
@@ -2798,6 +3199,7 @@ func reset_for_lobby() -> void:
 	_last_biome_score = -1
 	_drunk_plat_timer = 0.0
 	_interactables.clear()
+	_ci_prev_pos_valid = false  # TUNNEL FIX: next tick must not sweep from stale pos
 	_pending_spring_resets.clear()
 
 	# Clear scene objects
@@ -2811,29 +3213,17 @@ func reset_for_lobby() -> void:
 	# Put player into idle
 	if is_instance_valid(player):
 		player.velocity = Vector2.ZERO
-		player.set("is_dead",         false)
 		player.set("_initialized",    false)
-		player.set("has_shield",      false)
-		player.set("is_powered_up",   false)
-		player.set("powerup_timer",   0.0)
-		player.set("powerup_type",    "")
-		player.set("lives",           3)
-		player.set("_mirror_active",  false)
-		player.set("_mirror_timer",   0.0)
-		player.set("_drunk_active",   false)
-		player.set("_drunk_timer",    0.0)
-		player.set("_drunk_t",        0.0)
-		player.set("_eq_active",      false)
-		player.set("_eq_timer",       0.0)
-		player.set("_eq_debuff_timer",0.0)
-		player.set("_eq_offset",      Vector2.ZERO)
-		player.set("_speed_boost",       false)
-		player.set("_jump_boost",        false)
-		player.set("_speed_boost_timer", 0.0)  # was "_boost_timer" — stale name from before the timer-sharing fix
-		player.set("_jump_boost_timer",  0.0)
-		player.set("_invincible",     0.0)
-		player.set("_hurt_flash",     0.0)
-		player.set("god_mode",        false)
+		# Same shared helper as every other reset call site (stop_replay(),
+		# _init_game_from_seed(), Main.gd's shortcut) — was previously its
+		# own fourth hand-written copy of this field list (and, being dead
+		# code, was never even exercised to notice it had also drifted:
+		# missing the lives_changed signal emit that the other three copies
+		# needed a dedicated bug fix for). Routing through
+		# reset_transient_state() means this can never silently drift again
+		# if it's ever wired up.
+		if player.has_method("reset_transient_state"):
+			player.call("reset_transient_state")
 		if player.has_method("reset_to_idle"):
 			player.call("reset_to_idle")
 
@@ -2882,14 +3272,18 @@ func _submit_session() -> void:
 	if session_id == "" or score <= 0:
 		return
 
-	var pid := ""
-	var nickname := ""
+	# BUG FIX (see _session_player_id doc comment above _start_session):
+	# player_id/nickname MUST come from the identity snapshot taken when
+	# this run's seed was locked in, NOT read live off main_node here.
+	# Reading live meant a wallet sign-in completing mid-run (started as
+	# guest, Hub sign resolves a few seconds into the run) would submit a
+	# real/current player_id paired with the blank sig/expiry from before
+	# that auth existed — an internally-inconsistent payload the server
+	# correctly rejects as bad_seed_signature, even though the run was
+	# legitimate and just had unlucky timing.
+	var pid := _session_player_id
+	var nickname := _session_nickname
 	var main_node_ref = get_tree().get_root().get_node_or_null("Main")
-	if main_node_ref:
-		if main_node_ref.get("nimiq_address") != null:
-			pid = str(main_node_ref.get("nimiq_address"))
-		if main_node_ref.get("_nickname") != null:
-			nickname = str(main_node_ref.get("_nickname"))
 
 	var char_idx : int = 0
 	if main_node_ref and main_node_ref.get("_char_index") != null:
@@ -2927,6 +3321,13 @@ func _submit_session() -> void:
 	var payload := {
 		"session":     session_id,
 		"seed":        str(game_seed),
+		# Proof this seed was actually issued by POST /backend/seeds/issue to
+		# this exact player — see game/seed_batch.go server-side and the
+		# _current_seed_sig/_current_seed_expiry doc comment above
+		# _start_session. Empty strings for guest play / VS-room forced
+		# seeds, which the server exempts from this check by design.
+		"seed_sig":    _current_seed_sig,
+		"seed_expiry": _current_seed_expiry,
 		"score":       score,
 		"ticks":       rle_ticks,  # RLE'den decode — server ile her zaman eşleşir
 		"char":        char_idx,
@@ -3028,6 +3429,38 @@ func _send_submit_with_retry(sid: String, body: String) -> void:
 			# through to the retry branch below, matching what the comment
 			# always said should happen.
 			print("[GM] submit %d — permanent rejection, dropping sid=%s" % [code, sid.left(8)])
+			# bad_seed_signature: the one permanent-rejection reason worth a
+			# user-facing toast. Covers a real forged/tampered seed (should
+			# never happen from the real client), genuine 30-day expiry, AND
+			# — see _session_player_id doc comment above _start_session — a
+			# guest run whose wallet sign-in completed mid-flight, which
+			# submits under a real player_id but with the blank sig/expiry
+			# from before that auth existed. Every other 400/403/409 reason
+			# (seed_already_used, bad_vs_role, etc.) stays a silent drop,
+			# same as before — those aren't something the player can act on.
+			#
+			# BUG FIX: this used to always say "expired" regardless of
+			# which of those causes it actually was, which misdiagnosed the
+			# mid-flight-signin case as a stale-queue issue. We can't
+			# recover the server's specific reason from a bare
+			# "bad_seed_signature" string, but we CAN tell locally whether
+			# THIS body ever had a sig/expiry to begin with.
+			var _err_msg := ""
+			var _j := JSON.new()
+			if _j.parse(_b.get_string_from_utf8()) == OK and _j.get_data() is Dictionary:
+				_err_msg = str(_j.get_data().get("error", ""))
+			if _err_msg == "bad_seed_signature":
+				var _had_sig := false
+				var _bj := JSON.new()
+				if _bj.parse(body) == OK and _bj.get_data() is Dictionary:
+					var _bd = _bj.get_data()
+					_had_sig = str(_bd.get("seed_sig", "")) != "" and str(_bd.get("seed_expiry", "")) != ""
+				var _inst := Toast.get_instance()
+				if _inst != null:
+					if _had_sig:
+						_inst.show_toast("A saved run expired before it could be submitted and was not counted.", Toast.Kind.ERROR)
+					else:
+						_inst.show_toast("A run started before you signed in couldn't be verified and was not counted.", Toast.Kind.ERROR)
 			_pending_remove(sid)
 		else:
 			# 0 (network err), 5xx, 429 (rate-limited — transient, not a
@@ -3140,7 +3573,58 @@ func flush_pending() -> void:
 			http.queue_free()
 			if _alive.get_ref() == null: return
 			print("[GM] flush submit code=%d sid=%s" % [code, _sid.left(8)])
+			# BUG FIX ("always shows 6 pending"): this used to only ever call
+			# _pending_remove() on code==200 — any other response (including a
+			# DEFINITIVE, permanent rejection like 400/403/409) was silently
+			# ignored, leaving the entry in the queue forever. _send_submit_
+			# with_retry() (the in-run submit path) already drops on permanent
+			# 4xx rejections; flush_pending() — the path every retry tick and
+			# every login's _check_pending_submissions() actually reads from —
+			# never did, so a handful of stuck/invalid entries (expired
+			# session, already-claimed replay, etc.) sat in localStorage
+			# forever, retried every 15s but never cleared, and the same
+			# stale count kept showing up on every single login. Now mirrors
+			# _send_submit_with_retry()'s code handling exactly: only 401 (not
+			# authed yet), 429 (rate-limited), and 0/5xx (network/server
+			# error) are left in the queue to retry — everything else,
+			# success or permanent rejection, is removed.
 			if code == 200:
+				_pending_remove(_sid)
+			elif code == 401 or code == 429 or code == 0 or code >= 500:
+				pass  # transient — leave in queue, next retry tick will try again
+			else:
+				# Permanent rejection (400/403/409/etc.) — drop, it will never succeed.
+				print("[GM] flush submit %d — permanent rejection, dropping sid=%s" % [code, _sid.left(8)])
+				# BUG FIX: this used to always say "expired" for EVERY
+				# bad_seed_signature, but that's only one of several
+				# distinct server-side causes (see VerifyIssuedSeed in
+				# backend/game/seed_batch.go) — missing sig/expiry
+				# entirely (most commonly: a guest run whose wallet
+				# sign-in completed mid-flight, see the
+				# _session_player_id snapshot fix above _start_session),
+				# a signature mismatch, or genuine 30-day expiry.
+				# Reporting all three as "expired" hid the real cause.
+				# We can't recover the server's specific reason from a
+				# bare "bad_seed_signature" string, but we CAN tell
+				# locally whether this queued body ever had a sig/expiry
+				# to begin with — that already disambiguates the most
+				# common real-world case from genuine expiry.
+				var _err_msg := ""
+				var _j := JSON.new()
+				if _j.parse(_b.get_string_from_utf8()) == OK and _j.get_data() is Dictionary:
+					_err_msg = str(_j.get_data().get("error", ""))
+				if _err_msg == "bad_seed_signature":
+					var _had_sig := false
+					var _bj := JSON.new()
+					if _bj.parse(body) == OK and _bj.get_data() is Dictionary:
+						var _bd = _bj.get_data()
+						_had_sig = str(_bd.get("seed_sig", "")) != "" and str(_bd.get("seed_expiry", "")) != ""
+					var _inst := Toast.get_instance()
+					if _inst != null:
+						if _had_sig:
+							_inst.show_toast("A saved run expired before it could be submitted and was not counted.", Toast.Kind.ERROR)
+						else:
+							_inst.show_toast("A run started before you signed in couldn't be verified and was not counted.", Toast.Kind.ERROR)
 				_pending_remove(_sid)
 		)
 		var _e := http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/submit"), f_headers, HTTPClient.METHOD_POST, body)

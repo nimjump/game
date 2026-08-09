@@ -14,6 +14,7 @@ const UITheme := preload("res://scripts/UITheme.gd")
 var BACKEND_URL : String = ApiConfig.base_url()
 
 var _started    := false
+var _lobby_reseed_in_progress := false  # guards _maybe_refresh_lobby_seed() against overlapping calls
 
 # ── Server update-lock status (polled) ──────────────────────────────
 # When the admin panel activates the Game Update Lock, the server flips
@@ -56,6 +57,22 @@ var _prev_lives : int = 3   # detect damage by lives decrease
 # uses the "?vs=" URL param instead). Set when "Play Again" is pressed after a
 # VS match; consumed once on the next boot to open that room's result screen.
 static var _pending_vs_result_room : String = ""
+# Carries the auth token across a "Play Again" reload_current_scene() —
+# see the restart_btn handler and _ready() for why this exists.
+static var _cached_auth_token_for_reload : String = ""
+# BUG FIX ("abi bak lobi platformu geç geliyor"): _auth_token survives
+# "Play Again" reload via the static above, but nimiq_address never did —
+# it only gets repopulated once NimiqBridge's async poll/restore finishes,
+# a beat AFTER the fresh scene's first frame. That gap made _is_authed()
+# (checks _auth_token only) report true while _current_player_id() (reads
+# nimiq_address) still returned "" — GameManager._request_seed_batch()
+# then silently failed on the empty pid (no HTTP request ever fired) and
+# surfaced a confusing "couldn't fetch a new run" toast, even though
+# nothing was actually wrong with the network. Caching nimiq_address the
+# same way as the token closes that gap: both are restored synchronously,
+# before _build_game(), so the fresh boot starts fully authed from frame
+# one instead of racing its own auth restore.
+static var _cached_nimiq_address_for_reload : String = ""
 
 # The VS room id of the run currently on the game-over screen. Captured in
 # show_game_over() while _gm.vs_room_id is STILL set — the background LOCAL
@@ -288,6 +305,21 @@ func _ready() -> void:
 			"--out", "C:/path/to/your/temp/debug_result_editor.json",
 		]))
 		return
+
+	# BUG FIX ("PLAY AGAIN basınca arka planda seed değişiyor" — see the
+	# restart_btn handler's doc comment for the full picture): if this boot
+	# is a "Play Again" reload, restore the auth token we stashed right
+	# before reload_current_scene() — BEFORE anything below builds the
+	# lobby's first session. This must run before _nimiq_bridge even gets
+	# created (further down), so _auth_token's getter falls through to this
+	# value instead of "" for those first frames. Consumed once so a real
+	# sign-out afterward isn't overridden by a stale cached token forever.
+	if _cached_auth_token_for_reload != "":
+		_auth_token = _cached_auth_token_for_reload
+		_cached_auth_token_for_reload = ""
+	if _cached_nimiq_address_for_reload != "":
+		nimiq_address = _cached_nimiq_address_for_reload
+		_cached_nimiq_address_for_reload = ""
 
 	var vp := get_viewport()
 	_vw  = vp.get_visible_rect().size.x
@@ -1093,6 +1125,70 @@ func _sync_panels() -> void:
 
 	_rebuild_settings_if_open()
 
+	# BUG FIX ("authliyim ama lobide hala guest seed geliyor — özellikle
+	# game over sonrası PLAY AGAIN ile lobiye dönünce"): _auth_token doesn't
+	# ONLY get set via _on_auth_success() — a few lines up in this same
+	# function, it's also restored synchronously from
+	# _nimiq_bridge.auth_token whenever a bridge with an already-cached
+	# token exists. That's exactly what happens after PLAY AGAIN, which
+	# does a full get_tree().reload_current_scene(): the fresh scene's
+	# _nimiq_bridge sometimes already has a cached token available the
+	# moment _sync_panels() first runs, so _auth_token gets set HERE,
+	# silently, before (or instead of) _on_auth_success ever firing again —
+	# a reseed hook living only inside _on_auth_success would simply never
+	# run on that path, leaving the lobby stuck on the guest seed from the
+	# fresh boot forever (not just briefly). _sync_panels() is already this
+	# file's documented "single source of truth — call on every auth/
+	# address change", so that's the one place a reseed check is guaranteed
+	# to run no matter which path set _auth_token. Safe to call
+	# unconditionally on every _sync_panels() invocation (most of which
+	# have nothing to do with auth) — see _maybe_refresh_lobby_seed()'s own
+	# guards for why repeated calls are harmless once already fixed.
+	_maybe_refresh_lobby_seed()
+
+
+## Swaps the lobby's idle background session from a guest-generated seed to
+## the real authed one, the moment auth becomes available — silently, with
+## a short fade so the platform/player rebuild is never seen mid-pop. See
+## the call site above (_sync_panels(), which covers both the normal login
+## flow and the post-reload/PLAY AGAIN restore flow) for why this lives in
+## its own function instead of inline in _on_auth_success().
+func _maybe_refresh_lobby_seed() -> void:
+	if not is_instance_valid(_gm) or _started or _lobby_reseed_in_progress:
+		return
+	var sid : String = str(_gm.get("session_id")) if _gm.get("session_id") != null else ""
+	var pending_is_guest : bool = str(_gm.get("_session_player_id")) == ""
+	if not (sid == "" or (pending_is_guest and _auth_token != "")):
+		return  # already authed (or nothing to do yet) — no-op, safe to call repeatedly
+
+	_lobby_reseed_in_progress = true
+	print("[MAIN] Auth available — refreshing lobby session with real seed (sid_empty=%s pending_guest=%s)" % [str(sid == ""), str(pending_is_guest)])
+	# BUG FIX ("authum loading'den döndüğümde küçük bir geçiş görüyorum"):
+	# _start_session()/_init_game_from_seed() clears and rebuilds the
+	# platforms + repositions the player INSTANTLY, in a single frame — so
+	# even running silently in the background instead of at Play-press,
+	# reseeding a session the player is actively looking at (idle in the
+	# lobby) still produced a one-frame "pop": platforms disappearing and
+	# reappearing shuffled, player snapping to a new spot. Only happens
+	# when there was already a visible guest session to replace (sid !=
+	# "") — a brand new boot session has nothing on screen yet to pop. Fix:
+	# wrap the swap in a quick fade out/in on _gm (Node2D, so it has its
+	# own modulate — everything under it fades together), same 0.18s
+	# TRANS_QUAD feel used by the panel open/close fades elsewhere here.
+	var had_visible_session := sid != ""
+	if had_visible_session:
+		var fade_out := create_tween()
+		if fade_out:
+			fade_out.tween_property(_gm, "modulate:a", 0.0, 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+			await fade_out.finished
+	if is_instance_valid(_gm) and not _started:
+		await _gm.call("_start_session")
+	if had_visible_session and is_instance_valid(_gm):
+		var fade_in := create_tween()
+		if fade_in:
+			fade_in.tween_property(_gm, "modulate:a", 1.0, 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+	_lobby_reseed_in_progress = false
+
 
 func _on_nimiq_ready(address: String, label: String, avatar_data_url: String, device_id: String) -> void:
 	nimiq_address   = address
@@ -1125,6 +1221,7 @@ func _on_nimiq_ready(address: String, label: String, avatar_data_url: String, de
 func _on_auth_success(token: String, player_id: String) -> void:
 	print("[MAIN] Auth successful player=%s" % player_id.left(8))
 	_auth_token = token
+	_auth_failed_retry_done = false  # clear the one-shot retry guard from _on_auth_failed for next time
 
 	# WEB (Hub) sign-in / restored web session identity fix.
 	# Unlike Nimiq Pay (which injects a friendly account label AND a ready-made
@@ -1166,12 +1263,9 @@ func _on_auth_success(token: String, player_id: String) -> void:
 	# Flush any pending score submits now that we're authed
 	if is_instance_valid(_gm) and _gm.has_method("flush_pending"):
 		_gm.call("flush_pending")
-	# If session not started yet (auth came late), trigger it now
-	if is_instance_valid(_gm) and not _started:
-		var sid : String = str(_gm.get("session_id")) if _gm.get("session_id") != null else ""
-		if sid == "":
-			print("[MAIN] Auth arrived late — triggering _start_session")
-			_gm.call("_start_session")
+	# NOTE: lobby seed reseed-if-guest is handled centrally by
+	# _maybe_refresh_lobby_seed(), called from _sync_panels() above — no
+	# need to call it again here separately.
 	_update_streak_badge()
 	_maybe_toast_streak()
 	_fetch_streak_status()
@@ -1434,17 +1528,88 @@ func _on_auth_failed(reason: String) -> void:
 	# it kicks off its own auth attempt. If that flag isn't set, this is the
 	# passive background attempt failing — just leave auth unverified and
 	# let the player press Play whenever they actually want to.
+	#
+	# BUG FIX ("logged-in player's runs permanently rejected as
+	# bad_seed_signature"): this used to treat every `reason` identically —
+	# "no wallet available at all" (no_provider, user_rejected) and "a
+	# wallet WAS connected but the one-time sign/verify round trip itself
+	# failed" (verify_failed_*, challenge_fetch_failed,
+	# challenge_parse_failed, verify_parse_error, etc.) both fell straight
+	# into "start the game without wallet." That's correct for the first
+	# case (there's genuinely nothing to authenticate with, guest play is
+	# the intended behavior), but wrong for the second: a wallet-connected
+	# player has a real player_id and every reason to expect a signed run,
+	# yet _auth_token stays empty, so _start_session() silently takes the
+	# unsigned/guest seed branch. The submit then gets permanently rejected
+	# (bad_seed_signature) with zero indication to the player that
+	# anything was different about that run — indistinguishable from
+	# "you weren't logged in" from their side, even though they were.
+	#
+	# Fix: only skip straight to guest play when there's actually no
+	# wallet to authenticate with. If a wallet address IS known, give the
+	# sign/verify handshake exactly one automatic retry (a fresh challenge,
+	# not a replay of the stale one) before falling back — most
+	# verify_failed_*/challenge_* cases are a single transient blip and
+	# succeed the second time. Only if that retry also fails do we fall
+	# through to guest play, and even then we tell the player explicitly
+	# instead of staying silent, since their run may not be counted.
+	# NOTE on retry plumbing: _on_play_pressed() arms its own ONE_SHOT
+	# auth_success/auth_failed listeners every time it runs, and those
+	# fire (in connection order) AFTER this persistent handler for the
+	# same emission — one of them unconditionally clears
+	# _play_waiting_for_auth right after we return from here. Retrying
+	# synchronously from inside this handler would race that cleanup and
+	# fresh one-shots wouldn't be armed correctly. Deferring the retry
+	# lets the current emission (and its one-shot listeners) finish first,
+	# then re-runs _on_play_pressed() cleanly on the next idle frame —
+	# which re-arms fresh one-shots and calls _ensure_wallet_then_sign()
+	# itself, exactly like the original Play tap did.
+	# Explicit `: bool` (not `:=`) — _nimiq_bridge is typed as plain Node, so
+	# `_nimiq_bridge.nimiq_address` is a dynamic/Variant member access and
+	# the static analyzer can't infer a type from the `and` expression.
+	var _has_wallet: bool = is_instance_valid(_nimiq_bridge) and str(_nimiq_bridge.get("nimiq_address")) != ""
+	var _no_wallet_reason: bool = reason == "no_provider" or reason == "user_rejected"
+	if not _started and _play_waiting_for_auth and _has_wallet and not _no_wallet_reason and not _auth_failed_retry_done:
+		print("[MAIN] auth failed (%s) with wallet connected — retrying sign-in once before falling back" % reason)
+		_auth_failed_retry_done = true
+		call_deferred("_retry_play_after_auth_failure")
+		return
 	if not _started and _play_waiting_for_auth:
 		print("[MAIN] auth failed (%s) — starting game without wallet" % reason)
 		_play_waiting_for_auth = false
+		_auth_failed_retry_done = false
 		_started = true
 		_block_lb_replay = true
 		if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
 		if is_instance_valid(_stats_panel):       _stats_panel.hide_panel()
 		if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
+		if _has_wallet and not _no_wallet_reason:
+			# The retry above also failed — this player IS wallet-connected,
+			# so make sure they know this particular run won't be counted,
+			# instead of silently dropping it on submit later with no
+			# explanation (see bad_seed_signature handling in
+			# GameManager._send_submit_with_retry/flush_pending).
+			var _t := Toast.get_instance()
+			if _t: _t.show_toast("Couldn't verify your sign-in for this run — playing offline, this run may not be counted.", Toast.Kind.WARN)
 		_do_start_game()
 	elif not _started:
 		print("[MAIN] auth failed (%s) — background attempt, player hasn't pressed Play, staying in lobby" % reason)
+
+
+## Deferred one-shot retry after a wallet-connected player's sign/verify
+## failed — see the BUG FIX comment in _on_auth_failed above for why this
+## has to be deferred rather than called synchronously from there.
+func _retry_play_after_auth_failure() -> void:
+	if _started or _auth_token != "":
+		return  # resolved another way already (e.g. a background sign succeeded in the meantime)
+	# _on_play_pressed() bails out immediately if this is still true (it
+	# thinks a wait is already in flight) — the stale ONE_SHOT listener
+	# from the original Play tap already cleared it by now, but set it
+	# explicitly here too so this is correct even if that ordering ever
+	# changes.
+	_play_waiting_for_auth = false
+	print("[MAIN] retrying sign-in after transient auth failure")
+	_on_play_pressed()
 
 
 ## Called when server returns 401 — token invalid, clear it
@@ -2796,6 +2961,25 @@ func _build_game() -> void:
 		# static on the fresh boot to open that room's result screen. Empty for a
 		# non-VS run, so a normal "Play Again" just returns to the lobby as before.
 		_pending_vs_result_room = _last_go_vs_room_id
+		# BUG FIX ("PLAY AGAIN basınca arka planda seed değişiyor, hala"):
+		# reload_current_scene() throws away this whole scene and rebuilds
+		# Main.gd from scratch — including _auth_token, which starts back
+		# at "" every time. The fresh boot then builds its very first lobby
+		# session as GUEST (real auth hasn't had time to resolve yet), and
+		# _maybe_refresh_lobby_seed() only gets a chance to swap it to the
+		# real seed AFTER auth actually reconnects — which is a real network
+		# round trip, so the guest→real swap is still visibly happening
+		# every single "Play Again", just delayed a beat instead of
+		# instant. The actual fix is to not build a guest session on this
+		# path AT ALL: stash the already-known-good token on a static (same
+		# trick _pending_vs_result_room above already uses to survive this
+		# exact reload), so _ready() can restore it BEFORE the first
+		# session ever gets built — the fresh boot starts authed from frame
+		# one, nothing to swap.
+		if _auth_token != "":
+			_cached_auth_token_for_reload = _auth_token
+		if nimiq_address != "":
+			_cached_nimiq_address_for_reload = nimiq_address
 		if OS.has_feature("web"):
 			# Clear any lingering "?vs=" from the URL so the deeplink handler doesn't
 			# also fire — the static var is the single source of truth here.
@@ -5630,6 +5814,7 @@ func _change_char_settings(dir: int) -> void:
 #  MAIN CALLBACKS
 # ─────────────────────────────────────────────────────
 var _play_waiting_for_auth := false   # true while a Play-triggered auth wait is already pending
+var _auth_failed_retry_done := false  # one automatic re-sign attempt for a wallet-connected player before falling back to an unsigned/guest run (see _on_auth_failed)
 
 ## BUG FIX (iOS: "gyro selected, restarted the game, couldn't move at all"):
 ## _ensure_gyro_js() — which is what actually starts the JS devicemotion
@@ -5992,6 +6177,34 @@ func _do_start_game(forced_seed: int = 0) -> void:
 			# Otherwise call _start_session to get a fresh session.
 			var platforms_ready : bool = _gm.get("game_seed") != 0 and _gm.get("_platforms") != null and (_gm.get("_platforms") as Array).size() > 0
 			var is_recording    : bool = _gm.get("_replay_mode") == 1  # ReplayMode.RECORDING
+			# BUG FIX ("legitimate authed run rejected as bad_seed_signature"):
+			# the lobby's idle background is deliberately a real, already-running
+			# session (see the note above about no reload/flash on Play) — it's
+			# generated the instant the app opens, before Nimiq/auth has had any
+			# chance to resolve, so it always starts on the guest/LOCAL branch
+			# (see GameManager.gd's _start_session, _session_player_id doc
+			# comment). If the player is ALREADY authed by the time they press
+			# Play — e.g. a fast tap right after load, or an instant offline
+			# token restore — that pending session is still the guest one, and
+			# just activating it as-is means a real, connected player's run
+			# submits as an anonymous guest run: uncounted for rewards, even
+			# though nothing was actually wrong. (The submit itself is SAFE
+			# either way thanks to the _session_player_id snapshot fix — it just
+			# means the run doesn't count for the player who deserved credit.)
+			# Fix: if the pending session was picked as a guest but auth is
+			# ready NOW, don't take the no-reload shortcut — force a fresh
+			# _start_session() below instead, which (being authed this time)
+			# correctly requests a real server-issued signed seed.
+			var _pending_is_guest  : bool = str(_gm.get("_session_player_id")) == ""
+			var _authed_now        : bool = _auth_token != ""
+			if platforms_ready and is_recording and _pending_is_guest and _authed_now:
+				print("[MAIN] Play pressed — pending session was guest-generated but we're authed now, starting a fresh signed session instead of reusing it")
+				platforms_ready = false
+			# NOTE: after watching ANY replay (yours or someone else's),
+			# stop_replay() rebuilds the lobby's idle background — same seed
+			# it already had before you went to watch a replay, same as the
+			# normal "lobby is already a live session, Play just activates
+			# it" flow always works, no reload/flash.
 			# CRITICAL (VS seed bug): a forced_seed means this is a VS round that
 			# MUST run the room's exact fixed seed — both players play the same
 			# one. The "activate the already-running lobby session" shortcut below
@@ -6000,6 +6213,39 @@ func _do_start_game(forced_seed: int = 0) -> void:
 			# level and fail server-side with vs_room_seed_mismatch. So when a
 			# forced_seed is present, ALWAYS start a fresh session with it.
 			if forced_seed == 0 and platforms_ready and is_recording and _player and _player.has_method("activate"):
+				# BELT-AND-SUSPENDERS ("stop replaye basmadan çıkıyor... o
+				# reset play butonuna basıncada olmalı"): stop_replay() now
+				# resets is_dead/lives on every exit that actually CALLS it,
+				# but watching your OWN game_over replay all the way to its
+				# natural end never calls stop_replay() at all — see
+				# GameManager.gd's _on_player_died(), the non-viewer PLAYING
+				# branch emits replay_finished directly and skips it
+				# entirely. That path lands back on the game-over panel, not
+				# the lobby, but if the player then backs out to the lobby
+				# and presses Play here, this shortcut could still activate
+				# a player node whose lives/is_dead were never reset by
+				# anything. Doing the same reset again right here — same
+				# seed, no reload, just guaranteed-clean state — closes that
+				# gap regardless of which exit path was actually taken. Uses
+				# the same Player.gd reset_transient_state() stop_replay()
+				# calls — every leftover flag/timer (hurt-flash,
+				# invincibility, boosts, debuffs, not just lives), kept in
+				# one shared place instead of two lists that could drift.
+				if is_instance_valid(_player) and _player.has_method("reset_transient_state"):
+					_player.call("reset_transient_state")
+				# BUG FIX ("sol üstte gösterilen toplanan nim sayısı... sadece
+				# stop_replay içinde değil playde de sıfırlanmalı, genel
+				# fonksiyona ekle"): reset_transient_state() only covers
+				# Player.gd's own fields — _quest_coins (the top-left NIM
+				# counter) and the other per-match quest counters live on
+				# GameManager, not Player, so they need their own reset here
+				# too, for the exact same belt-and-suspenders reason as
+				# reset_transient_state() above: if the own-replay natural
+				# end skipped stop_replay() entirely, these were never
+				# cleared either. _reset_quest_counters() already calls
+				# update_nimiq_display(0) itself.
+				if is_instance_valid(_gm) and _gm.has_method("_reset_quest_counters"):
+					_gm.call("_reset_quest_counters")
 				_player.activate()
 			else:
 				print("[MAIN] platforms not ready or not recording — calling _start_session")

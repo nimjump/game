@@ -230,6 +230,21 @@ var _prev_velocity_y  := 0.0
 # is captured before ANY of this tick's physics runs, so it's stable and
 # correct regardless of what happens to velocity later in the same tick.
 var _tick_entry_velocity_y := 0.0
+# TUNNEL FIX: snapshot of global_position taken at the very start of this
+# tick, before this tick's motion is applied. Same rationale and same
+# ordering hazard as _tick_entry_velocity_y right above: GameManager runs
+# player.simulate_tick() BEFORE each enemy's simulate_tick() in the same
+# GM tick, so by the time an enemy's _tick_player_overlap() runs, the
+# player's global_position already reflects THIS tick's move — testing
+# overlap against only that post-move point is a plain point-in-circle
+# test with no memory of where the player was a moment ago. At high fall
+# speed the player can cross an enemy's entire overlap radius within one
+# tick and never register as "inside" on the post-move point alone (the
+# same tunneling bug fixed for spring/item/spike in GameManager's
+# _check_interactables — see its _ci_prev_pos comment). Enemies read this
+# field directly (get("_tick_entry_position")) to sweep prev→current
+# instead of testing a single point.
+var _tick_entry_position := Vector2.ZERO
 var _trail_timer      := 0.0
 const TRAIL_INTERVAL  := 0.04
 const TRAIL_TICKS      := 5   # ticks between trail spawns (≈ TRAIL_INTERVAL at 60fps)
@@ -695,6 +710,16 @@ func reset_to_idle() -> void:
 	if _idle_tween:
 		_idle_tween.kill()
 		_idle_tween = null
+	# DEFENSIVE ("iyice kontrol et... hiçbir eksik kalmasın"): a squash/
+	# stretch tween (from a landing/jump the instant before the replay
+	# ended) is still running and still owns _anim_sprite.scale — without
+	# killing it here, it would keep overwriting the scale reset two lines
+	# below for whatever's left of its ~0.06-0.22s, one or two frames of
+	# the idle character visibly squashed/stretched right after returning
+	# to the lobby.
+	if _squash_tween and _squash_tween.is_valid():
+		_squash_tween.kill()
+		_squash_tween = null
 	_initialized   = false
 	_current_anim  = "stand"
 	velocity       = Vector2.ZERO
@@ -765,6 +790,8 @@ func simulate_tick() -> void:
 	# DETERMINISM FIX: capture the true previous-tick velocity BEFORE this
 	# tick changes it. See the comment on _tick_entry_velocity_y above.
 	_tick_entry_velocity_y = velocity.y
+	# TUNNEL FIX: same idea, for position — see _tick_entry_position comment above.
+	_tick_entry_position = global_position
 
 	# PL-02: _gm_in_replay cached — re-read each tick (replay mode can change mid-game)
 	# Direct field access avoids .get() string lookup
@@ -1265,6 +1292,42 @@ func full_heal() -> void:
 	lives = MAX_LIVES
 	has_shield = true
 	emit_signal("lives_changed", lives)
+
+
+## Clears every leftover match-transient flag/timer — lives, damage/i-frame
+## state, powerups, and every debuff — WITHOUT touching position/seed/scene
+## (callers decide those separately). Single source of truth for "this
+## player is clean, nothing carried over from a previous run", used
+## anywhere a live session gets reused/reactivated instead of freshly
+## rebuilt (see GameManager.gd's stop_replay() and Main.gd's
+## _do_start_game() shortcut) — kept in ONE place specifically so this list
+## can't quietly drift out of sync between the several call sites that need
+## it, which is exactly how the "hurt-flash/invincibility/boosts left over
+## from a watched replay" bug happened in the first place.
+func reset_transient_state() -> void:
+	is_dead        = false
+	lives          = MAX_LIVES
+	emit_signal("lives_changed", lives)
+	has_shield     = false
+	is_powered_up  = false
+	powerup_timer  = 0.0
+	powerup_type   = ""
+	_mirror_active = false
+	_mirror_timer  = 0.0
+	_drunk_active  = false
+	_drunk_timer   = 0.0
+	_drunk_t       = 0.0
+	_eq_active       = false
+	_eq_timer        = 0.0
+	_eq_debuff_timer = 0.0
+	_eq_offset       = Vector2.ZERO
+	_speed_boost       = false
+	_jump_boost        = false
+	_speed_boost_timer = 0.0
+	_jump_boost_timer  = 0.0
+	_invincible    = 0.0
+	_hurt_flash    = 0.0
+	god_mode       = false
 
 
 func is_stomping() -> bool:

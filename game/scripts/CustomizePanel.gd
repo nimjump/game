@@ -30,8 +30,30 @@ var _player_id  : String = ""
 var _auth_token : String = ""
 
 var _panel_ctrl : Control
+# Referenced by the dim overlay's gui_input handler to forward mouse-wheel
+# scroll into the panel directly — see StatsPanel.gd's matching fix.
+var _scroll     : ScrollContainer
 var _view_root  : VBoxContainer
 var _anim_tween : Tween = null
+
+# ── Panel auto-fit ───────────────────────────────────────────────────────────
+# Same shrink/grow-to-content mechanism as VSPanel.gd (see the member doc
+# comment there) — the panel used to always reserve the same tall fixed box
+# regardless of how many items a slot's list actually had, leaving a big dead
+# gap under a short list. These refs + _fit_panel_height() let the panel
+# resize itself to fit whatever's currently in _view_root, capped at the
+# original max height (still scrolls internally beyond that) and floored at a
+# minimum. Chrome here is header + slot-tabs + both separators.
+var _pc          : PanelContainer = null
+var _content_mc  : MarginContainer = null
+var _hdr_mc      : MarginContainer = null
+var _tabs_mc     : MarginContainer = null
+var _sep_rect    : Control = null
+var _sep2_rect   : Control = null
+var _panel_pad   : float = 0.0
+var _panel_max_h : float = 0.0
+var _panel_min_h : float = 0.0
+var _height_tween : Tween = null
 
 var _catalog  : Array = []      # [{id,name,slot,price_nim,pay_memo}, ...]
 var _pay_to   : String = ""
@@ -69,6 +91,9 @@ func _as_array(v) -> Array:
 func show_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
 	show()
+	# See UITheme.refresh_mouse_hover() doc comment — fixes wheel scroll not
+	# working until the mouse is clicked inside the panel after opening it.
+	UITheme.refresh_mouse_hover(self)
 	if is_instance_valid(_panel_ctrl):
 		# BUG FIX ("panel pops in from the top-left corner") — see VSPanel.gd's
 		# show_panel() doc comment for the full explanation. Same fix here.
@@ -171,6 +196,13 @@ func _build_ui() -> void:
 		# e.g. instantly firing a bottom-nav button at that screen position).
 		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
+		# BUG FIX ("can't scroll with mouse wheel") — see StatsPanel.gd's
+		# matching dim handler comment for the full explanation.
+		elif e is InputEventMouseButton and e.pressed and is_instance_valid(_scroll):
+			if e.button_index == MOUSE_BUTTON_WHEEL_UP:
+				_scroll.scroll_vertical -= _scroll.get_v_scroll_bar().page * 0.25
+			elif e.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				_scroll.scroll_vertical += _scroll.get_v_scroll_bar().page * 0.25
 	)
 	_panel_ctrl.add_child(dim)
 
@@ -188,6 +220,10 @@ func _build_ui() -> void:
 	pc_style.shadow_size  = 10
 	pc.add_theme_stylebox_override("panel", pc_style)
 	_panel_ctrl.add_child(pc)
+	_pc = pc
+	_panel_pad = pad
+	_panel_max_h = ph
+	_panel_min_h = vh * 0.34
 
 	var outer := VBoxContainer.new()
 	outer.add_theme_constant_override("separation", 0)
@@ -196,6 +232,7 @@ func _build_ui() -> void:
 	# ── Header ──
 	var hdr_mc := _mpad(pad, int(pad * 0.6))
 	outer.add_child(hdr_mc)
+	_hdr_mc = hdr_mc
 	var hdr := HBoxContainer.new()
 	hdr.alignment = BoxContainer.ALIGNMENT_CENTER
 	hdr.add_theme_constant_override("separation", int(ref * 0.012))
@@ -232,10 +269,12 @@ func _build_ui() -> void:
 	sep.color = Color(0.4, 0.4, 0.4, 0.3)
 	sep.custom_minimum_size.y = 1
 	outer.add_child(sep)
+	_sep_rect = sep
 
 	# ── Slot tabs ──
 	var tabs_mc := _mpad(pad, int(pad * 0.5))
 	outer.add_child(tabs_mc)
+	_tabs_mc = tabs_mc
 	var tabs := HBoxContainer.new()
 	tabs.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	tabs.add_theme_constant_override("separation", int(ref * 0.012))
@@ -253,6 +292,7 @@ func _build_ui() -> void:
 	sep2.color = Color(0.4, 0.4, 0.4, 0.3)
 	sep2.custom_minimum_size.y = 1
 	outer.add_child(sep2)
+	_sep2_rect = sep2
 
 	var scroll := ScrollContainer.new()
 	scroll.size_flags_vertical    = Control.SIZE_EXPAND_FILL
@@ -260,10 +300,12 @@ func _build_ui() -> void:
 	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	scroll.vertical_scroll_mode   = ScrollContainer.SCROLL_MODE_AUTO
 	outer.add_child(scroll)
+	_scroll = scroll
 
 	var content_mc := _mpad(pad, pad)
 	content_mc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.add_child(content_mc)
+	_content_mc = content_mc
 
 	_view_root = VBoxContainer.new()
 	_view_root.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -271,6 +313,39 @@ func _build_ui() -> void:
 	content_mc.add_child(_view_root)
 
 	_refresh_tab_styles()
+
+
+## Shrinks/grows the panel to fit whatever's currently in _view_root instead
+## of always reserving the same tall fixed box — see the _pc/_panel_pad/etc.
+## member doc comment above for why. Call this once after populating
+## _view_root (after _render_list() rebuilds the current slot's item list).
+## Async: waits a frame so the freshly-added children have real minimum
+## sizes before measuring — fire-and-forget from callers (`_fit_panel_height()`
+## with no `await`).
+func _fit_panel_height() -> void:
+	if not is_instance_valid(_pc) or not is_instance_valid(_content_mc):
+		return
+	await get_tree().process_frame
+	# The panel may have been closed/torn down while we were waiting a frame.
+	if not is_instance_valid(_pc) or not is_instance_valid(_content_mc) or not is_instance_valid(_hdr_mc) or not is_instance_valid(_tabs_mc) or not is_instance_valid(_sep_rect) or not is_instance_valid(_sep2_rect):
+		return
+	var content_h : float = _content_mc.get_combined_minimum_size().y
+	var chrome_h  : float = _hdr_mc.size.y + _tabs_mc.size.y + _sep_rect.size.y + _sep2_rect.size.y + _panel_pad * 2.0
+	var desired_h : float = clampf(content_h + chrome_h, _panel_min_h, _panel_max_h)
+	_animate_panel_height(desired_h)
+
+
+## Tweens _pc's offset_top/offset_bottom to the given target height instead of
+## snapping instantly — shared by every _fit_panel_height() call.
+func _animate_panel_height(target_h: float) -> void:
+	if not is_instance_valid(_pc):
+		return
+	if is_instance_valid(_height_tween):
+		_height_tween.kill()
+	_height_tween = create_tween()
+	_height_tween.set_parallel(true)
+	_height_tween.tween_property(_pc, "offset_top",    -target_h * 0.5, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+	_height_tween.tween_property(_pc, "offset_bottom",  target_h * 0.5, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 
 
 func _select_slot(slot: String) -> void:
@@ -345,6 +420,7 @@ func _render_list() -> void:
 		lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		UITheme.apply_label(lbl, _COL_TEXT_MID, int(ref * 0.030))
 		_view_root.add_child(lbl)
+		_fit_panel_height()
 		return
 
 	if not _loaded:
@@ -353,6 +429,7 @@ func _render_list() -> void:
 		lbl2.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		UITheme.apply_label(lbl2, _COL_TEXT_MID, int(ref * 0.030))
 		_view_root.add_child(lbl2)
+		_fit_panel_height()
 		return
 
 	var items : Array = []
@@ -366,10 +443,12 @@ func _render_list() -> void:
 		lbl3.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 		UITheme.apply_label(lbl3, _COL_TEXT_MID, int(ref * 0.028))
 		_view_root.add_child(lbl3)
+		_fit_panel_height()
 		return
 
 	for it in items:
 		_view_root.add_child(_build_item_card(it, ref))
+	_fit_panel_height()
 
 
 func _placeholder_swatch(name_str: String, size: int) -> ImageTexture:

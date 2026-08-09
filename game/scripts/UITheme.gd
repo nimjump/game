@@ -395,6 +395,31 @@ static func apply_toggle_button(btn: CheckButton, icon_height: int = 36) -> void
 # previous tap). Now any Control that already explicitly opted into STOP
 # is left alone — only the default-filter passive wrappers (VBox/HBox,
 # Labels, plain Controls) get switched to PASS.
+# BUG FIX ("scroll wheel doesn't work on a panel until you click inside it
+# first, just opening it isn't enough"): a bottom-nav tab press opens its
+# panel via show() while the mouse cursor stays put — right over the tab
+# button that was just pressed, since the user didn't move the mouse to
+# trigger it. Godot's viewport only re-picks "which Control is currently
+# under the cursor" on an actual InputEventMouseMotion; it does NOT
+# re-evaluate that just because a new Control became visible on top. So
+# right after the panel appears, the viewport still thinks the OLD control
+# (the tab button underneath) is what's under the mouse, and wheel events
+# get routed/ignored based on that stale hover state instead of reaching
+# the panel's ScrollContainer. Manually moving the mouse and clicking sends
+# a real motion event, which is what actually "fixes" it — confirming this
+# is a stale-hover bug, not a focus bug. Fix: synthesize a motion event at
+# the current cursor position the moment the panel shows, forcing Godot to
+# re-pick immediately so wheel scroll works without the user touching
+# anything else. Call this once, right after show(), from every panel's
+# show_panel().
+static func refresh_mouse_hover(node: Node) -> void:
+	var vp := node.get_viewport()
+	if not is_instance_valid(vp): return
+	var mm := InputEventMouseMotion.new()
+	mm.position        = vp.get_mouse_position()
+	mm.global_position = mm.position
+	Input.parse_input_event(mm)
+
 static func set_scroll_passthrough(node: Node) -> void:
 	for child in node.get_children():
 		if child is Button or child is BaseButton or child is Slider or child is LineEdit:

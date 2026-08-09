@@ -13,10 +13,29 @@ var _auth_attempted : bool    = false
 var _has_wallet     : bool    = false   # whether Nimiq Pay is connected
 var _panel_ctrl  : Control
 var _list_root   : VBoxContainer
+# Referenced by the dim overlay's gui_input handler to forward mouse-wheel
+# scroll into the panel directly — see StatsPanel.gd's matching fix.
+var _scroll      : ScrollContainer
 var _reset_lbl   : Label
 var _timer       : Timer
 var _quest_data  : Array = []
 var _anim_tween  : Tween = null
+
+# ── Panel auto-fit ───────────────────────────────────────────────────────────
+# Same shrink/grow-to-content mechanism as VSPanel.gd (see the member doc
+# comment there) — was always the same tall fixed box regardless of whether
+# it held a loading spinner, an error line, or a full quest list, leaving a
+# big dead gap under short content. These refs + _fit_panel_height() let the
+# panel resize itself to fit whatever's currently in _list_root, capped at
+# the original max height and floored at a minimum.
+var _pc          : PanelContainer
+var _content_mc  : MarginContainer
+var _hdr_mc      : MarginContainer
+var _sep_rect    : ColorRect
+var _panel_pad   : float = 0.0
+var _panel_max_h : float = 0.0
+var _panel_min_h : float = 0.0
+var _height_tween : Tween = null
 # Unix timestamp of the next UTC+3 midnight, from the backend's /quests
 # response ("reset_at") — quests actually reset server-side at UTC+3
 # midnight (see handlers/quest.go), NOT at the player's own device midnight.
@@ -77,6 +96,9 @@ func set_player_id(player_id: String) -> void:
 func show_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
 	show()
+	# See UITheme.refresh_mouse_hover() doc comment — fixes wheel scroll not
+	# working until the mouse is clicked inside the panel after opening it.
+	UITheme.refresh_mouse_hover(self)
 	if is_instance_valid(_panel_ctrl):
 		# BUG FIX ("panel pops in from the top-left corner") — see VSPanel.gd's
 		# show_panel() doc comment for the full explanation. Same fix here.
@@ -157,6 +179,13 @@ func _build_ui() -> void:
 		# the same tap leak through onto whatever's now exposed underneath).
 		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
+		# BUG FIX ("can't scroll with mouse wheel") — see StatsPanel.gd's
+		# matching dim handler comment for the full explanation.
+		elif e is InputEventMouseButton and e.pressed and is_instance_valid(_scroll):
+			if e.button_index == MOUSE_BUTTON_WHEEL_UP:
+				_scroll.scroll_vertical -= _scroll.get_v_scroll_bar().page * 0.25
+			elif e.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				_scroll.scroll_vertical += _scroll.get_v_scroll_bar().page * 0.25
 	)
 	_panel_ctrl.add_child(dim)
 
@@ -175,6 +204,10 @@ func _build_ui() -> void:
 	pc_style.shadow_size  = 10
 	pc.add_theme_stylebox_override("panel", pc_style)
 	_panel_ctrl.add_child(pc)
+	_pc = pc
+	_panel_pad = pad
+	_panel_max_h = ph
+	_panel_min_h = vh * 0.34
 
 	var outer := VBoxContainer.new()
 	outer.add_theme_constant_override("separation", 0)
@@ -183,6 +216,7 @@ func _build_ui() -> void:
 	# ── Header ──
 	var hdr_mc := _mpad(pad, int(pad * 0.6))
 	outer.add_child(hdr_mc)
+	_hdr_mc = hdr_mc
 	var hdr := HBoxContainer.new()
 	hdr.alignment = BoxContainer.ALIGNMENT_CENTER
 	hdr.add_theme_constant_override("separation", int(ref * 0.012))
@@ -239,6 +273,7 @@ func _build_ui() -> void:
 	sep.color = Color(0.4, 0.4, 0.4, 0.3)
 	sep.custom_minimum_size.y = 1
 	outer.add_child(sep)
+	_sep_rect = sep
 
 	# ── Scroll ──
 	var scroll := ScrollContainer.new()
@@ -249,10 +284,12 @@ func _build_ui() -> void:
 	scroll.scroll_deadzone        = 0
 	scroll.follow_focus           = false
 	outer.add_child(scroll)
+	_scroll = scroll
 
 	var content_mc := _mpad(pad, pad)
 	content_mc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	scroll.add_child(content_mc)
+	_content_mc = content_mc
 
 	_list_root = VBoxContainer.new()
 	_list_root.size_flags_horizontal = Control.SIZE_EXPAND_FILL
@@ -369,6 +406,7 @@ func _build_quest_list() -> void:
 	spacer.custom_minimum_size.y = int(ref * 0.02)
 	_list_root.add_child(spacer)
 	UITheme.set_scroll_passthrough(_list_root)
+	_fit_panel_height()
 
 
 ## Warm beige palette (matching screenshot)
@@ -566,6 +604,7 @@ func _set_loading(msg: String) -> void:
 	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	UITheme.apply_label(lbl, Color(0.480, 0.340, 0.200), int(ref * 0.030))
 	row.add_child(lbl)
+	_fit_panel_height()
 
 
 func _show_connect_prompt() -> void:
@@ -600,6 +639,7 @@ func _show_connect_prompt() -> void:
 	# correctly, exactly like Stats/VS.
 	btn.pressed.connect(func(): emit_signal("connect_requested"))
 	vbox.add_child(btn)
+	_fit_panel_height()
 
 
 func _request_account_connect(btn: Button) -> void:
@@ -632,10 +672,44 @@ func _show_error(msg: String) -> void:
 	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	UITheme.apply_label(lbl, Color(0.480, 0.340, 0.200), int(ref * 0.026))
 	vbox.add_child(lbl)
+	_fit_panel_height()
 
 
 func _clear_list() -> void:
 	for c in _list_root.get_children(): c.queue_free()
+
+
+## Shrinks/grows the panel to fit whatever's currently in _list_root instead
+## of always reserving the same tall fixed box — see the _pc/_panel_pad/etc.
+## member doc comment above for why. Call this once after populating _list_root
+## with new content. Async: waits a frame so the freshly-added children have
+## real minimum sizes before measuring — fire-and-forget from callers
+## (`_fit_panel_height()` with no `await`).
+func _fit_panel_height() -> void:
+	if not is_instance_valid(_pc) or not is_instance_valid(_content_mc):
+		return
+	await get_tree().process_frame
+	# The panel may have been closed/torn down while we were waiting a frame.
+	if not is_instance_valid(_pc) or not is_instance_valid(_content_mc) or not is_instance_valid(_hdr_mc) or not is_instance_valid(_sep_rect):
+		return
+	var content_h : float = _content_mc.get_combined_minimum_size().y
+	var chrome_h  : float = _hdr_mc.size.y + _sep_rect.size.y + _panel_pad * 2.0
+	var desired_h : float = clampf(content_h + chrome_h, _panel_min_h, _panel_max_h)
+	_animate_panel_height(desired_h)
+
+
+## Tweens _pc's offset_top/offset_bottom to the given target height instead of
+## snapping instantly — shared by every _fit_panel_height() call (loading /
+## error / connect-prompt / quest-list all resize through this).
+func _animate_panel_height(target_h: float) -> void:
+	if not is_instance_valid(_pc):
+		return
+	if is_instance_valid(_height_tween):
+		_height_tween.kill()
+	_height_tween = create_tween()
+	_height_tween.set_parallel(true)
+	_height_tween.tween_property(_pc, "offset_top",    -target_h * 0.5, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+	_height_tween.tween_property(_pc, "offset_bottom",  target_h * 0.5, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 
 
 

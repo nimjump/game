@@ -238,6 +238,9 @@ func open_room(room_id: String) -> void:
 func show_panel() -> void:
 	if is_instance_valid(_anim_tween): _anim_tween.kill()
 	show()
+	# See UITheme.refresh_mouse_hover() doc comment — fixes wheel scroll not
+	# working until the mouse is clicked inside the panel after opening it.
+	UITheme.refresh_mouse_hover(self)
 	if is_instance_valid(_panel_ctrl):
 		# BUG FIX ("panel pops in from the top-left corner"): _panel_ctrl is a
 		# PRESET_FULL_RECT node (spans the whole screen — the actual visible
@@ -307,6 +310,16 @@ func _build_ui() -> void:
 		# same tap leak through onto whatever's now exposed underneath).
 		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
 			hide_panel(); closed.emit()
+		# BUG FIX ("can't scroll with mouse wheel") — not closing the panel was
+		# already fixed above, but the wheel event still needs to actually
+		# reach the scroll view. See StatsPanel.gd's matching dim handler
+		# comment for the full explanation.
+		elif e is InputEventMouseButton and e.pressed and is_instance_valid(_view_root) and is_instance_valid(_view_root.get_parent()) and _view_root.get_parent() is ScrollContainer:
+			var _sc : ScrollContainer = _view_root.get_parent()
+			if e.button_index == MOUSE_BUTTON_WHEEL_UP:
+				_sc.scroll_vertical -= _sc.get_v_scroll_bar().page * 0.25
+			elif e.button_index == MOUSE_BUTTON_WHEEL_DOWN:
+				_sc.scroll_vertical += _sc.get_v_scroll_bar().page * 0.25
 	)
 	_panel_ctrl.add_child(dim)
 
@@ -1725,7 +1738,7 @@ func _notify_status_change(old_r: Dictionary, new_r: Dictionary) -> void:
 # ── DETAIL VIEW ──────────────────────────────────────────────────────────────
 func _show_room_detail(room_id: String) -> void:
 	_viewing_room_id = room_id   # mark BEFORE the async fetch so a late auth/player
-	                             # sync can't re-render the list over this view
+								 # sync can't re-render the list over this view
 	_back_btn.visible = true
 	if is_instance_valid(_header_icon): _header_icon.visible = false  # back btn replaces it — no clutter
 	_title_lbl.text = "Match"
