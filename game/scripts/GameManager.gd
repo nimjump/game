@@ -23,6 +23,40 @@ func _discard_node(n: Node) -> void:
 ## Emitted when platforms have spawned and the game is ready to play.
 signal ready_to_play
 
+# ── Input edge-latch (catch-up-burst-proof) ──────────────────────────────
+# Input.is_action_pressed() only reflects the CURRENT polled state at the
+# instant it's called. When render FPS drops below the fixed 60Hz physics
+# rate (mobile/web under load, backgrounded tab resuming, lag spike), Godot
+# runs several _physics_process() calls back-to-back to catch up
+# (Project Settings > physics > common > max_physics_steps_per_frame) with
+# ZERO new input events processed in between those calls — every tick in
+# that burst reads the exact same is_action_pressed() result. A very short
+# tap that starts AND ends entirely inside one such burst is therefore
+# invisible to is_action_pressed() on EVERY tick of that burst, and never
+# makes it into the RLE replay log at all — the input is silently dropped
+# during recording itself, independent of any client/server sim mismatch.
+# This is almost certainly the real source of "left/right doesn't register
+# 100% of the time" reports.
+#
+# FIX: _input() fires once per real OS input event (key down/up), not once
+# per rendered frame, so it can't miss an edge the way polling can. Latch
+# the press edge into a one-shot "pending" flag here, OR it into the normal
+# is_action_pressed() read at the actual tick-consumption site below, and
+# clear it after exactly one tick has consumed it — so a fast tap is
+# guaranteed to register for at least one simulated tick, but never gets
+# artificially stretched across more than one.
+# NOTE: only feeds the KEYBOARD fallback path (used when Main isn't driving
+# control, e.g. editor/desktop testing without Main.gd's touch/gyro layer).
+# The primary touch/gyro path is fixed the same way in Main.gd.
+var _kb_left_pending  := false
+var _kb_right_pending := false
+
+func _input(event: InputEvent) -> void:
+	if event.is_action_pressed("ui_left") or event.is_action_pressed("move_left"):
+		_kb_left_pending = true
+	if event.is_action_pressed("ui_right") or event.is_action_pressed("move_right"):
+		_kb_right_pending = true
+
 # ── Screen dimensions — single source of truth: GameConstants ───────
 var VW : float = GameConstants.VW
 var VH : float = GameConstants.VH
@@ -289,7 +323,13 @@ func init(p_cam, p_player, _p_score, _p_best, _p_final, p_main, p_seed: int = -1
 		_spawn_start_platform()
 
 	if not p_skip_session:
-		_start_session()
+		# silent_boot=true: this is the scene's automatic first session, which
+		# on a "Play Again" reload can fire while _is_authed() is already true
+		# (cached token restored synchronously) but the Nimiq bridge is still
+		# connecting for real. A failed/slow seed fetch here isn't a genuine
+		# connectivity problem, so don't show a network-error toast for it —
+		# see _start_session_from_issued_seed / _start_session for details.
+		_start_session(0, true)
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -693,8 +733,13 @@ func _simulate_gm_tick() -> void:
 				rdir = main_node.call("get_control_dir")
 			else:
 				# Keyboard fallback (desktop / editor)
-				var l_held := Input.is_action_pressed("ui_left")  or Input.is_action_pressed("move_left")
-				var r_held := Input.is_action_pressed("ui_right") or Input.is_action_pressed("move_right")
+				# Edge-latch OR'd in — see _kb_left_pending/_kb_right_pending doc
+				# comment above _input() for why plain is_action_pressed() alone
+				# can silently miss a fast tap during a physics catch-up burst.
+				var l_held := Input.is_action_pressed("ui_left")  or Input.is_action_pressed("move_left") or _kb_left_pending
+				var r_held := Input.is_action_pressed("ui_right") or Input.is_action_pressed("move_right") or _kb_right_pending
+				_kb_left_pending  = false
+				_kb_right_pending = false
 				if r_held and not l_held:
 					rdir = 1
 				elif l_held and not r_held:
@@ -1390,7 +1435,15 @@ func _add_enemy(plat: StaticBody2D, p_diff: float = -1.0, p_score: int = -1) -> 
 		var enemy_id := enemy.get_instance_id()
 		plat.platform_broke.connect(func():
 			var e := instance_from_id(enemy_id)
-			if is_instance_valid(e) and e.has_method("_die"):
+			# ZOMBIE-NODE FIX: same class of bug as Platform.gd's connect_enemy —
+			# is_instance_valid() alone can't tell a genuinely-dead enemy from
+			# one that's merely un-flushed inside a seek_to_tick() server-replay
+			# burst (queue_free() never flushes mid-run there). e._removed is
+			# set synchronously the instant the enemy actually dies, so it
+			# catches the case is_instance_valid() misses and prevents _die()
+			# from double-firing (double-counted kills / stat desync between
+			# client recording and server verification of the same replay).
+			if is_instance_valid(e) and not bool(e.get("_removed")) and e.has_method("_die"):
 				e.call("_die")
 		)
 
@@ -1570,6 +1623,21 @@ func _check_interactables() -> void:
 	var seg_y0 : float = _ci_prev_pos.y
 	var seg_x1 : float = px
 	var seg_y1 : float = py
+
+	# WRAP FIX: Player.gd wraps global_position.x directly (screen edge
+	# teleport, exit right / re-enter left or vice versa) *inside the same
+	# tick* that _ci_prev_pos was snapshotted from — before the wrap. The
+	# swept-path tunnel-fix above/below then sees a "movement" spanning
+	# almost the full screen width in one tick and happily reports every
+	# item/spike/spring near the player's Y as "the player's path passed
+	# through it", triggering pickups/damage in the middle of the screen
+	# that never actually happened. A real single-tick horizontal move is
+	# nowhere near this large — only a wrap teleport is — so detect it by
+	# the jump size and collapse the segment to a point (post-wrap position
+	# only, no sweep) for this tick instead of tunnel-checking across it.
+	if absf(seg_x1 - seg_x0) > VW * 0.5:
+		seg_x0 = seg_x1
+		seg_y0 = seg_y1
 
 	_ci_to_remove.clear()
 
@@ -2269,6 +2337,13 @@ const SEED_BATCH_SIZE := 10   # MUST match backend/game/seed_batch.go's SeedBatc
 
 var _seed_queue            : Array = []   # [{seed:String, expiry:String, sig:String, player_id:String}, ...]
 var _seed_queue_loaded     : bool  = false
+
+## Bumped at the top of every _start_session() call. Lets an in-flight
+## (awaiting) call detect that a *newer* call has since started — e.g. the
+## lobby's background "auth just arrived, upgrade guest seed to a signed
+## one" reseed racing against the player mashing Play before it resolves —
+## and bail out without clobbering the newer call's state.
+var _session_gen           : int   = 0
 var _seed_refill_in_flight : bool  = false
 
 ## seed_sig / seed_expiry for the CURRENTLY ACTIVE game_seed. Empty string
@@ -2438,7 +2513,7 @@ func _maybe_refill_seed_queue() -> void:
 ## empty. Returns false if the caller should NOT start a game yet — true
 ## once game_seed / session_id / _current_seed_sig / _current_seed_expiry
 ## are all set and ready for _init_game_from_seed().
-func _start_session_from_issued_seed() -> bool:
+func _start_session_from_issued_seed(my_gen: int, silent_boot: bool = false) -> bool:
 	_load_seed_queue()
 	_prune_seed_queue()
 
@@ -2449,6 +2524,9 @@ func _start_session_from_issued_seed() -> bool:
 
 	if _seed_queue.is_empty():
 		if not online:
+			if silent_boot:
+				print("[GM] silent_boot: queue empty + offline — falling back to local seed, no toast")
+				return false
 			print("[GM] seed queue empty + offline — blocking new run until reconnect")
 			if is_instance_valid(main_node) and main_node.has_method("_on_offline_no_seeds"):
 				main_node.call("_on_offline_no_seeds")
@@ -2459,8 +2537,22 @@ func _start_session_from_issued_seed() -> bool:
 		# fully drained the queue) — fetch a batch right now and wait for it,
 		# since there's nothing else to play from.
 		var got := await _request_seed_batch()
+		if my_gen != _session_gen:
+			return false  # a newer _start_session() took over while we awaited
 		if not got or _seed_queue.is_empty():
-			Toast.network_error("couldn't fetch a new run — try again")
+			# silent_boot = this call came from init()'s automatic first
+			# session, not a player-initiated Play press. At this exact
+			# moment (fresh scene load / reload_current_scene) the Nimiq
+			# bridge is very likely still connecting even though a cached
+			# auth token already made _is_authed() return true (see
+			# _cached_auth_token_for_reload in Main.gd) — so a failed/slow
+			# fetch here is NOT a real connectivity problem, just a race.
+			# Don't scare the player with a network-error toast for
+			# something that self-heals: _start_session() falls back to a
+			# local guest seed below, and _maybe_refresh_lobby_seed() swaps
+			# it for a real one the moment auth actually finishes connecting.
+			if not silent_boot:
+				Toast.network_error("couldn't fetch a new run — try again")
 			return false
 	elif _seed_queue.size() < POOL_MIN and online:
 		# Already have enough to play NOW — top up in the background, don't
@@ -2469,7 +2561,18 @@ func _start_session_from_issued_seed() -> bool:
 
 	var entry := _consume_seed_from_queue()
 	if entry.is_empty():
-		Toast.network_error("couldn't fetch a new run — try again")
+		if not silent_boot:
+			Toast.network_error("couldn't fetch a new run — try again")
+		return false
+
+	if my_gen != _session_gen:
+		# Stale coroutine — a newer _start_session() has already taken over
+		# (e.g. lobby auth-reseed racing the player's own Play press). Put
+		# the seed back at the front of the queue instead of consuming it
+		# for nothing, and don't touch game_seed/session_id/_current_seed_sig
+		# — the newer call owns those now.
+		_seed_queue.push_front(entry)
+		_save_seed_queue()
 		return false
 
 	var seed_val : int = int(str(entry.get("seed", "0")))
@@ -2489,7 +2592,10 @@ func _start_session_from_issued_seed() -> bool:
 ## When set, skips local entropy generation entirely and just derives a
 ## session_id from it via _make_local_session_id (still locally unique, but
 ## game_seed itself is no longer random — that's the whole point of a VS match).
-func _start_session(forced_seed: int = 0) -> void:
+func _start_session(forced_seed: int = 0, silent_boot: bool = false) -> void:
+	_session_gen += 1
+	var my_gen := _session_gen
+
 	if forced_seed != 0:
 		game_seed  = forced_seed & 0x7FFFFFFFFFFFFFFF
 		session_id = _make_local_session_id(game_seed)
@@ -2508,13 +2614,24 @@ func _start_session(forced_seed: int = 0) -> void:
 		# actual suspension point, so the common case (queue already has a
 		# seed, nothing to await) behaves exactly like before. Only the
 		# empty-queue-while-online case visibly waits before platforms spawn.
-		var ok := await _start_session_from_issued_seed()
-		if not ok:
-			return  # blocked — see _start_session_from_issued_seed for why
-		_init_game_from_seed()
-		return
+		var ok := await _start_session_from_issued_seed(my_gen, silent_boot)
+		if my_gen != _session_gen:
+			return  # superseded by a newer _start_session() while we awaited
+		if ok:
+			_init_game_from_seed()
+			return
+		if not silent_boot:
+			return  # blocked, or a real player-initiated request failed — already toasted
+		# silent_boot + genuinely failed (not superseded): this is init()'s
+		# automatic first session racing the Nimiq bridge, not a player
+		# action, so fall through to a local guest seed instead of leaving
+		# the lobby stuck with nothing to render. _maybe_refresh_lobby_seed()
+		# swaps this for a real signed seed the moment auth actually
+		# finishes connecting — see the comments in
+		# _start_session_from_issued_seed above.
+		print("[GM] silent_boot fallback — building local seed while auth/bridge catches up")
 
-	# ── Guest (signed-out): fully local generation, unchanged from before ──
+	# ── Guest (signed-out), or silent_boot fallback above: fully local generation ──
 	_current_seed_sig    = ""
 	_current_seed_expiry = ""
 	_snapshot_session_identity()
@@ -3270,6 +3387,18 @@ func _submit_session() -> void:
 	# sadece auth varsa atar. Auth yoksa kayıt queue'da bekler; Main._on_auth_success
 	# sign-in olunca flush_pending() çağırıp bekleyen kaydı otomatik gönderir.
 	if session_id == "" or score <= 0:
+		return
+
+	# HARDENING: session_id is derived FROM game_seed at _start_session() time
+	# (_make_local_session_id(game_seed)), so in the normal path they can
+	# never disagree. But if some future code path ever resets game_seed to 0
+	# (e.g. mid-run reset/reinit race) without also clearing session_id, this
+	# would silently submit "seed": "0" — a payload the server will reject
+	# anyway, but only after a wasted round-trip and with a confusing error
+	# for the player. Fail fast and loud here instead, before any network
+	# call is made, so it shows up in logs as exactly what it is.
+	if game_seed == 0:
+		push_error("[SUBMIT] aborting — session_id=%s but game_seed=0 (seed/session desync)" % session_id)
 		return
 
 	# BUG FIX (see _session_player_id doc comment above _start_session):

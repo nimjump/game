@@ -263,7 +263,18 @@ func connect_enemy(enemy: Node) -> void:
 	var enemy_id := enemy.get_instance_id()
 	platform_broke.connect(func():
 		var e := instance_from_id(enemy_id)
-		if is_instance_valid(e):
+		# ZOMBIE-NODE FIX: is_instance_valid() alone isn't enough here. During
+		# a server-replay's seek_to_tick() burst, queue_free() never flushes
+		# mid-run (no frame yields), so an enemy that already died earlier in
+		# THIS SAME MATCH still reads as valid when this platform breaks
+		# later — re-firing _die()/_fall_off_platform() on it a second time
+		# and double-counting kills, which desyncs the server's verified
+		# stats from what the client actually recorded (a false mismatch on
+		# a legitimate run). Checking e._removed (set synchronously the
+		# instant the enemy actually died/was removed, before any deferred
+		# free happens) catches that even though the node object is still
+		# technically alive.
+		if is_instance_valid(e) and not bool(e.get("_removed")):
 			if e.has_method("_fall_off_platform"):
 				e.call("_fall_off_platform")
 			elif e.has_method("_die"):

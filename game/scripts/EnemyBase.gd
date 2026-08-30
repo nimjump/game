@@ -118,6 +118,25 @@ var _is_headless : bool = false
 # [PERF] EN-06: cached vertical overlap offset
 var _overlap_v_offset : Vector2 = Vector2.ZERO
 
+# ── Zombie-node guard ──────────────────────────────────────────────────
+# queue_free() only *schedules* deletion for the next frame — it needs
+# control to return to the engine to actually flush. seek_to_tick()'s
+# server-replay loop runs the whole match in one uninterrupted while()
+# loop with no frame yields, so ANY enemy freed mid-match stays
+# is_instance_valid() == true for the rest of that headless run (it would
+# correctly be false by now in normal client play, where each tick is a
+# real frame and frees do flush). Anything that resolves an enemy later
+# via instance_from_id() (e.g. Platform.gd/GameManager.gd's platform_broke
+# lambdas) and gates on is_instance_valid() alone can therefore fire
+# _die()/_fall_off_platform() a SECOND time on an already-dead enemy in
+# headless — double-counting kills/quest stats and desyncing the server's
+# verification result from what the client actually recorded, even though
+# the replay was 100% legitimate. Set this true synchronously at the top
+# of _die()/_fall_off_platform() (before any free happens) and check it
+# — not just is_instance_valid() — anywhere an enemy reference is reused
+# after the fact.
+var _removed := false
+
 
 func _ready() -> void:
 	# Fixed virtual world resolution, matching GameManager's VW/VH and the
@@ -380,6 +399,18 @@ func _tick_player_overlap() -> void:
 	var ey0 : float = p_entry.y + _overlap_v_offset.y
 	var ex1 : float = p.global_position.x
 	var ey1 : float = p.global_position.y + _overlap_v_offset.y
+	# WRAP FIX: Player.gd teleports global_position.x on screen-edge wrap
+	# (exit right / re-enter left or vice versa) *after* _tick_entry_position
+	# was captured for this tick — so a wrap makes ex0→ex1 span almost the
+	# entire screen width, and the swept-path tunnel-fix below reports every
+	# enemy near the player's Y as "the player's path passed through it",
+	# triggering a stomp/hit on creatures nowhere near where the player
+	# actually was. A real single-tick move is nowhere near this large —
+	# only a wrap teleport is — so collapse the segment to a point (post-
+	# wrap position only) for this tick instead of sweeping across it.
+	if absf(ex1 - ex0) > _vw * 0.5:
+		ex0 = ex1
+		ey0 = ey1
 	var ax  : float = global_position.x
 	var ay  : float = global_position.y
 	var ex  : float = ex1 - ex0
@@ -698,6 +729,8 @@ func _on_removed() -> void:
 func _fall_off_platform() -> void:
 	if can_fly: return
 	if not _setup_done: return
+	if _removed: return  # zombie-node guard — already dead/removed this match, see field comment
+	_removed = true
 	_on_removed()
 	set_deferred("monitoring", false)
 	set_deferred("monitorable", false)
@@ -717,6 +750,8 @@ func _fall_off_platform() -> void:
 		queue_free()
 
 func _die() -> void:
+	if _removed: return  # zombie-node guard — already dead/removed this match, see field comment
+	_removed = true
 	_on_removed()
 	set_deferred("monitoring", false)
 	set_deferred("monitorable", false)
@@ -732,12 +767,15 @@ func _die() -> void:
 				(Enemy.EnemyType.keys()[enemy_type] if enemy_type >= 0 and enemy_type < Enemy.EnemyType.size() else "?"),
 				enemy_type, get_instance_id(), global_position.x, global_position.y
 			])
-		# [CRASH FIX] queue_free() defers via call_deferred, which never flushes
-		# mid-replay since the whole synchronous tick loop never returns control
-		# to the engine between ticks. Use immediate free() here too, same as
-		# _discard_node() does elsewhere in GameManager — keeps behavior consistent
-		# and guarantees this node (and its slot in _enemies) is actually gone
-		# instead of lingering as a "zombie" node for the rest of the sim.
+		# CORRECTION: this used to claim _discard_node() frees immediately —
+		# it doesn't, it still calls queue_free() (deliberately, to avoid a
+		# separate lambda-capture-freed crash — see GameManager._discard_node's
+		# own doc comment). So this node DOES remain a "zombie" — is_instance_valid()
+		# still true — for the rest of a seek_to_tick() burst, since that loop
+		# never returns control to the engine to flush the deferred free.
+		# That's exactly what _removed (set above, before any of this runs)
+		# now guards against: anything that resolves this enemy later via
+		# instance_from_id() must check _removed, not just is_instance_valid().
 		if is_instance_valid(gm) and gm.has_method("_discard_node"):
 			gm.call("_discard_node", self)
 		else:

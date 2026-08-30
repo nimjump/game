@@ -5,7 +5,7 @@
   <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
   <meta http-equiv="Pragma" content="no-cache">
   <meta http-equiv="Expires" content="0">
-  <meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <!-- PERF/BUG FIX: Nimiq Hub's own popup (hub.nimiq.com) starts a hardcoded
        1-SECOND timeout the instant it loads (see nimiq/hub's RpcApi.start()
        -> RpcServer.init(onClientTimeout), window.setTimeout(...,1000)) —
@@ -82,12 +82,42 @@
          auto-sizing behavior at all, just an exact number every browser
          computes the same way. top/left position it, width/height size it,
          'right'/'bottom' aren't needed (and would over-constrain the box
-         if combined with an explicit width/height anyway). */
+         if combined with an explicit width/height anyway).
+
+         PERMANENT FIX (bottom nav bar — Quests/Stats/Leaderboard/VS —
+         getting covered by the phone's OS nav bar on some devices):
+         env(safe-area-inset-bottom) ONLY reports hardware safe areas
+         (notch, Dynamic Island, iPhone home-indicator). It does NOT
+         report Android's on-screen gesture/3-button nav bar at all —
+         there is no CSS env() variable for that. On top of that, a
+         plain percentage/vh height on a position:fixed full-screen box
+         resolves against the browser's "large viewport" (address bar
+         hidden) by default on Chrome/Safari's dynamic-toolbar model, so
+         on some phones #canvas was measured taller than what's actually
+         visible on screen — GDScript's own bottom bar (positioned from
+         that same inflated height) ended up drawn partly behind the OS
+         nav bar / collapsed toolbar strip, exactly the "some devices"
+         symptom reported.
+
+         Fix: --app-height is written by JS below from
+         window.visualViewport.height, which is the one number that
+         already excludes BOTH the Android nav bar AND a shown/hidden
+         mobile toolbar on every browser that matters here (near-
+         universal support). env(safe-area-inset-*) is still subtracted
+         on top of that for the iOS notch/home-indicator case, which
+         visualViewport does NOT exclude on its own — the two fixes are
+         complementary, not redundant, and never double-count on either
+         platform. `100dvh` is the fallback for the split second before
+         the JS below runs (or in the unlikely case it can't run at
+         all); plain `100%` one line above is the last-resort fallback
+         for engines with neither. */
       position:fixed;
       top:    env(safe-area-inset-top, 0px);
       left:   env(safe-area-inset-left, 0px);
       width:  calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
       height: calc(100% - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+      height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+      height: calc(var(--app-height, 100dvh) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
       outline:none; touch-action:none; image-rendering:pixelated;
     }
     #status, #status-splash, #status-progress { position:fixed; }
@@ -96,6 +126,8 @@
       left:   env(safe-area-inset-left, 0px);
       width:  calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px));
       height: calc(100% - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+      height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+      height: calc(var(--app-height, 100dvh) - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
     }
     #status {
       background-color: $GODOT_SPLASH_COLOR;
@@ -160,12 +192,154 @@
     /* pointer:coarse + hover:none = an actual touchscreen (phone/tablet),
        not a desktop browser window that just happens to be wide — device-
        width breakpoints are unreliable for this, pointer/hover capability
-       is the correct modern way to target "real mobile device" specifically. */
+       is the correct modern way to target "real mobile device" specifically.
+       BUG FIX (black screen after rotating back to portrait): this used to
+       also do `#canvas, #status { display:none !important; }` here. On
+       several mobile browsers (notably iOS Safari) setting a canvas that
+       has a live WebGL context to display:none frees the GPU context
+       outright, and Godot's HTML5/WASM export has no code path to rebuild
+       its renderer from a 'webglcontextrestored' event — so rotating back
+       to portrait brought the canvas back on screen with a dead renderer
+       behind it: permanent black screen, no way to recover except a full
+       page reload.
+       #rotate-lock already fully covers the screen (position:fixed;
+       inset:0; solid #000 background; z-index:9999 above the canvas), so
+       it was already 100% hiding the canvas visually WITHOUT any help from
+       display:none — the canvas being technically still in the render tree
+       underneath was never visible to the player. So the only thing
+       display:none was actually still doing was (a) risking exactly the
+       context-loss bug above, and (b) letting touches fall through to a
+       canvas the player can't see. Fix: drop display:none entirely (keeps
+       the WebGL context alive, so rotating back is instant and always
+       shows a live game, never a black screen) and replace its only
+       useful side effect — blocking stray touches on the hidden canvas —
+       with pointer-events:none, which has no effect on the GPU context at
+       all. GDScript's own resize handler (_on_viewport_resized in Main.gd)
+       already debounces/coalesces rapid resize events and safely no-ops
+       its landscape-lock branch (_check_landscape() is intentionally a
+       no-op now), so letting it see the brief landscape size while the
+       overlay is up is safe. */
     @media (orientation: landscape) and (pointer: coarse) and (hover: none) {
       #rotate-lock { display:flex; }
-      #canvas, #status { display:none !important; }
+      #canvas, #status { pointer-events:none; }
     }
   </style>
+  <script>
+    // ── PERMANENT FIX: real visible height for #canvas/#status ─────────────
+    // See the long comment on #canvas above for the full "why" — short
+    // version: env(safe-area-inset-bottom) doesn't know about Android's
+    // on-screen nav bar, and plain %/vh sizing can be measured against a
+    // "toolbar hidden" viewport that's taller than what's actually on
+    // screen. window.visualViewport.height is the one value that reliably
+    // excludes both, on every browser this game targets, so we mirror it
+    // into a CSS var and let #canvas/#status consume it (see height rules
+    // above). Runs synchronously here (before body/canvas exist) so the
+    // var is already correct for the very first layout/paint — no flash
+    // of a wrong size — and again on every event that can change the
+    // visible area afterwards.
+    (function () {
+      // BUG FIX #3 (bottom bar still stuck on some Android WebViews):
+      // Real-world logs showed sessions where visualViewport.height (and
+      // even window.innerHeight) read as literally 0 on the very first
+      // call — before the WebView had actually laid out the page — and
+      // then NEVER got corrected, because that first call was the only
+      // one that ran: no 'resize'/'scroll' event ever fired afterward on
+      // that WebView, so --app-height stayed unset and #canvas silently
+      // fell back to plain `100dvh`, which does NOT know about Android's
+      // on-screen nav bar. All affected sessions in the logs carried a
+      // "; wv)" token in the UA — Android's embedded WebView, not a
+      // normal Chrome tab — which is known to fire viewport/resize
+      // events less reliably than a real browser.
+      //
+      // Fix has three parts:
+      //   1) Reject h<=0 readings (as before) but ALSO retry shortly
+      //      after via rAF + timeouts, instead of only trying once —
+      //      covers the "layout wasn't ready yet" case.
+      //   2) Add a ResizeObserver on <html> as an extra signal source.
+      //      WebViews that don't fire visualViewport resize/scroll
+      //      reliably still generally fire ResizeObserver correctly,
+      //      since it's driven by actual layout, not a separate event
+      //      pipeline.
+      //   3) A slow poll (every 1s for the first 10s, then stop) as a
+      //      last-resort safety net for the rare WebView where neither
+      //      of the above fires at all after the initial bad reading.
+      var _lastAppHeight = 0;
+      function setAppHeight() {
+        var vv = window.visualViewport;
+        var h = vv ? vv.height : window.innerHeight;
+        if (h > 0 && h !== _lastAppHeight) {
+          _lastAppHeight = h;
+          document.documentElement.style.setProperty('--app-height', h + 'px');
+        }
+        // BUG FIX (touches near the bottom bar land on the wrong Y on some
+        // phones): #canvas's CSS box height already tracks --app-height
+        // above, but Godot maps touch coordinates using the ratio between
+        // that CSS box and the canvas's actual backing-store resolution
+        // (canvas.width/height in device pixels). That backing store used
+        // to be set ONCE, at engine-init time, by a separate DPR-capping
+        // snippet (see initGodotGame below) that took a single
+        // getBoundingClientRect() snapshot and never re-read it. Whenever
+        // the nav bar height settles after that snapshot, or appears mid-
+        // session (Android's swipe-to-show gesture bar), the CSS box
+        // resizes via --app-height but the backing store doesn't — so the
+        // two go out of sync and touches map to the wrong internal Y,
+        // right in the strip where the bottom bar (Quests/Stats/
+        // Leaderboard/VS) lives. Fix: re-sync the backing store from
+        // every one of THIS function's callers too, instead of only once.
+        // syncCanvasBackingStore is defined later (needs #canvas to
+        // exist); guard for the calls that happen before that.
+        if (window._syncCanvasBackingStore) window._syncCanvasBackingStore();
+        return h;
+      }
+
+      setAppHeight();
+      // Retry quickly in case the very first call landed before the
+      // WebView had a real layout size yet (the h<=0 case from the logs).
+      requestAnimationFrame(setAppHeight);
+      setTimeout(setAppHeight, 50);
+      setTimeout(setAppHeight, 250);
+
+      if (window.visualViewport) {
+        // 'resize' covers nav bar show/hide, toolbar show/hide, keyboard
+        // open/close; 'scroll' covers iOS Safari's toolbar-collapse-on-
+        // scroll changing the visual viewport without a resize event.
+        window.visualViewport.addEventListener('resize', setAppHeight);
+        window.visualViewport.addEventListener('scroll', setAppHeight);
+      }
+      // Fallback path for the rare engine without visualViewport at all,
+      // and an extra signal alongside it for WebViews that under-fire
+      // visualViewport's own events.
+      window.addEventListener('resize', setAppHeight);
+      window.addEventListener('orientationchange', function () {
+        // orientationchange can fire a tick before the viewport actually
+        // settles at its new size on some Android builds; re-check shortly
+        // after in addition to the immediate call.
+        setAppHeight();
+        setTimeout(setAppHeight, 300);
+      });
+      document.addEventListener('DOMContentLoaded', setAppHeight);
+
+      // Extra signal source: fires on real layout changes even on
+      // WebViews that don't dispatch visualViewport resize/scroll
+      // reliably. Cheap and safe to leave running for the page's life.
+      if (window.ResizeObserver) {
+        try {
+          new ResizeObserver(function () { setAppHeight(); })
+            .observe(document.documentElement);
+        } catch (e) { /* never let a diagnostic helper break the page */ }
+      }
+
+      // Last-resort safety net: short polling window to catch the case
+      // where a WebView fires none of the above after an initial h<=0
+      // reading. Stops itself after 10s so it's not a perpetual timer.
+      var _pollCount = 0;
+      var _pollTimer = setInterval(function () {
+        _pollCount++;
+        setAppHeight();
+        if (_pollCount >= 10) clearInterval(_pollTimer);
+      }, 1000);
+    })();
+  </script>
   $GODOT_HEAD_INCLUDE
   <link rel="icon" type="image/png" sizes="192x192" href="assets/icon/ico-192.png">
   <link rel="icon" type="image/png" sizes="512x512" href="assets/icon/ico-512.png">
@@ -1007,6 +1181,154 @@
   <div>Please rotate your phone back to portrait —<br>NimJump only plays upright.</div>
 </div>
 
+<!-- BUG FIX (game shows briefly then goes black after rotating back to
+     portrait): removing display:none from #canvas (see the media query in
+     <style> above) fixed the WebGL-context-loss black screen, but exposed
+     a SECOND bug — #canvas is no longer display:none while landscape, so
+     its CSS box now actually grows to the real landscape width/height
+     (still fully hidden behind the opaque #rotate-lock overlay, but Godot
+     doesn't know that). Godot's own default canvasResizePolicy watches the
+     canvas element's real size and resizes its internal viewport/
+     framebuffer to match on every 'resize' — so it now genuinely resizes
+     itself into a landscape framebuffer while rotated, then resizes AGAIN
+     back to portrait a moment later. Main.gd's landscape-restriction logic
+     was deliberately disabled (_check_landscape() is a no-op — see that
+     function's comment), meaning nothing in GDScript ever validated that a
+     landscape-shaped viewport actually renders correctly — it doesn't:
+     the brief "comes back, then goes black" is that bad landscape resize
+     round-trip landing the renderer in a broken state.
+
+     Fix: keep #canvas's CSS box PINNED at its last known portrait size for
+     the entire time the device is physically in landscape, so neither
+     Godot's engine.js nor Main.gd's _on_viewport_resized() ever sees a
+     landscape-shaped viewport at all — same end goal the old display:none
+     approach had ("the canvas never sees a landscape size"), just without
+     touching display, so the WebGL context is never freed either.
+
+     BUG FIX #2 (safe-area padding sometimes wrong/stale after rotating
+     back): Main.gd's own _on_viewport_resized() is the ONLY thing that
+     calls _refresh_safe_area_bottom() on a rotation (see that function —
+     "rotasyonda safe-area değişebilir... bar/HUD reposition dahil"), and
+     Godot only fires that signal when the canvas's REAL measured size
+     actually changes. Freezing #canvas at the exact same pixel size the
+     whole way through a rotate-away-and-back cycle (the fix directly
+     above) means Godot now sees NO size change at all across the whole
+     cycle — so it never re-fires _on_viewport_resized(), so
+     _refresh_safe_area_bottom() never re-runs, so Main.gd keeps whatever
+     _safe_area_bottom value it had before the rotation even if the real
+     env(safe-area-inset-*) changed (landscape can have a different safe
+     area than portrait on notched phones, and JS's own
+     window._lastSafeAreaSignals — read by _refresh_safe_area_bottom() —
+     DOES keep updating live off the real env() values the whole time,
+     completely independent of our pin/unpin, since it doesn't measure the
+     canvas at all). Net effect: JS has the right numbers ready, but
+     nothing ever tells Godot to go read them again.
+     Fix: once back in portrait, force ONE genuine, Godot-visible resize —
+     nudge the canvas 1px narrower, let the browser paint that (two
+     requestAnimationFrame callbacks, so the resize-observer/next-frame
+     watcher Godot's shell uses definitely sees it as a real, separate
+     size), then restore the exact real size. Two real size changes back
+     to back — Godot's own vp.size_changed fires normally off the second
+     one, which runs its EXISTING _on_viewport_resized() →
+     _refresh_safe_area_bottom() path with fresh, correct, already-settled
+     env() values. No GDScript changes needed; this only ever nudges
+     AFTER we've confirmed the device is back in portrait, so the 1px
+     blip is not visible during the landscape/rotate-lock window. -->
+<script data-cfasync="false">
+  (function () {
+    var mq = window.matchMedia('(orientation: landscape) and (pointer: coarse) and (hover: none)');
+    var canvas = document.getElementById('canvas');
+    var statusEl = document.getElementById('status');
+    var lockedW = 0, lockedH = 0;
+
+    function captureSize() {
+      if (!canvas) return;
+      var r = canvas.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) { lockedW = r.width; lockedH = r.height; }
+    }
+
+    function pin(el) {
+      if (!el || lockedW <= 0 || lockedH <= 0) return;
+      el.style.setProperty('width',  lockedW + 'px', 'important');
+      el.style.setProperty('height', lockedH + 'px', 'important');
+    }
+
+    function unpin(el) {
+      if (!el) return;
+      el.style.removeProperty('width');
+      el.style.removeProperty('height');
+    }
+
+    // Forces Godot to observe a real, two-step size change on `canvas` so
+    // its own resize/safe-area refresh path runs — see BUG FIX #2 above.
+    //
+    // BUG FIX #2b: changing canvas.style.width/height alone does NOT make
+    // Godot notice anything — Godot's own resize handling (same as the
+    // existing syncCanvasBackingStore() code elsewhere in this file, see
+    // its "A synthetic 'resize' is ... exactly what tells Godot to re-read
+    // the canvas" comment) is driven off the window 'resize' event, not an
+    // element-level observer. A plain style mutation fires no such event
+    // by itself, so the first version of this fix silently did nothing —
+    // Godot never re-read the nudged size, so _on_viewport_resized() (and
+    // therefore _refresh_safe_area_bottom()) still never re-ran. Fix:
+    // explicitly dispatch a synthetic 'resize' right after EACH of the two
+    // size changes below, so Godot's listener actually fires each time and
+    // picks up the temporarily-different size, then the corrected real one.
+    //
+    // #status doesn't need this: it's the loading splash, not something
+    // Main.gd repositions off safe-area, and it's normally removed from
+    // the DOM (setStatusMode('hidden') → .remove()) long before a player
+    // could ever rotate their phone.
+    function fireResize() { window.dispatchEvent(new Event('resize')); }
+
+    function nudgeForRealResize() {
+      if (!canvas) return;
+      var r = canvas.getBoundingClientRect();
+      if (r.width <= 1 || r.height <= 0) return; // nothing sane to nudge from
+      var realW = r.width, realH = r.height;
+      canvas.style.setProperty('width',  (realW - 1) + 'px', 'important');
+      canvas.style.setProperty('height', realH + 'px', 'important');
+      fireResize();
+      requestAnimationFrame(function () {
+        requestAnimationFrame(function () {
+          // Restore the exact natural (calc-driven) size — removing the
+          // override rather than re-setting realW/realH means it stays
+          // correct even if the safe-area insets shifted again in the
+          // one frame we waited (e.g. address bar finished animating).
+          canvas.style.removeProperty('width');
+          canvas.style.removeProperty('height');
+          fireResize();
+        });
+      });
+    }
+
+    function apply(isLandscapeLocked) {
+      if (isLandscapeLocked) {
+        // Pin to whatever the last real portrait measurement was — taken
+        // BEFORE this function ever runs with isLandscapeLocked=true, so
+        // it's always a genuine portrait size, never a mid-rotation one.
+        pin(canvas);
+        pin(statusEl);
+        fireResize(); // keep Godot in sync with the pinned (unchanged) size immediately, don't wait for its own listener to eventually catch up
+      } else {
+        unpin(canvas);
+        unpin(statusEl);
+        // Refresh the locked size now that we're confirmed back in
+        // portrait, so the NEXT rotation pins to a fresh, current value
+        // (handles the player resizing the browser/PWA window, or a
+        // different portrait size after an OS UI change, between rotations).
+        captureSize();
+        nudgeForRealResize();
+      }
+    }
+
+    captureSize();
+    apply(mq.matches);
+    if (mq.addEventListener) mq.addEventListener('change', function (e) { apply(e.matches); });
+    else mq.addListener(function (e) { apply(e.matches); }); // Safari <14 fallback
+  })();
+</script>
+
 <!-- Best-effort real lock for browsers/PWA contexts that support it (mostly
      Android Chrome when installed to home screen). Wrapped in try/catch —
      silently does nothing where unsupported (e.g. plain iOS Safari tabs),
@@ -1434,20 +1756,115 @@ function initGodotGame() {
   GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] = false;
   GODOT_CONFIG['serviceWorker'] = '';
 
-  // Cap DPR at 1.5 to reduce GPU load on high-DPI screens
+  // Cap DPR at 1.5 to reduce GPU load on high-DPI screens.
+  //
+  // BUG FIX ("touches near the bottom bar land on the wrong Y on some
+  // phones"): this used to run exactly once, right here, taking a single
+  // getBoundingClientRect() snapshot and baking it into canvas.width/
+  // height (the backing-store resolution Godot uses to map touch
+  // coordinates). Every other height-dependent value in this file
+  // (--app-height) got retries + a ResizeObserver + polling specifically
+  // because that first snapshot can be wrong, and because "; wv)" Android
+  // WebView sessions don't reliably fire resize/scroll afterward. This
+  // snippet never got that treatment, so once the nav bar settled to its
+  // real size (or appeared mid-session via Android's swipe-to-show
+  // gesture bar) the backing store went stale relative to the visible
+  // CSS box and touch mapping drifted — worst right at the bottom strip
+  // where Quests/Stats/Leaderboard/VS live.
+  //
+  // Fix: pull the sync into a standalone function, expose it as
+  // window._syncCanvasBackingStore so the SAME retry/ResizeObserver/
+  // polling machinery driving --app-height (see setAppHeight() in the
+  // <head>) re-runs it too, and dispatch a synthetic 'resize' after any
+  // change so Godot's own input/viewport handling picks up the new size
+  // instead of only ever seeing the init-time one.
   (function() {
-    var canvas=document.getElementById('canvas'); if(!canvas) return;
-    var dpr=Math.min(window.devicePixelRatio||1, 1.5);
-    if(dpr<(window.devicePixelRatio||1)){
-      var rect=canvas.getBoundingClientRect();
-      canvas.width=Math.round(rect.width*dpr);
-      canvas.height=Math.round(rect.height*dpr);
-      if(DEV) window._earlyLog('DPR capped: '+dpr.toFixed(2)+' (native='+(window.devicePixelRatio||1).toFixed(2)+')');
+    function syncCanvasBackingStore() {
+      var canvas = document.getElementById('canvas');
+      if (!canvas) return;
+      var rect = canvas.getBoundingClientRect();
+      // Same guard as setAppHeight()'s h<=0 case: don't bake in a
+      // snapshot taken before the WebView has actually laid out yet.
+      // BUG FIX (rotation leaves the canvas zoomed into the top-left
+      // corner): a rotate transition can momentarily report rect
+      // width/height <= 0 (or an in-between size) mid-flip. This used to
+      // `return` silently with NO retry scheduled, so if that was the
+      // last resize-family event to fire, canvas.width/height stayed
+      // wrong (or stale) forever — the CSS box then resizes to the
+      // correct post-rotation size, but the backing store never gets
+      // told to catch up, which is exactly "zoomed into the top-left and
+      // stuck". Fix: schedule a short retry instead of giving up.
+      // BUG FIX (WebGL "Could not create render target, status: 36054"
+      // right at a rotation, engine then stuck/frozen): rect.width/height
+      // can land on a tiny-but-nonzero value mid-transition (e.g. 1-2px),
+      // which the old `<= 0` guard let straight through. Math.round(1 *
+      // dpr) still produces a valid-looking but near-zero backing store
+      // size; Godot then tries to build a render target/framebuffer at
+      // that size and GLES3 rejects it (status 36054 /
+      // GL_FRAMEBUFFER_INCOMPLETE_DIMENSIONS-class error), leaving the
+      // renderer in a broken state that a later correct-size resize
+      // event doesn't necessarily recover from — matches the "rotate and
+      // it's stuck zoomed into the corner" report exactly. Raise the
+      // floor from 0 to a real minimum so a garbage in-between frame is
+      // treated the same as the <=0 case: skipped and retried, never
+      // written to the canvas.
+      var MIN_BACKING_PX = 32;
+      if (rect.width <= 0 || rect.height <= 0 || rect.width < MIN_BACKING_PX || rect.height < MIN_BACKING_PX) {
+        if (!syncCanvasBackingStore._retryQueued) {
+          syncCanvasBackingStore._retryQueued = true;
+          setTimeout(function () {
+            syncCanvasBackingStore._retryQueued = false;
+            syncCanvasBackingStore();
+          }, 100);
+        }
+        return;
+      }
+      var dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+      var newW = Math.round(rect.width * dpr);
+      var newH = Math.round(rect.height * dpr);
+      if (canvas.width === newW && canvas.height === newH) return;
+      canvas.width = newW;
+      canvas.height = newH;
+      if (DEV) window._earlyLog('Canvas backing store synced: ' + newW + 'x' + newH + ' (dpr=' + dpr.toFixed(2) + ', native=' + (window.devicePixelRatio || 1).toFixed(2) + ')');
+      // Nudge the engine: Godot's viewport/input code derives its touch-
+      // to-game-coordinate ratio from canvas.width/height vs. the CSS
+      // box, but only recomputes it in response to a resize signal, not
+      // by polling the canvas element itself. A synthetic 'resize' is a
+      // no-op for setAppHeight()'s own equality check (the CSS box
+      // hasn't changed) but is exactly what tells Godot to re-read the
+      // canvas and stop mapping touches against the stale ratio.
+      window.dispatchEvent(new Event('resize'));
+      // BUG FIX cont'd: a size caught mid-transition can still be
+      // "valid" (>0) but not the FINAL post-rotation size (an
+      // intermediate frame of a CSS rotate/layout transition). One more
+      // re-check shortly after catches that case the same way
+      // orientationchange's existing 300ms re-check does — but for
+      // every trigger path, not just orientationchange.
+      if (!syncCanvasBackingStore._settleQueued) {
+        syncCanvasBackingStore._settleQueued = true;
+        setTimeout(function () {
+          syncCanvasBackingStore._settleQueued = false;
+          syncCanvasBackingStore();
+        }, 250);
+      }
     }
+    window._syncCanvasBackingStore = syncCanvasBackingStore;
+    syncCanvasBackingStore();
+
+    var canvas = document.getElementById('canvas');
+    if (!canvas) return;
     // Diagnostic: catch real WebGL context-lost events. Won't catch a hard
     // process-level crash, but if the Firefox/webview crash is a recoverable
     // context loss rather than a full process kill, this finally gives us a
     // visible log line instead of a silent reload.
+    //
+    // No reload-recovery here on purpose: the actual trigger for this event
+    // during normal play was the portrait-lock CSS hiding #canvas with
+    // display:none while rotated to landscape (see the #rotate-lock media
+    // query above) — fixed at the root by no longer doing that, so this
+    // listener should now only ever fire for a genuine GPU/driver-level
+    // loss, which is rare and worth just logging rather than silently
+    // reloading the player's game out from under them.
     canvas.addEventListener('webglcontextlost', function(e){
       e.preventDefault();
       console.error('WEBGL_CONTEXT_LOST', e);
@@ -1618,6 +2035,108 @@ function initGodotGame() {
     : 'SAFE_AREA probe-failed';
   if (DEV) window._earlyLog(_safeAreaMsg, '#0ff');
   if (window._enqueueLog) window._enqueueLog('info', _safeAreaMsg);
+
+  // ── --app-height verification ───────────────────────────────────────
+  // Same idea as the safe-area probe above, for the OTHER half of the
+  // bottom-nav-bar-covered-by-OS-nav-bar fix: logs the gap (if any)
+  // between the "naive" full CSS viewport and the real visualViewport-
+  // derived height #canvas now actually uses. A non-zero gap on a
+  // session confirms a device where the old 100%/100dvh-only sizing
+  // would have drawn the canvas taller than what's really on screen
+  // (Android nav bar, collapsed-toolbar edge case, etc.) — and that this
+  // fix is the thing correcting it, not a coincidence.
+  try {
+    var _naiveH = window.innerHeight;
+    var _realH  = window.visualViewport ? window.visualViewport.height : _naiveH;
+    var _appHeightMsg = 'APP_HEIGHT naive=' + _naiveH + ' real=' + Math.round(_realH) +
+      ' gap=' + Math.round(_naiveH - _realH);
+    if (DEV) window._earlyLog(_appHeightMsg, '#0ff');
+    if (window._enqueueLog) window._enqueueLog('info', _appHeightMsg);
+  } catch (e) { /* logging itself must never throw */ }
+
+  // ── SAFE AREA REPORT (on-screen panel) ──────────────────────────────
+  // Measures every available signal and shows them in a small on-screen
+  // panel (not just console) so this can be checked on any device
+  // without a debugger attached. IMPORTANT: this file no longer decides
+  // which signal is "the" answer — it only exposes the raw numbers via
+  // window._lastSafeAreaSignals. Godot (Main.gd:_refresh_safe_area_bottom)
+  // reads those raw numbers, applies its own plausibility filter, and
+  // logs the chosen value to the admin panel — keeping the "which signal
+  // do we trust" decision in one place instead of split between JS and
+  // GDScript, which is what let a bad signal (e.g. an inflated
+  // avail_vs_inner) get silently picked before.
+  var SHOW_SAFE_AREA_PANEL = false; // flip to false to hide the on-screen panel
+  function _measureSafeAreaSignals() {
+    var out = {};
+    try {
+      var probe = document.createElement('div');
+      probe.style.cssText = 'position:fixed;bottom:0;left:0;visibility:hidden;pointer-events:none;' +
+        'height:env(safe-area-inset-bottom,0px);';
+      document.body.appendChild(probe);
+      out.env = parseFloat(getComputedStyle(probe).height) || 0;
+      document.body.removeChild(probe);
+    } catch (e) { out.env = 0; }
+
+    out.vv_vs_inner = 0;
+    if (window.visualViewport) {
+      out.vv_vs_inner = Math.max(0, window.innerHeight - window.visualViewport.height);
+    }
+    out.vv_vs_layout = 0;
+    if (window.visualViewport) {
+      out.vv_vs_layout = Math.max(0, document.documentElement.clientHeight - window.visualViewport.height);
+    }
+    out.avail_vs_inner = 0;
+    if (window.screen && window.screen.availHeight) {
+      out.avail_vs_inner = Math.max(0, window.screen.availHeight - window.innerHeight);
+    }
+    var appHpx = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--app-height')) || 0;
+    out.apph_vs_inner = appHpx > 0 ? Math.max(0, window.innerHeight - appHpx) : 0;
+    return out;
+  }
+
+  var _safeAreaPanel = null;
+  function _renderSafeAreaPanel(sig) {
+    if (!SHOW_SAFE_AREA_PANEL) return;
+    if (!_safeAreaPanel) {
+      _safeAreaPanel = document.createElement('div');
+      _safeAreaPanel.style.cssText = 'position:fixed;top:4px;left:4px;z-index:999999;' +
+        'background:rgba(0,0,0,0.75);color:#0f0;font:10px monospace;' +
+        'padding:4px 6px;border-radius:4px;pointer-events:none;white-space:pre;';
+      document.body.appendChild(_safeAreaPanel);
+    }
+    // Raw numbers only, side by side — no "best" pick shown here anymore.
+    // Godot's own admin log (GODOT_SAFE_AREA ... -> chosen=...) is the
+    // place that shows which one actually got used, so the two logs
+    // together tell the full story: what JS measured vs what Godot chose.
+    _safeAreaPanel.textContent =
+      'env=' + sig.env.toFixed(0) +
+      ' vvIn=' + sig.vv_vs_inner.toFixed(0) +
+      ' vvLay=' + sig.vv_vs_layout.toFixed(0) +
+      ' avail=' + sig.avail_vs_inner.toFixed(0) +
+      ' appH=' + sig.apph_vs_inner.toFixed(0);
+  }
+
+  function _reportSafeArea(tag) {
+    var sig = _measureSafeAreaSignals();
+    _renderSafeAreaPanel(sig);
+    var msg = 'SAFE_AREA_REPORT[' + tag + '] env=' + sig.env.toFixed(1) +
+      ' vv_vs_inner=' + sig.vv_vs_inner.toFixed(1) +
+      ' vv_vs_layout=' + sig.vv_vs_layout.toFixed(1) +
+      ' avail_vs_inner=' + sig.avail_vs_inner.toFixed(1) +
+      ' apph_vs_inner=' + sig.apph_vs_inner.toFixed(1);
+    if (DEV) window._earlyLog(msg, '#0ff');
+    if (window._enqueueLog) window._enqueueLog('info', msg);
+    window._lastSafeAreaSignals = sig; // Godot reads the raw numbers from here
+    return sig;
+  }
+
+  _reportSafeArea('initial');
+  setTimeout(function(){ _reportSafeArea('t+300ms'); }, 300);
+  setTimeout(function(){ _reportSafeArea('t+1000ms'); }, 1000);
+  window.addEventListener('resize', function(){ _reportSafeArea('resize'); });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', function(){ _reportSafeArea('vv-resize'); });
+  }
 
   var missing=Engine.getMissingFeatures({threads:false});
   if(DEV) window._earlyLog('missing: ['+missing.join(',')+']');

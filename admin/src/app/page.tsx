@@ -16,6 +16,7 @@ import StreakTab        from "@/components/StreakTab";
 import LeaderboardTab   from "@/components/LeaderboardTab";
 import AnalyticsTab     from "@/components/AnalyticsTab";
 import SystemTab        from "@/components/SystemTab";
+
 import DatabaseTab      from "@/components/DatabaseTab";
 import VSRoomsTab       from "@/components/VSRoomsTab";
 import ErrorBoundary    from "@/components/ErrorBoundary";
@@ -36,6 +37,7 @@ const TAB_LABELS: [Tab, string][] = [
   ["vsrooms",         "VS Rooms"],
   ["players",         "Players"],
   ["streaks",         "Streaks"],
+
   ["logs",            "Logs"],
   ["system",          "System"],
   ["database",        "Database"],
@@ -238,6 +240,7 @@ export default function AdminPage() {
           {tab === "vsrooms" && (
             <VSRoomsTab />
           )}
+
 
           {tab === "system" && (
             <SystemTab />

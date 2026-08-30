@@ -134,6 +134,8 @@ var _onboarding_overlay : Control = null   # ilk açılışta bir kez gösterile
 # parented directly under Main instead of under _ui_root, so a UI
 # teardown/rebuild never touches it — it's built once and stays put.
 var _onboarding_layer   : CanvasLayer = null
+var _onboarding_panel   : PanelContainer = null   # the centred card inside _onboarding_overlay —
+													# see _reposition_onboarding()'s doc comment
 var _streak_badge      : Control = null   # lobide sürekli görünen "🔥 N" streak rozeti
 var _streak_badge_lbl  : Label   = null
 # Claimable NIM reward — see backend/game/streak_reward.go. NOT auto-paid;
@@ -182,6 +184,12 @@ const _TEX_TORCH_ON_B := preload("res://assets/pack/torch_on_b.png")
 
 # ── Backend state ──────────────────────────────────────────────────
 var _play_btn      : Button = null   # PLAY button reference
+var _settings_btn  : Button = null   # Settings button reference (start screen) — needed so
+									  # safe-area retries can reposition it without a full rebuild
+var _start_btns_sab_at_build : float = 0.0  # _safe_area_bottom value baked into _play_btn/
+											 # _settings_btn's offsets at the moment they were
+											 # built — lets _reposition_start_buttons() apply just
+											 # the delta instead of re-deriving the whole layout
 var _vs_panel      : CanvasLayer = null
 var _customize_panel : CanvasLayer = null   # hat/glasses/outfit/shoes shop — see CustomizePanel.gd
 # Cosmetics feature switch — OFF for now (placeholder art wasn't good enough,
@@ -258,6 +266,168 @@ var _vw  : float = GameConstants.VW
 var _vh  : float = GameConstants.VH
 var _ref : float = GameConstants.VW
 
+## Telefonun alt gesture/nav bar'ının (Android nav bar, iPhone home indicator)
+## kapladığı "güvenli alan" (safe-area) yüksekliği, piksel cinsinden.
+## HTML5 export'ta sayfa CSS'inin env(safe-area-inset-bottom) değerini
+## JS köprüsüyle okuyarak doldurulur; native/desktop'ta veya destek
+## olmayan tarayıcılarda 0 kalır. _build_bottom_bar bu kadar payı
+## bar'ın altına ekleyerek dokunuşların OS nav bar'ına gitmesini önler.
+var _safe_area_bottom : float = 0.0
+
+func _refresh_safe_area_bottom() -> void:
+	if not OS.has_feature("web"):
+		return
+	# BUG FIX ("kalıcı/saçma bar altı boşluk — masaüstünde"): bu pay OS'un
+	# gesture nav bar'ı / home indicator'ı için ayrılıyordu, ama aşağıdaki
+	# heuristik (en büyük makul sinyali seçmek) masaüstü tarayıcılarda da
+	# çalışıyordu — masaüstünde gerçek bir nav-bar/home-indicator hiç yok,
+	# ama tarayıcı chrome'u/zoom/devtools gibi şeylerden kaynaklanan
+	# viewport-fark sinyalleri yine de 0-140px aralığına düşüp "makul"
+	# görünebiliyor ve _sab_fill altta kalıcı, anlamsız bir boşluk olarak
+	# çiziliyordu. Dokunma/gyro desteği için zaten var olan aynı touch-
+	# cihaz kontrolünü kullanarak masaüstünde bu payı baştan 0'da tutuyoruz
+	# — JS ölçümünü bile çalıştırmaya gerek yok.
+	if not _is_touch_device():
+		_safe_area_bottom = 0.0
+		return
+	# TEK KAYNAK, KARAR GODOT'TA: index.html artık hiçbir seçim yapmıyor —
+	# sadece ham sinyalleri (env, vv_vs_inner, vv_vs_layout, avail_vs_inner,
+	# appH_vs_inner) window._lastSafeAreaSignals içine yazıyor. "Hangisi
+	# doğru" kararını burada, Godot tarafında veriyoruz: makul bir nav-bar
+	# aralığının (0-140px) DIŞINDA kalan sinyalleri (ör. avail_vs_inner'ın
+	# bazı cihazlarda status bar + nav bar toplamını ya da tamamen alakasız
+	# bir farkı raporladığı, şişirilmiş/yanlış durumlar) elemeye alıyoruz,
+	# kalanların en büyüğünü seçiyoruz. Sonucu VE tüm ham sinyalleri admin
+	# log'a (_enqueueLog üzerinden) gönderiyoruz — hangi sinyalin yanlış
+	# rapor verdiğini admin panelden görebiliriz, sadece "çalıştı/çalışmadı"
+	# değil, hangi cihazda hangi sayı çıktığını.
+	const _SAB_PLAUSIBLE_MAX := 140.0
+	var raw = JavaScriptBridge.eval("""
+		(function() {
+			var s = window._lastSafeAreaSignals || {};
+			return JSON.stringify({
+				env: s.env || 0,
+				vv_vs_inner: s.vv_vs_inner || 0,
+				vv_vs_layout: s.vv_vs_layout || 0,
+				avail_vs_inner: s.avail_vs_inner || 0,
+				apph_vs_inner: s.apph_vs_inner || 0
+			});
+		})();
+	""", true)
+	var signals := {}
+	if raw != null:
+		var parsed = JSON.parse_string(str(raw))
+		if parsed is Dictionary:
+			signals = parsed
+
+	var candidates := {
+		"env": float(signals.get("env", 0.0)),
+		"vv_vs_inner": float(signals.get("vv_vs_inner", 0.0)),
+		"vv_vs_layout": float(signals.get("vv_vs_layout", 0.0)),
+		"avail_vs_inner": float(signals.get("avail_vs_inner", 0.0)),
+		"apph_vs_inner": float(signals.get("apph_vs_inner", 0.0)),
+	}
+	var best := 0.0
+	var best_source := "none"
+	for key in candidates:
+		var v : float = candidates[key]
+		if v > best and v < _SAB_PLAUSIBLE_MAX:
+			best = v
+			best_source = key
+	_safe_area_bottom = best
+
+	# Admin log: tüm ham sinyaller + seçilen değer + hangi sinyalin
+	# seçildiği. Böylece "avail_vs_inner=340 gibi saçma bir şey raporladı,
+	# elendi, asıl vv_vs_inner=48 kullanıldı" gibi durumları admin panelden
+	# doğrudan görebiliriz.
+	var log_msg := "GODOT_SAFE_AREA env=%.0f vv_in=%.0f vv_lay=%.0f avail=%.0f apph=%.0f -> chosen=%.0f (source=%s)" % [
+		candidates.env, candidates.vv_vs_inner, candidates.vv_vs_layout,
+		candidates.avail_vs_inner, candidates.apph_vs_inner, best, best_source
+	]
+	JavaScriptBridge.eval("""
+		(function() {
+			try {
+				if (window._enqueueLog) window._enqueueLog('info', %s);
+			} catch (e) {}
+		})();
+	""" % JSON.stringify(log_msg), true)
+	# Bar zaten inşa edilmişse (ör. oyun ortasında Android nav bar aniden
+	# belirdi/kayboldu — swipe-to-show gesture bar), tam rebuild yapmadan
+	# sadece offset'lerini tazele. Panel açıkken de güvenli: sadece anchor/
+	# offset değiştiriyor, hiçbir child'ı free/create etmiyor.
+	if is_instance_valid(_bottom_bar):
+		_reposition_bottom_bar()
+
+	# PLAY/Settings butonları da bottom_bar_top_abs'e göre (dolayısıyla
+	# _safe_area_bottom'a göre) konumlanıyor — ilk ölçüm 0 gelip retry'da
+	# gerçek değer geldiğinde bu ikisi de güncellensin, yoksa start
+	# ekranında butonlar yanlış (eski, safe-area'sız) konumda takılı kalır.
+	if is_instance_valid(_play_btn) and is_instance_valid(_settings_btn):
+		_reposition_start_buttons()
+
+## Bar'ı (ve varsa nav-bar-boşluk dolgusunu) MEVCUT _vh ve _safe_area_bottom
+## değerlerine göre yeniden konumlandırır — _build_bottom_bar()'daki offset
+## formülüyle birebir aynı, ama hiçbir node'u yok edip yeniden yaratmıyor.
+## Bu yüzden oyun aktifken (_started == true) bile güvenle çağrılabilir.
+func _reposition_bottom_bar() -> void:
+	if is_instance_valid(_bottom_bar):
+		var bar_h := int(_vh * 0.09)  # _build_bottom_bar()'daki bar_h formülüyle aynı olmalı
+		var sab := _safe_area_bottom
+		_bottom_bar.set_anchor_and_offset(SIDE_BOTTOM, 1, -sab)
+		_bottom_bar.set_anchor_and_offset(SIDE_TOP,    1, -bar_h - sab)
+		if is_instance_valid(_sab_fill):
+			_sab_fill.visible = sab > 0.0
+			_sab_fill.set_anchor_and_offset(SIDE_TOP, 1, -sab)
+	# BUG FIX ("oyun içi can ikonları nav bar'ın arkasında kalıyor"): HUD
+	# _bottom_bar'dan bağımsız bir CanvasLayer, bu yüzden ayrıca güncellenmesi
+	# gerekiyor — aksi halde oyun sırasında (bottom bar zaten gizliyken) nav
+	# bar belirdiğinde/kaybolduğunda _life_panel eski (yanlış) offset'te kalır.
+	if is_instance_valid(_life_panel):
+		var M := int(_p(0.020))
+		var sab2 := _safe_area_bottom
+		_life_panel.offset_top    = -M - sab2
+		_life_panel.offset_bottom = -M - sab2
+
+## Recomputes the onboarding card's width from the CURRENT viewport (not the
+## stale one captured in _build_onboarding_overlay()) and re-applies it.
+## anchor_left/right are both 0.5 with GROW_DIRECTION_BOTH, so once
+## custom_minimum_size.x is updated the engine's own layout pass keeps the
+## card centred on the new width automatically — this only needs to push the
+## fresh width in, not compute a position by hand. Cheap no-op if the card
+## isn't open. Called from _on_viewport_resized().
+func _reposition_onboarding() -> void:
+	if not is_instance_valid(_onboarding_panel):
+		return
+	var _vp := get_viewport().get_visible_rect().size
+	var _panel_w : float = minf(_vp.x * 0.88, _vp.y * 0.95)
+	if absf(_panel_w - _onboarding_panel.custom_minimum_size.x) < 0.5:
+		return  # önemsiz bir fark — gereksiz layout churn'den kaçın
+	_onboarding_panel.custom_minimum_size = Vector2(_panel_w, _onboarding_panel.custom_minimum_size.y)
+	# Re-centre the scale/rotation pivot too, now that the real size is known
+	# again (see the matching pivot_offset comment in _build_onboarding_overlay).
+	await get_tree().process_frame
+	if is_instance_valid(_onboarding_panel):
+		var _pcmin := _onboarding_panel.get_combined_minimum_size()
+		_onboarding_panel.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
+
+
+## PLAY/Settings butonlarını (start ekranı) _build_start_ui()'de baz alınan
+## safe-area değeri ile ŞU ANKİ değer arasındaki farkı (delta) uygulayarak
+## kaydırır — tüm start ekranını yeniden inşa etmeden. Bu, ilk ölçümün 0
+## (henüz doğru değer gelmemiş) olduğu, sonra retry ile gerçek değerin
+## geldiği durumda butonların eski/yanlış konumda takılı kalmasını önler.
+func _reposition_start_buttons() -> void:
+	var delta := _safe_area_bottom - _start_btns_sab_at_build
+	if absf(delta) < 0.5:
+		return  # önemsiz bir fark — gereksiz offset churn'den kaçın
+	if is_instance_valid(_play_btn):
+		_play_btn.offset_top    -= delta
+		_play_btn.offset_bottom -= delta
+	if is_instance_valid(_settings_btn):
+		_settings_btn.offset_top    -= delta
+		_settings_btn.offset_bottom -= delta
+	_start_btns_sab_at_build = _safe_area_bottom
+
 # ── Mobile control mode ────────────────────────────────────────────
 # "tap"  = tap left/right half of screen
 # "gyro" = tilt device to control
@@ -328,7 +498,24 @@ func _ready() -> void:
 	_last_vw_real = _vw
 	_last_vh_real = _vh
 	_ref = minf(minf(_vw, _vh), GameConstants.VW)  # cap: design ref is 600x800, don't scale UI past it on big screens
+	_refresh_safe_area_bottom()  # telefon nav bar/home indicator payını erkenden oku
 	vp.size_changed.connect(_on_viewport_resized)
+
+	# BUG FIX ("refresh atınca tekrar bozuluyor"): _refresh_safe_area_bottom()
+	# burada, _ready()'nin en başında, çağrılıyor — ama tam bu anda tarayıcı
+	# genelde henüz "yerleşmemiş" oluyor: visualViewport.height bir-iki frame
+	# boyunca innerHeight'a eşit okunabiliyor (nav bar payı henüz hesaba
+	# katılmamış), _bottom_bar da henüz yok, yani _reposition_bottom_bar()
+	# hiçbir şey yapmıyor. Sonuç: _safe_area_bottom yanlışlıkla 0 olarak
+	# ölçülüyor, _build_bottom_bar() bu 0'ı bar'ın offset'lerine gömüyor,
+	# ve tarayıcı asıl doğru değeri raporlamaya başladığında artık kimse
+	# tekrar okumuyor — index.html'deki JS tarafındaki "h<=0 ise tekrar dene"
+	# fix'inin AYNISI burada da lazımdı. Birkaç frame ve kısa timeout'larla
+	# tekrar ölçüp, bar zaten inşa edilmişse offset'lerini güncelliyoruz.
+	call_deferred("_refresh_safe_area_bottom")
+	get_tree().create_timer(0.15).timeout.connect(_refresh_safe_area_bottom)
+	get_tree().create_timer(0.5).timeout.connect(_refresh_safe_area_bottom)
+	get_tree().create_timer(1.0).timeout.connect(_refresh_safe_area_bottom)
 
 	_check_landscape()
 
@@ -367,10 +554,22 @@ func _ready() -> void:
 			if (!window._touchListenerSet) {
 				window._touchListenerSet = true;
 				window._activeTouches = [];
+				// EDGE-LATCH FIX: _getTapDir() below used to read _activeTouches
+				// LIVE, at call time — same class of bug as GDScript's
+				// Input.is_action_pressed() polling (see GameManager.gd's
+				// _kb_left_pending doc comment). A touchstart immediately
+				// followed by touchend, both dispatched between two Godot
+				// ticks with no tick observing the state in between, left
+				// _activeTouches back at [] and no tick ever saw the tap.
+				// _tapPendingDir latches the touchstart side as a one-shot
+				// flag that survives until _getTapDir() actually consumes it.
+				window._tapPendingDir = 0;
 				document.addEventListener('touchstart', function(e) {
 					window._activeTouches = [];
 					for (var i = 0; i < e.touches.length; i++)
 						window._activeTouches.push(e.touches[i].clientX);
+					if (e.touches.length > 0)
+						window._tapPendingDir = (e.touches[0].clientX > window.innerWidth * 0.5) ? 1 : -1;
 				}, {passive: true});
 				document.addEventListener('touchmove', function(e) {
 					window._activeTouches = [];
@@ -611,10 +810,20 @@ func _ready() -> void:
 			window._getGyroBase = function(){ return +(window._gyroBase||0); };  // "Auto Set" reads this back after re-averaging
 			window._getTapDir  = function(){
 				var t = window._activeTouches;
-				if (!t || t.length === 0) return 0;
-				var sum = 0;
-				for (var i = 0; i < t.length; i++) sum += t[i];
-				return (sum / t.length) > window.innerWidth * 0.5 ? 1 : -1;
+				if (t && t.length > 0) {
+					// Live touch currently held — this always wins and clears
+					// any stale one-shot pending flag from an earlier tap.
+					window._tapPendingDir = 0;
+					var sum = 0;
+					for (var i = 0; i < t.length; i++) sum += t[i];
+					return (sum / t.length) > window.innerWidth * 0.5 ? 1 : -1;
+				}
+				// No touch currently active — consume the one-shot pending
+				// flag (a tap that started AND ended before this was called),
+				// exactly once, so it can't be replayed on a later call.
+				var pending = window._tapPendingDir | 0;
+				window._tapPendingDir = 0;
+				return pending;
 			};
 		""", true)
 		_js_window = JavaScriptBridge.get_interface("window")
@@ -1111,12 +1320,13 @@ func _sync_panels() -> void:
 	var has_wallet : bool   = nimiq_address != ""
 	var authed     : bool   = token != ""
 
-	for panel in [_leaderboard_panel, _quest_panel, _stats_panel, _vs_panel, _customize_panel, _streak_panel]:
+	for panel in [_leaderboard_panel, _quest_panel, _stats_panel, _vs_panel, _customize_panel, _streak_panel, _profile_card_panel]:
 		if not is_instance_valid(panel): continue
 		if panel.has_method("set_has_wallet"):     panel.call("set_has_wallet", has_wallet)
 		if panel.has_method("set_player_id"):      panel.call("set_player_id", pid)
 		if panel.has_method("set_auth_token"):     panel.call("set_auth_token", token)
 		if panel.has_method("set_auth_attempted"): panel.call("set_auth_attempted", authed)
+		if panel.has_method("set_own_address"):    panel.call("set_own_address", nimiq_address)
 
 	# Auth state may have just changed (sign-in / expiry) — refresh the VS
 	# badge so it appears right after login instead of waiting for the poll.
@@ -1157,7 +1367,18 @@ func _maybe_refresh_lobby_seed() -> void:
 	if not is_instance_valid(_gm) or _started or _lobby_reseed_in_progress:
 		return
 	var sid : String = str(_gm.get("session_id")) if _gm.get("session_id") != null else ""
-	var pending_is_guest : bool = str(_gm.get("_session_player_id")) == ""
+	# BUG FIX: this used to check _session_player_id == "" to detect "the
+	# pending lobby session is guest/unsigned" — but _session_player_id is
+	# just the nimiq wallet address, which Nimiq Pay injects and makes
+	# available almost immediately, well BEFORE the backend auth token
+	# (_auth_token) is actually obtained. So a wallet-connected-but-not-yet-
+	# signed-in lobby session had a non-empty _session_player_id even though
+	# it took the guest/local-seed branch (_current_seed_sig == "") — this
+	# check thought it was already a real signed session and skipped the
+	# reseed forever, so the first run always submitted with a blank sig and
+	# got rejected as "not counted". The actual signal for "was this seed
+	# ever issued by the server" is _current_seed_sig, not the player id.
+	var pending_is_guest : bool = str(_gm.get("_current_seed_sig")) == ""
 	if not (sid == "" or (pending_is_guest and _auth_token != "")):
 		return  # already authed (or nothing to do yet) — no-op, safe to call repeatedly
 
@@ -1574,7 +1795,15 @@ func _on_auth_failed(reason: String) -> void:
 		_auth_failed_retry_done = true
 		call_deferred("_retry_play_after_auth_failure")
 		return
-	if not _started and _play_waiting_for_auth:
+	if not _started and _play_waiting_for_auth and _has_wallet and not _no_wallet_reason:
+		# The retry above also failed — this player IS wallet-connected, so
+		# make sure they know this particular run won't be counted, instead
+		# of silently dropping it on submit later with no explanation (see
+		# bad_seed_signature handling in
+		# GameManager._send_submit_with_retry/flush_pending). This is a pure
+		# FYI, not a decision — the player already committed to Play with a
+		# wallet connected and we already retried once on their behalf, so a
+		# toast (not a blocking Yes/No) is the right weight here.
 		print("[MAIN] auth failed (%s) — starting game without wallet" % reason)
 		_play_waiting_for_auth = false
 		_auth_failed_retry_done = false
@@ -1583,15 +1812,37 @@ func _on_auth_failed(reason: String) -> void:
 		if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
 		if is_instance_valid(_stats_panel):       _stats_panel.hide_panel()
 		if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
-		if _has_wallet and not _no_wallet_reason:
-			# The retry above also failed — this player IS wallet-connected,
-			# so make sure they know this particular run won't be counted,
-			# instead of silently dropping it on submit later with no
-			# explanation (see bad_seed_signature handling in
-			# GameManager._send_submit_with_retry/flush_pending).
-			var _t := Toast.get_instance()
-			if _t: _t.show_toast("Couldn't verify your sign-in for this run — playing offline, this run may not be counted.", Toast.Kind.WARN)
+		var _t := Toast.get_instance()
+		if _t: _t.show_toast("Couldn't verify your sign-in for this run — playing offline, this run may not be counted.", Toast.Kind.WARN)
 		_do_start_game()
+	elif not _started and _play_waiting_for_auth:
+		# No wallet to authenticate with at all, or the player backed out of
+		# the sign-in prompt themselves (no_provider / user_rejected).
+		# BUG FIX ("game just starts as guest the instant you dismiss
+		# sign-in, no warning"): this used to fall straight into
+		# _do_start_game() here, same as the wallet-verify-failed branch
+		# above — so backing out of sign-in silently committed you to an
+		# uncounted guest run with zero indication anything was different.
+		# Unlike the branch above, this IS a real decision (play uncounted
+		# vs. go back and actually sign in), so it gets the same blocking
+		# Yes/No confirm dialog used elsewhere in the game (VSPanel's
+		# "Cancel match?", the Gyro-controls prompt above) instead of a
+		# toast — a toast is a passive, auto-dismissing FYI with no way to
+		# answer "no" and back out, which is exactly the wrong shape for a
+		# gate on whether the game starts at all.
+		print("[MAIN] auth failed (%s) — asking player to confirm guest play" % reason)
+		_play_waiting_for_auth = false
+		_auth_failed_retry_done = false
+		var _start_as_guest := func():
+			_started = true
+			_block_lb_replay = true
+			if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
+			if is_instance_valid(_stats_panel):       _stats_panel.hide_panel()
+			if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
+			_do_start_game()
+		UITheme.confirm_action(_ui_root, "You're not signed in",
+			"You'll play as a guest — no score saving, no earnings. Would you like to continue?",
+			"Continue", _ref, _start_as_guest, false)
 	elif not _started:
 		print("[MAIN] auth failed (%s) — background attempt, player hasn't pressed Play, staying in lobby" % reason)
 
@@ -1747,12 +1998,28 @@ func _set_nickname_async(nickname: String, token: String, on_done: Callable) -> 
 
 
 var _resize_token   : int   = 0     # BUG FIX: see _on_viewport_resized's debounce comment
+var _menu_rebuild_in_progress : bool = false  # BUG FIX: see _teardown_and_rebuild_menu_ui's doc comment — guards against two overlapping rebuilds (e.g. rotate-away-then-back firing resize events faster than one rebuild finishes)
+var _menu_rebuild_requeue      : bool = false  # set when a resize lands while a rebuild is already in progress — run one more rebuild (at the latest size) right after the current one finishes
 var _last_vw_real   : float = 0.0   # klavye olmadan son gerçek genişlik
 var _last_vh_real   : float = 0.0   # klavye olmadan son gerçek yükseklik
 var _reopen_tab_after_resize : String = ""  # tab that was open when a rotation
 											# rebuilt the UI — reopened at the new
 											# size so panels re-lay-out instead of
 											# dumping the player back to the menu
+var _reopen_customize_after_resize : bool = false  # same idea as
+											# _reopen_tab_after_resize, for
+											# CustomizePanel (not a bottom-bar tab)
+var _reopen_profile_after_resize : String = ""     # player_id being viewed when a
+											# rotation happened — ProfileCardPanel
+											# needs this to reopen (open_profile()
+											# takes a player_id, unlike show_panel())
+var _menu_rebuild_pending : bool = false  # set when a real resize/rotation happens
+											# while _started == true (menu rebuild was
+											# skipped on purpose) — consumed by
+											# _restore_lobby_ui() to rebuild the menu
+											# at the CURRENT size once the run ends,
+											# instead of leaving it stuck at whatever
+											# size it was built at before the run started
 
 func _on_viewport_resized() -> void:
 	var vp    := get_viewport()
@@ -1801,10 +2068,8 @@ func _on_viewport_resized() -> void:
 	_vw  = new_w
 	_vh  = new_h
 	_ref = minf(minf(_vw, _vh), GameConstants.VW)  # cap: design ref is 600x800, don't scale UI past it on big screens
-
-	# Oyun aktifken rebuild etme — sadece main menu / game-over ekranında yenile
-	if _started:
-		return
+	_refresh_safe_area_bottom()  # rotasyonda safe-area değişebilir (ör. landscape'te home indicator yanda) — bar/HUD reposition dahil, bkz. fonksiyon içi
+	_reposition_onboarding()  # onboarding card lives outside _ui_layer/_started's reach — see its own doc comment
 
 	# Küçük boyut değişikliklerini yoksay (klavye, status bar vs.)
 	# Sadece gerçek yönelim değişikliği (genişlik/yükseklik yer değiştirdi) rebuild yap
@@ -1814,19 +2079,58 @@ func _on_viewport_resized() -> void:
 	# İkisi de değiştiyse gerçek resize sayılır
 	var is_real_resize := (w_changed and h_changed) or (w_changed and not h_changed)
 
-	# A panel (VS/Quest/Stats/Leaderboard) is open full-screen. Its inner sizes
-	# (icons/fonts/margins) were computed once from the `ref` at open time, so a
-	# real orientation change makes that ref stale and the panel half-updates
-	# ("some elements reflow, some stay stuck"). We fix this by doing the SAME
-	# safe teardown+rebuild as the menu — free the panel first (never rebuild the
-	# menu under a still-live panel, that was task #64's crash), rebuild at the
-	# new size, then reopen the same tab (see after _build_start_ui). On a minor/
-	# keyboard-driven change we leave the open panel untouched and just sync sizes.
+	# Oyun aktifken (_started) menü/panel UI'ını burada rebuild ETMİYORUZ —
+	# oyun ortasında koca menüyü yeniden inşa etmek riskli/gereksiz. Bottom
+	# bar ve HUD (can ikonları vs.) zaten yukarıda _refresh_safe_area_bottom()
+	# → _reposition_bottom_bar() ile anlık güncellendi, o yüzden görünürdeki
+	# hiçbir şey yanlış yerde kalmıyor.
+	#
+	# BUG FIX ("ekranı çevirip oyunu bitirince menü eski/bozuk haliyle
+	# geliyor"): burada eskiden koşulsuz `return` vardı — yani _started iken
+	# gerçek bir resize/rotation olduysa (is_real_resize), menü/panel'lerin
+	# _ref'e bağlı TÜM iç boyutları (font, ikon, anchor'lar) STALE kalıyordu.
+	# Oyun bitip _restore_lobby_ui() çağrıldığında bu artık STALE menü hiç
+	# rebuild edilmeden aynen gösteriliyordu. Çözüm: burada rebuild YAPMIYORUZ
+	# ama bir flag bırakıyoruz — _restore_lobby_ui() bunu görüp lobiye
+	# dönerken GÜNCEL boyuta göre tam bir rebuild tetikleyecek.
+	if _started:
+		if is_real_resize:
+			_menu_rebuild_pending = true
+		return
+
+	# A panel (VS/Quest/Stats/Leaderboard/Streak/Customize/ProfileCard) is open
+	# full-screen. Its inner sizes (icons/fonts/margins) were computed once
+	# from the `ref` at open time, so a real orientation change makes that ref
+	# stale and the panel half-updates ("some elements reflow, some stay
+	# stuck"). We fix this by doing the SAME safe teardown+rebuild as the
+	# menu — free the panel first (never rebuild the menu under a still-live
+	# panel, that was task #64's crash), rebuild at the new size, then reopen
+	# the same panel (see after _build_start_ui). On a minor/keyboard-driven
+	# change we leave the open panel untouched and just sync sizes.
+	#
+	# BUG FIX: _customize_panel and _profile_card_panel were missing from
+	# this detection list even though _teardown_and_rebuild_menu_ui() always
+	# frees both unconditionally — so a real rotation while either was open
+	# didn't crash, but it DID silently close the panel out from under the
+	# player with no reopen, unlike every other panel here. Same bug class
+	# as the "_vs_panel missing from teardown" fix above, just one step
+	# earlier in the pipeline (detection, not teardown).
 	var _open_panel_found := false
+	var _reopen_customize   := false
+	var _reopen_profile_id  := ""
 	for panel in [_vs_panel, _quest_panel, _stats_panel, _leaderboard_panel, _streak_panel]:
 		if is_instance_valid(panel) and panel.visible:
 			_open_panel_found = true
 			break
+	if not _open_panel_found and is_instance_valid(_customize_panel) and _customize_panel.visible:
+		_open_panel_found = true
+		_reopen_customize = true
+	if not _open_panel_found and is_instance_valid(_profile_card_panel) and _profile_card_panel.visible:
+		_open_panel_found = true
+		# open_profile() needs the id back, not just "reopen with nothing" —
+		# read whatever ProfileCardPanel currently has loaded.
+		var _addr = _profile_card_panel.get("_target_address")
+		_reopen_profile_id = str(_addr) if _addr != null else ""
 
 	if _open_panel_found:
 		_vw  = new_w
@@ -1837,9 +2141,11 @@ func _on_viewport_resized() -> void:
 		# Real rotation with a panel open: remember which tab it was so we can
 		# bring it straight back at the new size after the rebuild below —
 		# "rotate and it just re-lays-out" instead of closing on the player.
-		# (_active_tab is "" for the streak/customize overlays, which aren't
-		# bottom-bar tabs — those simply close, same as before.)
+		# (_active_tab is "" for the streak/customize/profile overlays, which
+		# aren't bottom-bar tabs — those are tracked separately below.)
 		_reopen_tab_after_resize = _active_tab
+		_reopen_customize_after_resize = _reopen_customize
+		_reopen_profile_after_resize   = _reopen_profile_id
 		_last_vw_real = new_w
 		_last_vh_real = new_h
 		# fall through to the debounced teardown + rebuild
@@ -1876,6 +2182,40 @@ func _on_viewport_resized() -> void:
 	await get_tree().create_timer(0.15).timeout
 	if _my_resize_token != _resize_token:
 		return
+	_teardown_and_rebuild_menu_ui()
+
+
+## Frees the menu UI layer + any open bottom-bar panels and rebuilds them from
+## scratch at the CURRENT _vw/_vh/_ref — used by both the debounced resize
+## handler above and _restore_lobby_ui() (see _menu_rebuild_pending) for the
+## case where a resize/rotation happened while a run was in progress and the
+## rebuild had to be deferred until the player is back at the menu.
+func _teardown_and_rebuild_menu_ui() -> void:
+	# BUG FIX ("rotate away then back to normal — UI comes back completely
+	# garbled"): _build_start_ui() is a coroutine — it doesn't finish in one
+	# frame, it AWAITS internal timers (title pivot at ~0.05s, idle
+	# animations at ~0.25s more), and doesn't build the Quest/Leaderboard/
+	# Stats/Streak/Profile panels until AFTER that second timer. This
+	# function used to call it WITHOUT awaiting, then immediately (same
+	# frame) try to reopen whatever panel was open before the resize — but
+	# those panels didn't exist yet, so the reopen silently no-op'd.
+	# Worse: because nothing awaited it, a SECOND resize landing while the
+	# first _build_start_ui() was still asleep in one of those timers (a
+	# real device rotation easily fires several viewport-resize events
+	# across a few hundred ms while the OS animates the turn) would run
+	# THIS function again — freeing the _ui_layer the first, still-
+	# suspended call's local variables (title_lbl, etc.) pointed to, then
+	# building a THIRD one, with both coroutines' idle-animation tweens
+	# and member vars (_play_btn/_settings_btn/etc, reassigned by whichever
+	# call finishes last) fighting over the same freed/replaced nodes. That
+	# combination is exactly what produced the garbled-on-rotate-back
+	# symptom. Fix: a simple in-progress guard, and actually await the
+	# build before touching anything it creates.
+	if _menu_rebuild_in_progress:
+		_menu_rebuild_requeue = true  # a resize landed mid-rebuild — run once more, at the LATEST size, right after this one finishes
+		return
+	_menu_rebuild_in_progress = true
+
 	# UI'ı teardown + rebuild
 	# determinism-ok (whole block): viewport-resize UI rebuild — only reachable via
 	# vp.size_changed, which is never connected/fired during --server-replay/--server-worker.
@@ -1885,9 +2225,12 @@ func _on_viewport_resized() -> void:
 	_ui_root        = null
 	_settings_popup = null
 	_bottom_bar     = null
+	_sab_fill       = null
 	_play_btn       = null
+	_settings_btn   = null
 	if is_instance_valid(_quest_panel):      _quest_panel.free();      _quest_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.free(); _leaderboard_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
+	if is_instance_valid(_profile_card_panel): _profile_card_panel.free(); _profile_card_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_stats_panel):      _stats_panel.free();      _stats_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_streak_panel):     _streak_panel.free();     _streak_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	# BUG FIX: _vs_panel was missing from this list entirely. VSPanel is the
@@ -1901,7 +2244,18 @@ func _on_viewport_resized() -> void:
 	# from mid-typing — which is what was actually crashing the game.
 	if is_instance_valid(_vs_panel):         _vs_panel.free();         _vs_panel = null  # determinism-ok: viewport-resize rebuild, never fires headless
 	if is_instance_valid(_customize_panel):  _customize_panel.free();  _customize_panel = null  # determinism-ok: same viewport-resize rebuild as the other panels above
-	_build_start_ui()
+	# BUG FIX ("Trying to assign invalid previously freed instance" on
+	# _set_tab_color when reopening the VS tab after a rebuild): _tab_btns
+	# is a Dictionary populated by _build_bottom_bar()/_make_tab_button(),
+	# but it was never cleared here — the freed buttons from the _ui_layer
+	# above stayed in it until _build_bottom_bar() got around to overwriting
+	# each key again, ~300ms later inside _build_start_ui(). Any
+	# _set_active_tab()/_set_tab_color() call in that window (e.g. the
+	# post-rebuild "reopen the tab that was open" logic below) read a freed
+	# Button straight out of the stale dict. Clear it here so there's never
+	# a stale entry to read.
+	_tab_btns.clear()
+	await _build_start_ui()  # BUG FIX: was fire-and-forget — see doc comment above
 
 	# Bring back the panel that was open before this rotation, now rebuilt at the
 	# new orientation's size — so turning the phone re-lays-out the panel in place
@@ -1917,6 +2271,32 @@ func _on_viewport_resized() -> void:
 			"leaderboard": if is_instance_valid(_leaderboard_panel): _leaderboard_panel.call("show_panel")
 			"stats":       if is_instance_valid(_stats_panel):       _stats_panel.call("show_panel")
 			"vs":          _open_vs_panel()
+
+	# Same idea as the tab reopen above, for the two overlay panels that
+	# aren't bottom-bar tabs (_active_tab doesn't cover them). Both are
+	# built lazily by their _open_*_panel() functions, which create-if-
+	# missing then call show_panel() — exactly what we need here since
+	# _teardown_and_rebuild_menu_ui() always frees them unconditionally.
+	if _reopen_customize_after_resize:
+		_reopen_customize_after_resize = false
+		_open_customize_panel()
+	if _reopen_profile_after_resize != "":
+		var _pid := _reopen_profile_after_resize
+		_reopen_profile_after_resize = ""
+		# _build_start_ui() above already rebuilt _profile_card_panel
+		# unconditionally (via _build_quest_panel()), so it's always valid
+		# here — just feed it back the id it was showing before the rotation.
+		if is_instance_valid(_profile_card_panel):
+			_profile_card_panel.call("open_profile", _pid)
+
+	_menu_rebuild_in_progress = false
+	if _menu_rebuild_requeue:
+		# A resize landed while we were rebuilding — _vw/_vh/_ref are already
+		# the latest values (set synchronously in _on_viewport_resized before
+		# the debounce), so just run once more to lay everything out at
+		# whatever the truly-final size turned out to be.
+		_menu_rebuild_requeue = false
+		_teardown_and_rebuild_menu_ui()
 
 
 func _check_landscape() -> void:
@@ -1967,6 +2347,17 @@ func _process(_delta: float) -> void:
 
 
 ## Native mobile (Android/iOS) touch tracking
+##
+## INPUT EDGE-LATCH: also feeds _kb_left_pending/_kb_right_pending and
+## _touch_pending_dir (consumed in _get_tap_dir() below). Both
+## Input.is_action_pressed() polling AND _native_touch_x's own held-state
+## still miss a tap that starts AND ends entirely within one physics
+## catch-up burst (see the long comment on GameManager.gd's identical
+## _kb_left_pending — _native_touch_x has the exact same failure mode: a
+## touchstart followed immediately by a touchend, both delivered here
+## before any physics tick of that frame runs, leaves _native_touch_x back
+## at -1.0 with no tick ever having observed the press). Latching the press
+## edge into a one-shot pending flag guarantees at least one tick sees it.
 func _input(event: InputEvent) -> void:
 	# Audio unlock — canvas inputları gui_input'a gelmiyor olabilir
 	if not _audio_unlocked:
@@ -1974,11 +2365,16 @@ func _input(event: InputEvent) -> void:
 			_start_bgm_if_needed()
 	if event is InputEventScreenTouch:
 		if event.pressed:
-			_native_touch_x = event.position.x
+			_native_touch_x    = event.position.x
+			_touch_pending_dir = 1 if event.position.x > _vw * 0.5 else -1
 		else:
 			_native_touch_x = -1.0
 	elif event is InputEventScreenDrag:
 		_native_touch_x = event.position.x
+	if event.is_action_pressed("ui_left") or event.is_action_pressed("move_left"):
+		_kb_left_pending = true
+	if event.is_action_pressed("ui_right") or event.is_action_pressed("move_right"):
+		_kb_right_pending = true
 
 
 # ─────────────────────────────────────────────────────
@@ -2301,6 +2697,35 @@ func _ensure_gyro_js_and_await() -> bool:
 		await get_tree().create_timer(0.1).timeout
 	return false   # timed out with no answer — treat the same as denied
 
+## Whether this is a touch-capable device (phone/tablet) as opposed to a
+## desktop with a mouse. `window.DeviceOrientationEvent`/`ontouchstart`
+## existing in the DOM isn't itself proof — desktop Chrome/Firefox expose
+## both constructors even with no sensor/touchscreen behind them — so this
+## checks `navigator.maxTouchPoints` too, the same heuristic used industry-
+## wide to tell "phone/tablet" from "desktop with a mouse". Cached after the
+## first check (can't change mid-session). Backs both _gyro_selectable()
+## (below) and _refresh_safe_area_bottom()'s OS-nav-bar padding — a desktop
+## browser has neither a gyroscope nor an OS gesture bar to pad for.
+var _touch_device_cached : Variant = null   # null = not checked yet, else bool
+func _is_touch_device() -> bool:
+	if _touch_device_cached != null:
+		return _touch_device_cached
+	if not OS.has_feature("web"):
+		_touch_device_cached = true   # native/editor testing — don't block it here
+		return true
+	var r = JavaScriptBridge.eval(
+		"('ontouchstart' in window) || (navigator.maxTouchPoints > 0)", true)
+	_touch_device_cached = bool(r) if r != null else false
+	return _touch_device_cached
+
+## Whether this device can plausibly have a gyroscope at all — gates the
+## Gyro option in Settings so it isn't offered on desktop, where there's no
+## sensor to read and picking it just leads straight to a permission dialog
+## that does nothing useful (or, on browsers that don't even prompt, a
+## silently-dead control scheme).
+func _gyro_selectable() -> bool:
+	return _is_touch_device()
+
 ## Returns -1 / 0 / 1 direction; GameManager uses this value.
 func get_control_dir() -> int:
 	if _control_mode == "tap":
@@ -2309,18 +2734,36 @@ func get_control_dir() -> int:
 		return _get_gyro_dir()
 
 ## Tap left/right half of screen — touch or left mouse click
+# Edge-latch pending flags — set in _input() above, consumed (and cleared)
+# exactly once per tick here. See _input()'s doc comment for why plain
+# polling (is_action_pressed / _native_touch_x) can silently drop a fast
+# tap during a physics catch-up burst.
+var _kb_left_pending    := false
+var _kb_right_pending   := false
+var _touch_pending_dir  := 0   # one-shot: last touchstart side since this was last consumed
 func _get_tap_dir() -> int:
 	# Keyboard support (desktop / editor)
-	var l_key := Input.is_action_pressed("ui_left")  or Input.is_action_pressed("move_left")
-	var r_key := Input.is_action_pressed("ui_right") or Input.is_action_pressed("move_right")
+	var l_key := Input.is_action_pressed("ui_left")  or Input.is_action_pressed("move_left") or _kb_left_pending
+	var r_key := Input.is_action_pressed("ui_right") or Input.is_action_pressed("move_right") or _kb_right_pending
+	_kb_left_pending  = false
+	_kb_right_pending = false
 	if r_key and not l_key: return 1
 	if l_key and not r_key: return -1
 
 	# Native mobile (Android/iOS) — touch from _input
-	if not OS.has_feature("web") and _native_touch_x >= 0.0:
-		return 1 if _native_touch_x > _vw * 0.5 else -1
+	if not OS.has_feature("web"):
+		if _native_touch_x >= 0.0:
+			_touch_pending_dir = 0  # live touch always wins, drop any stale pending
+			return 1 if _native_touch_x > _vw * 0.5 else -1
+		if _touch_pending_dir != 0:
+			var d := _touch_pending_dir
+			_touch_pending_dir = 0  # one-shot — consumed
+			return d
 
 	# Web / mobile touch — pre-compiled JS getter, zero string parsing per frame
+	# (JS side has its own matching one-shot _tapPendingDir latch — see the
+	# _getTapDir() JS definition below for the DOM-event-timing equivalent
+	# of this same fix.)
 	if OS.has_feature("web"):
 		if _js_window == null:
 			return 0
@@ -2497,11 +2940,11 @@ func _build_game() -> void:
 	# ── Teardown previous build — free all game nodes before rebuilding ──────
 	# Use free() not queue_free() — new nodes are added in the same frame
 	var _nodes_to_free := [_hud, _ui_layer, _gm, _player, _replay_bar,
-		_quest_panel, _leaderboard_panel, _stats_panel, _streak_panel]
+		_quest_panel, _leaderboard_panel, _stats_panel, _streak_panel, _profile_card_panel]
 	for node in _nodes_to_free:
 		if is_instance_valid(node): node.free()  # determinism-ok: client-only UI teardown, never runs in --server-replay/--server-worker (those return before _build_game() is ever called)
 	_hud = null; _ui_layer = null; _gm = null; _player = null
-	_replay_bar = null; _quest_panel = null; _leaderboard_panel = null; _stats_panel = null; _streak_panel = null
+	_replay_bar = null; _quest_panel = null; _leaderboard_panel = null; _stats_panel = null; _streak_panel = null; _profile_card_panel = null
 	_powerup_row = null
 	# Free all CanvasLayers except landscape/calib overlays
 	for child in get_children().duplicate():
@@ -2628,8 +3071,13 @@ func _build_game() -> void:
 	_life_panel = PanelContainer.new()
 	_life_panel.anchor_left   = 0.0; _life_panel.anchor_top    = 1.0
 	_life_panel.anchor_right  = 0.0; _life_panel.anchor_bottom = 1.0
-	_life_panel.offset_left   = M;   _life_panel.offset_top    = -M
-	_life_panel.offset_right  = M;   _life_panel.offset_bottom = -M
+	# BUG FIX ("can ikonları telefonun nav bar'ının arkasında kalıyor/kaplıyor"):
+	# bu panel eskiden sadece sabit M marjıyla en alta yapıştırılıyordu —
+	# _safe_area_bottom hiç hesaba katılmıyordu, o yüzden Android gesture bar
+	# veya iPhone home indicator can ikonlarının üstüne biniyordu. Bottom bar
+	# için zaten var olan _safe_area_bottom payını burada da ekliyoruz.
+	_life_panel.offset_left   = M;   _life_panel.offset_top    = -M - _safe_area_bottom
+	_life_panel.offset_right  = M;   _life_panel.offset_bottom = -M - _safe_area_bottom
 	_life_panel.grow_horizontal = Control.GROW_DIRECTION_END
 	_life_panel.grow_vertical   = Control.GROW_DIRECTION_BEGIN
 	UITheme.apply_panel(_life_panel)
@@ -3386,7 +3834,15 @@ func _build_start_ui() -> void:
 	# instead of a fixed offset from the screen edge that left them uneven.
 	var sel_bottom_abs     : float = _vh * 0.5 + sel_pc.offset_bottom
 	var bottom_bar_h       : float = _vh * 0.09  # must match _build_bottom_bar()'s bar_h formula
-	var bottom_bar_top_abs : float = _vh - bottom_bar_h
+	# BUG FIX: bottom_bar_top_abs didn't account for _safe_area_bottom —
+	# the bottom bar itself shifts up by that amount on devices with an
+	# Android on-screen nav bar (see _build_bottom_bar/_reposition_bottom_bar),
+	# so its actual top edge is higher than this formula assumed. Without
+	# this, PLAY/Settings could end up spaced against the bar's OLD
+	# (un-shifted) position — inconsistent gap, or worse, closer to the bar
+	# than intended on nav-bar devices.
+	var bottom_bar_top_abs : float = _vh - bottom_bar_h - _safe_area_bottom
+	_start_btns_sab_at_build = _safe_area_bottom
 	var block_h            : float = play_h + gap + set_h
 	# BUG FIX: on an extreme resize (very short window — someone dragging a
 	# desktop window's corner into a tall/thin or short/wide shape) this
@@ -3405,19 +3861,19 @@ func _build_start_ui() -> void:
 	var base_bottom := int(block_top_abs + block_h - _vh)
 
 	# Settings — bottom
-	var settings_btn := Button.new()
-	settings_btn.text = "Settings"
-	settings_btn.add_theme_font_size_override("font_size", int(_p(0.055)))
-	settings_btn.custom_minimum_size = Vector2(btn_w, set_h)
-	settings_btn.anchor_left   = 0.5; settings_btn.anchor_right  = 0.5
-	settings_btn.anchor_top    = 1.0; settings_btn.anchor_bottom = 1.0
-	settings_btn.offset_left   = -btn_w * 0.5
-	settings_btn.offset_right  =  btn_w * 0.5
-	settings_btn.offset_bottom = base_bottom
-	settings_btn.offset_top    = base_bottom - set_h
-	settings_btn.pressed.connect(_open_settings)
-	UITheme.apply_ghost_button(settings_btn)
-	_ui_root.add_child(settings_btn)
+	_settings_btn = Button.new()
+	_settings_btn.text = "Settings"
+	_settings_btn.add_theme_font_size_override("font_size", int(_p(0.055)))
+	_settings_btn.custom_minimum_size = Vector2(btn_w, set_h)
+	_settings_btn.anchor_left   = 0.5; _settings_btn.anchor_right  = 0.5
+	_settings_btn.anchor_top    = 1.0; _settings_btn.anchor_bottom = 1.0
+	_settings_btn.offset_left   = -btn_w * 0.5
+	_settings_btn.offset_right  =  btn_w * 0.5
+	_settings_btn.offset_bottom = base_bottom
+	_settings_btn.offset_top    = base_bottom - set_h
+	_settings_btn.pressed.connect(_open_settings)
+	UITheme.apply_ghost_button(_settings_btn)
+	_ui_root.add_child(_settings_btn)
 
 	# PLAY — above Settings
 	_play_btn = Button.new()
@@ -3465,39 +3921,63 @@ func _build_start_ui() -> void:
 		var _set_h2 := int(_p(0.080))
 		var _play_h2 := int(_p(0.105))
 		var _gap2 := int(_p(0.034))   # must match `gap` above
-		intro.tween_property(settings_btn, "offset_top",    _base - _set_h2,              0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(settings_btn, "offset_bottom", _base,                         0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_settings_btn, "offset_top",    _base - _set_h2,              0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_settings_btn, "offset_bottom", _base,                         0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 		intro.tween_property(_play_btn, "offset_top",    _base - _set_h2 - _gap2 - _play_h2, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 		intro.tween_property(_play_btn, "offset_bottom", _base - _set_h2 - _gap2,            0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
 	# ── Idle animations (start after intro) ──────────────────
 	await get_tree().create_timer(0.25).timeout
 
-	# Title breathes — scale on label with pivot at centre
-	# pivot_offset was set above after the first process frame
-	_title_tw = create_tween()
-	if _title_tw:
-		_title_tw.set_loops()
-		_title_tw.tween_property(title_lbl, "scale", Vector2(1.05, 1.05), 0.9).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		_title_tw.tween_property(title_lbl, "scale", Vector2(0.95, 0.95), 0.9).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-	# Keep pivot centred if window resizes
-	title_lbl.resized.connect(func(): title_lbl.pivot_offset = title_lbl.size * 0.5)
+	# BUG FIX (resize crash: "Cannot call method 'set_trans' on a null
+	# value" from this exact tween_property chain): this function suspends
+	# here for 0.25s. If the window/viewport resizes during that wait,
+	# _on_viewport_resized() tears down and rebuilds the whole start UI —
+	# _ui_layer.free() frees title_lbl/_play_btn/sel_pc (locals captured by
+	# this closure) along with everything else. When this coroutine
+	# resumes, those still point at freed Objects; create_tween() itself
+	# may succeed (this Main node is still in the tree), but
+	# tween_property() on a freed target returns null, and the chained
+	# .set_trans() call on that null is exactly what crashed.
+	#
+	# IMPORTANT: this must NOT be an early `return` — _build_settings_popup(),
+	# _build_bottom_bar(), _build_quest_panel(), _build_streak_badge() etc.
+	# all run further down in this same function, after the idle-animation
+	# block below, and are NOT stale (they don't reference these captured
+	# locals, they build fresh nodes). Returning early would silently skip
+	# building the settings popup/bottom bar/quest panel/streak badge on
+	# any rebuild that raced with the 0.25s wait — a strictly worse bug
+	# than a skipped idle animation. So: only the three tween blocks are
+	# conditional, everything after them still runs unconditionally.
+	var _idle_targets_valid := is_instance_valid(self) and is_inside_tree() \
+		and is_instance_valid(title_lbl) and is_instance_valid(_play_btn) and is_instance_valid(sel_pc)
 
-	# PLAY button glows
-	_play_tw = create_tween()
-	if _play_tw:
-		_play_tw.set_loops()
-		_play_tw.tween_property(_play_btn, "modulate", Color(1.0, 1.0, 0.75, 1.0), 0.55).set_trans(Tween.TRANS_SINE)
-		_play_tw.tween_property(_play_btn, "modulate", Color(1.0, 1.0, 1.0,  1.0), 0.55).set_trans(Tween.TRANS_SINE)
+	if _idle_targets_valid:
+		# Title breathes — scale on label with pivot at centre
+		# pivot_offset was set above after the first process frame
+		_title_tw = create_tween()
+		if _title_tw:
+			_title_tw.set_loops()
+			_title_tw.tween_property(title_lbl, "scale", Vector2(1.05, 1.05), 0.9).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+			_title_tw.tween_property(title_lbl, "scale", Vector2(0.95, 0.95), 0.9).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		# Keep pivot centred if window resizes
+		title_lbl.resized.connect(func(): title_lbl.pivot_offset = title_lbl.size * 0.5)
 
-	# Character selector bobs up and down slightly
-	_sel_tw = create_tween()
-	if _sel_tw:
-		_sel_tw.set_loops()
-		_sel_tw.tween_property(sel_pc, "offset_top",    sel_pc.offset_top    - int(_p(0.012)), 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		_sel_tw.tween_property(sel_pc, "offset_bottom", sel_pc.offset_bottom - int(_p(0.012)), 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		_sel_tw.tween_property(sel_pc, "offset_top",    sel_pc.offset_top,                     0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
-		_sel_tw.tween_property(sel_pc, "offset_bottom", sel_pc.offset_bottom,                  0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+		# PLAY button glows
+		_play_tw = create_tween()
+		if _play_tw:
+			_play_tw.set_loops()
+			_play_tw.tween_property(_play_btn, "modulate", Color(1.0, 1.0, 0.75, 1.0), 0.55).set_trans(Tween.TRANS_SINE)
+			_play_tw.tween_property(_play_btn, "modulate", Color(1.0, 1.0, 1.0,  1.0), 0.55).set_trans(Tween.TRANS_SINE)
+
+		# Character selector bobs up and down slightly
+		_sel_tw = create_tween()
+		if _sel_tw:
+			_sel_tw.set_loops()
+			_sel_tw.tween_property(sel_pc, "offset_top",    sel_pc.offset_top    - int(_p(0.012)), 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+			_sel_tw.tween_property(sel_pc, "offset_bottom", sel_pc.offset_bottom - int(_p(0.012)), 0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+			_sel_tw.tween_property(sel_pc, "offset_top",    sel_pc.offset_top,                     0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+			_sel_tw.tween_property(sel_pc, "offset_bottom", sel_pc.offset_bottom,                  0.7).set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
 
 	_build_settings_popup()
 	_build_bottom_bar()
@@ -3536,8 +4016,10 @@ func _build_start_ui() -> void:
 # ─────────────────────────────────────────────────────
 
 var _bottom_bar        : Control
+var _sab_fill          : Control = null  # nav-bar-boşluk dolgusu — _reposition_bottom_bar() bunu da günceller
 var _quest_panel       : CanvasLayer
 var _leaderboard_panel : CanvasLayer
+var _profile_card_panel : CanvasLayer
 var _stats_panel       : CanvasLayer
 var _streak_panel      : CanvasLayer   # opened by tapping the lobby streak badge — see _on_streak_badge_input
 var _active_tab        : String = ""
@@ -3557,12 +4039,36 @@ func _build_bottom_bar() -> void:
 	bb_st.corner_radius_bottom_left  = 0
 	bb_st.corner_radius_bottom_right = 0
 	_bottom_bar.add_theme_stylebox_override("panel", bb_st)
+	# Telefonun alt gesture/nav bar'ı (Android nav bar, iPhone home indicator)
+	# sayfanın en altına biniyor ve dokunuşları oyun yerine OS/tarayıcıya
+	# yönlendiriyor. _safe_area_bottom (CSS env(safe-area-inset-bottom)'dan
+	# okunur) kadar payı bar'ın altına ekleyerek bar'ı nav bar'ın ÜSTÜNE
+	# taşıyoruz — böylece tüm buton alanı gerçekten tıklanabilir kalıyor.
+	var sab := _safe_area_bottom
 	_bottom_bar.set_anchor_and_offset(SIDE_LEFT,   0, 0)
 	_bottom_bar.set_anchor_and_offset(SIDE_RIGHT,  1, 0)
-	_bottom_bar.set_anchor_and_offset(SIDE_BOTTOM, 1, 0)
-	_bottom_bar.set_anchor_and_offset(SIDE_TOP,    1, -bar_h)
+	_bottom_bar.set_anchor_and_offset(SIDE_BOTTOM, 1, -sab)
+	_bottom_bar.set_anchor_and_offset(SIDE_TOP,    1, -bar_h - sab)
 	_bottom_bar.z_index = 20
 	_ui_root.add_child(_bottom_bar)
+
+	# Nav bar ile bar arasında kalan boşluğu da aynı bej renkle doldur, ki
+	# ekranın en altı OS'un koyu/şeffaf nav bar'ı yerine oyunun teması gibi
+	# görünsün (aksi halde iki renk arasında çirkin bir "kesik" oluşurdu).
+	# Not: sab şu an 0 olsa bile bu node'u önceden yaratıyoruz — nav bar
+	# oyun ortasında sonradan belirirse (Android gesture-bar swipe-to-show),
+	# _reposition_bottom_bar() sadece visible/offset günceller, node'u
+	# sıfırdan yaratmaya gerek kalmaz.
+	_sab_fill = ColorRect.new()
+	_sab_fill.color = Color(0.957, 0.898, 0.800)
+	_sab_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_sab_fill.visible = sab > 0.0
+	_sab_fill.set_anchor_and_offset(SIDE_LEFT,   0, 0)
+	_sab_fill.set_anchor_and_offset(SIDE_RIGHT,  1, 0)
+	_sab_fill.set_anchor_and_offset(SIDE_BOTTOM, 1, 0)
+	_sab_fill.set_anchor_and_offset(SIDE_TOP,    1, -sab)
+	_sab_fill.z_index = 19
+	_ui_root.add_child(_sab_fill)
 
 	var row := HBoxContainer.new()
 	row.alignment             = BoxContainer.ALIGNMENT_CENTER
@@ -3694,7 +4200,12 @@ func _make_tab_button(lucide_name: String, label: String, tab_id: String) -> But
 
 
 func _set_tab_color(tab_id: String, active_id: String) -> void:
+	if not _tab_btns.has(tab_id):
+		return
 	var btn : Button = _tab_btns[tab_id]
+	if not is_instance_valid(btn):  # defensive: see _tab_btns.clear() in _teardown_and_rebuild_menu_ui()
+		_tab_btns.erase(tab_id)
+		return
 	var col := Color(0.780, 0.380, 0.120) if tab_id == active_id else Color(0.480, 0.340, 0.200)
 	if btn.has_meta("lucide_icon"):
 		var ic : TextureRect = btn.get_meta("lucide_icon")
@@ -3847,6 +4358,9 @@ func _build_vs_panel() -> void:
 	# the bottom-bar "VS" tab again) left that tab looking permanently active.
 	_vs_panel.connect("closed", func(): _deactivate_tab())
 	_vs_panel.connect("connect_requested", _request_wallet_connect)
+	_vs_panel.connect("profile_requested", func(player_id: String):
+		if is_instance_valid(_profile_card_panel):
+			_profile_card_panel.call("open_profile", player_id))
 	_sync_panels()
 
 
@@ -3955,6 +4469,20 @@ func _build_quest_panel() -> void:
 	_leaderboard_panel.connect("closed", func(): _deactivate_tab())
 	_leaderboard_panel.connect("replay_requested", _on_leaderboard_replay_requested)
 	# LeaderboardPanel handles wallet connection internally via NimiqJS.request_account
+
+	# Profile card — opened from either LeaderboardPanel (tap a row) or
+	# VSPanel (tap an opponent avatar). Both emit the same profile_requested
+	# signal; this single panel is the shared entry point (open_profile()).
+	_profile_card_panel = CanvasLayer.new()
+	_profile_card_panel.set_script(load("res://scripts/ProfileCardPanel.gd"))
+	_profile_card_panel.layer = 20  # above leaderboard/VS (15/16) so it shows on top
+	add_child(_profile_card_panel)
+	_profile_card_panel.call("setup")
+	_profile_card_panel.connect("closed", func(): _profile_card_panel.call("hide_panel"))
+	_profile_card_panel.connect("replay_requested", _on_leaderboard_replay_requested)
+	_profile_card_panel.connect("connect_requested", _request_wallet_connect)
+	_leaderboard_panel.connect("profile_requested", func(player_id: String):
+		_profile_card_panel.call("open_profile", player_id))
 
 	# Stats panel — reads from localStorage
 	_stats_panel = CanvasLayer.new()
@@ -4073,7 +4601,12 @@ func _build_settings_popup() -> void:
 	const ICON_ORANGE := Color(0.780, 0.380, 0.120)  # oyunun asıl turuncusu
 
 	# ── Main popup: above bottom bar, upper part of screen ──
-	var bar_h  := _vh * 0.09
+	# BUG FIX: bar_h/center_y hesaplaması _safe_area_bottom'ı hiç hesaba
+	# katmıyordu — alt bar artık (Android nav bar payı kadar) yukarı kaymış
+	# durumda, bu popup'ın "bar'ın üstü" hesabı da aynı payı düşmeli, yoksa
+	# bar ile popup arasında (nav bar'lı cihazlarda) tutarsız bir boşluk
+	# oluşuyor.
+	var bar_h  := _vh * 0.09 + _safe_area_bottom
 	var margin := _vh * 0.02
 	var pw     := _p(0.88)
 	var ph     := minf(_vh * 0.74, _vh - bar_h - margin * 2.0)
@@ -4523,6 +5056,19 @@ func _build_settings_popup() -> void:
 	gyro_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	ctrl_row.add_child(gyro_btn)
 
+	# BUG FIX: Gyro was selectable on desktop — there's no sensor to read
+	# there, so picking it just opened a dead-end permission prompt (or
+	# nothing at all on browsers that don't prompt) with no way back except
+	# manually switching back to Tap. Desktop/no-touch devices now only see
+	# Tap: hide the Gyro button, its info text, and its calibration row
+	# entirely, and force _control_mode back to "tap" if a stale save
+	# somehow has it set to "gyro" on a device that can't use it.
+	var _gyro_ok := _gyro_selectable()
+	gyro_btn.visible = _gyro_ok
+	if not _gyro_ok and _control_mode == "gyro":
+		_control_mode = "tap"
+		_save_settings()
+
 	var tap_info := Label.new()
 	tap_info.text = "Tap the left or right half of the screen to move that direction."
 	tap_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -4623,8 +5169,8 @@ func _build_settings_popup() -> void:
 		_warm_btn_st(tap_btn,  is_gyro)      # ghost when NOT the active mode
 		_warm_btn_st(gyro_btn, not is_gyro)
 		tap_info.visible  = not is_gyro
-		gyro_info.visible = is_gyro
-		calib_row.visible = is_gyro
+		gyro_info.visible = is_gyro and _gyro_ok
+		calib_row.visible = is_gyro and _gyro_ok
 	_refresh_ctrl_ui.call()
 
 	tap_btn.pressed.connect(func():
@@ -5055,6 +5601,12 @@ func _build_settings_popup() -> void:
 	UITheme.apply_label(about_dev, S_MID, int(_p(0.036)))
 	about_vbox.add_child(about_dev)
 
+	var about_version := Label.new()
+	about_version.text = "v1.0.1"
+	about_version.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	UITheme.apply_label(about_version, S_MID, int(_p(0.036)))
+	about_vbox.add_child(about_version)
+
 	# Make all non-interactive containers inside scroll passthrough touch events
 	# so ScrollContainer receives drag gestures regardless of where the finger lands
 	_set_containers_pass(scroll)
@@ -5444,6 +5996,14 @@ func _build_onboarding_overlay() -> void:
 	pc.grow_horizontal = Control.GROW_DIRECTION_BOTH
 	pc.grow_vertical   = Control.GROW_DIRECTION_BOTH
 	pc.custom_minimum_size = Vector2(_panel_w, 0)   # height follows content
+	# BUG FIX ("welcome card settles off-center after a desktop window
+	# resize"): custom_minimum_size.x above is a snapshot of the viewport at
+	# BUILD time. The card's anchors keep it centred on whatever that width
+	# is, live — but the width itself never updates, so after a real resize
+	# the card is still centred around a stale reference width instead of
+	# the new one. Stash both so _reposition_onboarding() (called from
+	# _on_viewport_resized) can recompute and apply the current width.
+	_onboarding_panel = pc
 	var pc_st := StyleBoxFlat.new()
 	pc_st.bg_color = OB_BG
 	pc_st.border_color = OB_BORDER
@@ -5604,6 +6164,7 @@ func _dismiss_onboarding() -> void:
 			if is_instance_valid(ovl): ovl.queue_free()
 	_onboarding_overlay = null
 	_onboarding_layer   = null
+	_onboarding_panel   = null
 
 
 func _close_settings() -> void:
@@ -6195,7 +6756,14 @@ func _do_start_game(forced_seed: int = 0) -> void:
 			# ready NOW, don't take the no-reload shortcut — force a fresh
 			# _start_session() below instead, which (being authed this time)
 			# correctly requests a real server-issued signed seed.
-			var _pending_is_guest  : bool = str(_gm.get("_session_player_id")) == ""
+			# BUG FIX: was checking _session_player_id == "" — see the matching
+			# fix + comment in _maybe_refresh_lobby_seed() above. In the Nimiq
+			# Pay flow the wallet address (and therefore _session_player_id)
+			# is populated long before _auth_token, so this never caught the
+			# common case of "pending session is unsigned, real auth is
+			# ready now" — the real signal is whether a server-issued sig was
+			# ever attached to this session.
+			var _pending_is_guest  : bool = str(_gm.get("_current_seed_sig")) == ""
 			var _authed_now        : bool = _auth_token != ""
 			if platforms_ready and is_recording and _pending_is_guest and _authed_now:
 				print("[MAIN] Play pressed — pending session was guest-generated but we're authed now, starting a fresh signed session instead of reusing it")
@@ -6873,6 +7441,18 @@ func _restore_lobby_ui() -> void:
 		_gm.set("_replay_log",         PackedByteArray())
 		_gm.set("_replay_nickname",     "")
 		_gm.set("_replay_total_ticks",  0)
+
+	# BUG FIX ("ekranı çevirip oyunu bitirince menü eski/bozuk haliyle
+	# geliyor"): oyun sırasında (_started == true) bir resize/rotation olduysa
+	# _on_viewport_resized() menü rebuild'ini bilerek atlayıp bu flag'i
+	# bırakmıştı (bkz. _menu_rebuild_pending tanımı). Şimdi lobiye dönerken
+	# menüyü GÜNCEL boyuta göre tam olarak yeniden inşa ediyoruz, ki PLAY
+	# butonu / panel anchor'ları / bottom bar hepsi doğru yerde çıksın —
+	# eskiden bu adım hiç yoktu, o yüzden menü "eski haline gelmiyordu".
+	if _menu_rebuild_pending:
+		_menu_rebuild_pending = false
+		_teardown_and_rebuild_menu_ui()
+
 	if is_instance_valid(_ui_layer):
 		_ui_layer.visible = true
 	if is_instance_valid(_ui_root):
@@ -7272,7 +7852,7 @@ func _build_replay_bar() -> void:
 	# height for as long as this bar is showing; _exit_replay_ui() puts it
 	# back down to its normal margin when the replay bar closes.
 	if is_instance_valid(_life_panel):
-		var lifted_offset := -(int(_p(0.020)) + int(bar_h))
+		var lifted_offset := -(int(_p(0.020)) + int(bar_h) + int(_safe_area_bottom))
 		_life_panel.offset_top    = lifted_offset
 		_life_panel.offset_bottom = lifted_offset
 
@@ -7385,18 +7965,39 @@ void fragment() {
 	ps.corner_radius_bottom_left  = 0
 	ps.corner_radius_bottom_right = 0
 	panel_bg.add_theme_stylebox_override("panel", ps)
+	# BUG FIX: this panel used to anchor flush to offset_bottom=0.0, with no
+	# _safe_area_bottom allowance — same class of bug as the main bottom bar
+	# (see _build_bottom_bar), just never ported over here. On an Android
+	# WebView with an on-screen gesture/nav bar, that put the seek bar and
+	# play/pause/skip buttons partly or fully under the nav bar, unreachable.
+	# Lifting by the same sab used everywhere else keeps this consistent.
+	var sab_rb := _safe_area_bottom
 	panel_bg.anchor_left    = 0.0; panel_bg.anchor_right  = 1.0
 	panel_bg.anchor_top     = 1.0; panel_bg.anchor_bottom = 1.0
-	panel_bg.offset_top     = -bar_h
-	panel_bg.offset_bottom  = 0.0
+	panel_bg.offset_top     = -bar_h - sab_rb
+	panel_bg.offset_bottom  = -sab_rb
 	panel_bg.mouse_filter   = Control.MOUSE_FILTER_STOP
 	root.add_child(panel_bg)
+
+	# Fill the gap between the panel and the true screen edge with the same
+	# bar color, so the WebView's nav-bar-inset area doesn't show a black/
+	# transparent strip under the replay controls (same idea as _sab_fill
+	# for the main bottom bar).
+	if sab_rb > 0.0:
+		var rb_sab_fill := ColorRect.new()
+		rb_sab_fill.color = C_BG
+		rb_sab_fill.mouse_filter = Control.MOUSE_FILTER_IGNORE
+		rb_sab_fill.anchor_left = 0.0; rb_sab_fill.anchor_right = 1.0
+		rb_sab_fill.anchor_top = 1.0; rb_sab_fill.anchor_bottom = 1.0
+		rb_sab_fill.offset_top = -sab_rb
+		rb_sab_fill.offset_bottom = 0.0
+		root.add_child(rb_sab_fill)
 
 	var content := VBoxContainer.new()
 	content.anchor_left   = 0.0; content.anchor_right  = 1.0
 	content.anchor_top    = 1.0; content.anchor_bottom = 1.0
-	content.offset_top    = -bar_h + pad_top
-	content.offset_bottom = -pad_bot
+	content.offset_top    = -bar_h + pad_top - sab_rb
+	content.offset_bottom = -pad_bot - sab_rb
 	content.offset_left   = pad_x
 	content.offset_right  = -pad_x
 	content.add_theme_constant_override("separation", int(pad_sep))

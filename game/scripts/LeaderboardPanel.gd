@@ -4,6 +4,12 @@ extends CanvasLayer
 
 signal closed
 signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int, address: String, gyro_active: bool)
+## Emitted when the player taps a leaderboard row (anywhere except the
+## replay button, which keeps its own action) — Main.gd listens for this on
+## both LeaderboardPanel and VSPanel and opens the same ProfileCardPanel
+## either one connects to, so "click a player -> see their profile card"
+## behaves identically everywhere in the app.
+signal profile_requested(player_id: String)
 
 var BACKEND_URL : String = ApiConfig.base_url()   # resolved at runtime (same origin on web)
 const UITheme     := preload("res://scripts/UITheme.gd")
@@ -167,7 +173,7 @@ func _build_ui() -> void:
 	)
 	_panel_ctrl.add_child(dim)
 
-	var pw := ref * 0.92   # FIX: vw yerine ref — büyük ekranda genişlemeyi önler
+	var pw := ref * 0.92   # FIX: ref instead of vw — prevents it growing too wide on large screens
 	var ph := minf(vh * 0.88, vh - int(ref * 0.04) * 2.0)
 
 	var pc := PanelContainer.new()
@@ -396,7 +402,7 @@ func _fetch_lb(_retry: bool = false) -> void:
 	http.request(ApiConfig.sign_url(BACKEND_URL + "/backend/leaderboard?period=%s&limit=10" % _cur_period))
 
 
-## ── Warm bej buton helper'ları ─────────────────────────────────────────────
+## ── Warm beige button helpers ────────────────────────────────────────────
 
 static func _warm_btn(btn: Button, r: float = 8.0) -> void:
 	var ri := int(r)
@@ -618,6 +624,30 @@ func _build_list(data: Variant) -> void:
 		row_pc.add_theme_stylebox_override("panel", row_st)
 		_list_root.add_child(row_pc)
 
+		# ── Tap row → open profile card ──────────────────────────────────
+		# Same press/release-distance gesture as VSPanel's card tap (see
+		# VSPanel.gd's _build_room_card): only counts as a click if the
+		# release stays close to the press point, so a scroll-drag through
+		# the list is never mistaken for opening a profile. The replay
+		# button (added below, if present) is its own Button and consumes
+		# its own clicks first, so this doesn't steal that tap.
+		row_pc.mouse_filter = Control.MOUSE_FILTER_STOP
+		row_pc.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+		var _row_address := address
+		var _press_gpos := [Vector2.ZERO]
+		var _armed := [false]
+		row_pc.gui_input.connect(func(ev: InputEvent):
+			if _row_address == "": return
+			if ev is InputEventMouseButton and ev.button_index == MOUSE_BUTTON_LEFT:
+				if ev.pressed:
+					_press_gpos[0] = ev.global_position
+					_armed[0] = true
+				elif _armed[0]:
+					_armed[0] = false
+					if ev.global_position.distance_to(_press_gpos[0]) < ref * 0.045:
+						profile_requested.emit(_row_address)
+		)
+
 		var row_mc := _make_margin(pad)
 		row_pc.add_child(row_mc)
 
@@ -659,7 +689,7 @@ func _build_list(data: Variant) -> void:
 		row.add_child(score_lbl)
 
 		var prize_str := (str(snappedf(float(prize), 0.0001))) if prize > 0 else "-"
-		var prize_col := Color(0.820, 0.580, 0.100) if prize > 0 else _C_MID  # altın
+		var prize_col := Color(0.820, 0.580, 0.100) if prize > 0 else _C_MID  # gold
 		var prize_lbl := _make_col_label(prize_str, ref, 0.13, prize_col, prize > 0)
 		prize_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 		row.add_child(prize_lbl)
@@ -699,9 +729,50 @@ func _build_list(data: Variant) -> void:
 			_replay_icon_btn(rp_btn, rp_size)
 			rp_btn.pressed.connect(_fetch_and_emit_replay.bind(session_id_e, rp_btn))
 			row.add_child(rp_btn)
+
+			# Copy/share a direct link to this entry's replay (ApiConfig.replay_url)
+			# so the viewer can send it on, same Web Share/clipboard path as
+			# Main.gd's Share Score button and VSPanel's invite link.
+			var link_btn := Button.new()
+			link_btn.visible = false
+			link_btn.text = ""
+			# BUG FIX: "link-2.png" isn't actually present in the exported
+			# lucide icon set, so this always fell through to the emoji
+			# fallback below — and unlike the desktop editor (which
+			# substitutes a system emoji font for missing glyphs), the
+			# web/HTML5 export has no emoji glyph support at all, so "🔗"
+			# rendered as a broken/missing glyph there specifically (this is
+			# why it looked fine everywhere except web). Try a couple of
+			# plausible lucide filenames, and if none exist, fall back to a
+			# plain "LINK" text label instead of an emoji — that always
+			# renders through the same font-fallback chain
+			# UITheme._apply_pixel_font sets up for every other label.
+			var _link_candidates : Array[String] = ["link-2", "link", "external-link"]
+			var _link_ic := ""
+			for _cand in _link_candidates:
+				var _p : String = UITheme.LUCIDE_PATH + _cand + ".png"
+				if ResourceLoader.exists(_p):
+					_link_ic = _p
+					break
+			if _link_ic != "":
+				link_btn.icon = load(_link_ic)
+				link_btn.expand_icon = true
+				link_btn.icon_alignment          = HORIZONTAL_ALIGNMENT_CENTER
+				link_btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_CENTER
+				link_btn.add_theme_constant_override("icon_max_width", int(rp_size * 0.5))
+			else:
+				link_btn.text = "LINK"
+				UITheme._apply_pixel_font(link_btn)
+				link_btn.add_theme_font_size_override("font_size", int(ref * 0.016))
+			link_btn.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+			link_btn.size_flags_horizontal = Control.SIZE_SHRINK_END
+			_replay_icon_btn(link_btn, rp_size)
+			link_btn.tooltip_text = "Copy replay link"
+			# DISABLED: link_btn.pressed.connect(func(): _share_replay_link(session_id_e))
+			row.add_child(link_btn)
 		else:
 			var spacer := Control.new()
-			spacer.custom_minimum_size = Vector2(int(ref * 0.056), 0)
+			spacer.custom_minimum_size = Vector2(int(ref * 0.056 * 2 + ref * 0.006), 0)
 			row.add_child(spacer)
 
 	UITheme.set_scroll_passthrough(_list_root)
@@ -927,6 +998,17 @@ func _apply_png_base64(target: TextureRect, data_url: String) -> void:
 	if img.load_png_from_buffer(bytes) != OK: return
 	if is_instance_valid(target):
 		target.texture = ImageTexture.create_from_image(img)
+
+
+## Copies/shares a leaderboard entry's replay link (ApiConfig.replay_url) so
+## the viewer can send it on directly — same Web Share API / clipboard-
+## fallback path VSPanel's invite link and Main.gd's Share Score button
+## already use.
+func _share_replay_link(session_id: String) -> void:
+	if session_id == "":
+		return
+	var url := ApiConfig.replay_url(session_id)
+	ApiConfig.share_link("Watch this replay:", url)
 
 
 func _fetch_and_emit_replay(session_id_e: String, btn: Button) -> void:

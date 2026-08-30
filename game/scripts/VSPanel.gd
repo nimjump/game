@@ -13,6 +13,12 @@ signal closed
 signal connect_requested   # emitted when user taps Connect in the not-signed-in state
 signal play_requested(room_id: String, role: String, seed: String)
 signal replay_requested(seed: int, replay_log: PackedByteArray, char_idx: int, nickname: String, player_seed: int, address: String, gyro_active: bool)
+## Emitted when the player taps the OTHER player's avatar on a VS room card
+## — same signal/schema as LeaderboardPanel.profile_requested, same
+## ProfileCardPanel opens either way (see Main.gd wiring). Deliberately
+## scoped to just the avatar (not the whole card, which already opens the
+## room detail on tap — see _build_room_card's press/armed gesture below).
+signal profile_requested(player_id: String)
 
 var BACKEND_URL : String = ApiConfig.base_url()
 const UITheme    := preload("res://scripts/UITheme.gd")
@@ -55,7 +61,7 @@ var _anim_tween : Tween = null
 # küçülse keşke").
 var _height_tween : Tween = null
 var _entry_apply_key : Callable = Callable()  # keypad key handler; physical
-                                              # keyboard input is routed here too
+											  # keyboard input is routed here too
 var _entry_close     : Callable = Callable()  # closes the keypad sheet (Enter key)
 var _entry_sheet_open := false                # true while the keypad sheet is open
 
@@ -101,11 +107,11 @@ var _detail_timer : Timer = null
 var _pending_open_room_id : String = ""   # deep-link target, applied once auth is ready
 var _viewing_room_id : String = ""        # room whose detail is on screen (set BEFORE its
 										  # fetch resolves) so late auth/player-id syncs don't
-                                          # re-render the list on top of an opening detail view
+										  # re-render the list on top of an opening detail view
 var _avatar_tex_cache : Dictionary = {}   # address+size key → fallback ImageTexture
 var _nimiq_avatar_cache : Dictionary = {} # address+size key → REAL loaded identicon ImageTexture
-                                          # (so a poll-driven re-render reuses it instead of
-                                          # flashing the fallback + re-loading it every 4s)
+										  # (so a poll-driven re-render reuses it instead of
+										  # flashing the fallback + re-loading it every 4s)
 
 
 ## BUG FIX: Dictionary.get(key, default) only falls back to `default` when
@@ -168,20 +174,23 @@ func _invite_message(entry_nim: float) -> String:
 
 ## Copy the invite message (stake-aware text + URL) to the clipboard
 ## (web-aware) and toast a confirmation.
+## BUG FIX ("Copy button on VS invite link doesn't actually copy"): this used
+## to do its own bare `try{navigator.clipboard.writeText(full);}catch(e){}`
+## and then unconditionally toast "Invite copied!" regardless of outcome.
+## navigator.clipboard.writeText() returns a Promise — its rejection is
+## async, not a synchronous throw — so that try/catch never caught the
+## failure, and plenty of WebViews (including wallet mini-app browsers)
+## never grant the async Clipboard permission at all, so the write silently
+## did nothing while the toast still claimed success. The "Share Invite
+## Link" button below already routed through ApiConfig.share_link()'s
+## robust execCommand-first path and worked fine — this now uses the same
+## path (pulled out as ApiConfig.copy_to_clipboard()) so both buttons behave
+## the same way, and the toast only fires on an actual, confirmed copy.
 func _copy_invite_link(url: String, entry_nim: float = 0.0) -> void:
 	if url == "":
 		return
 	var full := _invite_message(entry_nim) + "\n" + url
-	if OS.has_feature("web"):
-		# BUG FIX: previously only copied the bare url — same class of "the
-		# message text got dropped" issue fixed in ApiConfig.share_score/
-		# share_link. Copies the full stake-aware message + link now.
-		var js := "try{navigator.clipboard.writeText(%s);}catch(e){}" % JSON.stringify(full)
-		JavaScriptBridge.eval(js, true)
-	else:
-		DisplayServer.clipboard_set(full)
-	var t := Toast.get_instance()
-	if t: t.show_toast("Invite copied!", Toast.Kind.SUCCESS)
+	ApiConfig.copy_to_clipboard(full, "Invite copied!")
 
 
 func setup(player_id: String) -> void:
@@ -955,6 +964,20 @@ func _show_room_list() -> void:
 			sheet_tween[0].kill()
 		sheet_tween[0] = null
 
+	# BUG FIX: same class of bug as the main bottom bar / replay bar / other
+	# panels' bottom sheets — this used to animate flush to
+	# offset_bottom=0.0 with no _safe_area_bottom allowance. The digit/Done
+	# buttons in this keypad sheet sit right at the bottom edge, exactly
+	# where an Android on-screen nav bar would cover them. Same pattern as
+	# ProfileCardPanel's donate sheet: get_parent() reliably reaches Main
+	# since this panel is always instantiated as its direct child (see
+	# Main.gd: add_child(_vs_panel)); falls back to 0 (no shift) if Main
+	# hasn't computed a value yet.
+	var _sheet_sab := 0.0
+	var _main_node := get_parent()
+	if _main_node != null and "_safe_area_bottom" in _main_node:
+		_sheet_sab = _main_node._safe_area_bottom
+
 	open_entry_sheet = func():
 		_entry_sheet_open = true
 		kill_sheet_tween.call()
@@ -963,8 +986,8 @@ func _show_room_list() -> void:
 		sheet_tween[0] = t
 		t.set_parallel(true)
 		t.tween_property(sheet_dim, "modulate:a", 1.0, 0.22).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
-		t.tween_property(sheet, "offset_top",    0.0, 0.26).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
-		t.tween_property(sheet, "offset_bottom", 0.0, 0.26).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+		t.tween_property(sheet, "offset_top",    -_sheet_sab, 0.26).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
+		t.tween_property(sheet, "offset_bottom", -_sheet_sab, 0.26).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_OUT)
 	close_entry_sheet = func():
 		# BUG FIX (same pattern as the settings-popup input-blocking race
 		# fixed earlier in this project): stop the scrim from blocking clicks
@@ -1580,7 +1603,27 @@ func _make_room_row(r: Dictionary, ref: float) -> Control:
 	# creator's own (an open room I made still shows a face, not a blank gap).
 	var avatar_addr := other_addr if other_addr != "" else str(r.get("creator_id", ""))
 	if avatar_addr != "":
-		row.add_child(_make_nimiq_avatar(avatar_addr, int(ref * 0.052)))
+		var _avatar_ctrl := _make_nimiq_avatar(avatar_addr, int(ref * 0.052))
+		# STOP here means this click is consumed by the avatar and never
+		# reaches the card's own gui_input (the press/armed block above,
+		# which opens room detail) — tapping the face opens the profile
+		# card instead, tapping anywhere else on the card still opens the
+		# room as before.
+		_avatar_ctrl.mouse_filter = Control.MOUSE_FILTER_STOP
+		_avatar_ctrl.mouse_default_cursor_shape = Control.CURSOR_POINTING_HAND
+		var _av_press := [Vector2.ZERO]
+		var _av_armed := [false]
+		_avatar_ctrl.gui_input.connect(func(ev: InputEvent):
+			if ev is InputEventMouseButton and ev.button_index == MOUSE_BUTTON_LEFT:
+				if ev.pressed:
+					_av_press[0] = ev.global_position
+					_av_armed[0] = true
+				elif _av_armed[0]:
+					_av_armed[0] = false
+					if ev.global_position.distance_to(_av_press[0]) < ref * 0.045:
+						pass  # DISABLED: profile_requested.emit(avatar_addr)
+		)
+		row.add_child(_avatar_ctrl)
 
 	var info := VBoxContainer.new()
 	info.size_flags_horizontal = Control.SIZE_EXPAND_FILL

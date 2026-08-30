@@ -173,6 +173,7 @@ func (s *Server) handleStats(ctx *fasthttp.RequestCtx) {
 	// ── Daily login streak ──────────────────────────────────────────────────
 	streak := s.Store.GetStreak(playerID)
 
+
 	writeJSON(ctx, 200, map[string]any{
 		"streak": streak.Count,
 		"player_id":       playerID,

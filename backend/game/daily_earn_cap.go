@@ -62,19 +62,24 @@ func (s *Store) CoinNIMRate() float64 {
 }
 
 // DailyCapNIM — admin panel'den (AppConfig.DailyEarnCapNIM, BadgerDB) ayarlanan
-// günlük limiti okur. Hiç ayarlanmamışsa DAILY_EARN_CAP_NIM env değişkenine,
-// o da yoksa 100 NIM sabit varsayılana düşer. Store method — önceden serbest
-// bir fonksiyondu ve sadece env okuyordu, admin panelden değiştirilemiyordu.
-func (s *Store) DailyCapNIM() float64 {
+// günlük limiti okur. Hiç ayarlanmamışsa DAILY_EARN_CAP_NIM env
+// değişkenine, o da yoksa 100 NIM sabit varsayılana düşer.
+// (Eskiden level sistemine göre günlük kazanım çarpanı uygulanıyordu;
+// level sistemi kaldırıldığı için artık sabit base limit döner.)
+func (s *Store) DailyCapNIM(playerID string) float64 {
+	base := defaultDailyCap
 	if v := s.GetAppConfig().DailyEarnCapNIM; v > 0 {
-		return v
-	}
-	if v := os.Getenv("DAILY_EARN_CAP_NIM"); v != "" {
+		base = v
+	} else if v := os.Getenv("DAILY_EARN_CAP_NIM"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			return f
+			base = f
 		}
 	}
-	return defaultDailyCap
+
+	if playerID == "" {
+		return base
+	}
+	return base
 }
 
 // dailyCapRecord — DB'de saklanan günlük kazanım kaydı
@@ -125,7 +130,7 @@ func (s *Store) DailyCapRemaining(playerID string) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	cap := s.DailyCapNIM()
+	cap := s.DailyCapNIM(playerID)
 	remaining := cap - rec.EarnedNIM
 	if remaining < 0 {
 		remaining = 0
@@ -138,7 +143,7 @@ func (s *Store) DailyCapRemaining(playerID string) (float64, error) {
 func (s *Store) addDailyCapEarned(playerID string, requestedNIM float64) (float64, error) {
 	day := todayUTC3()
 	key := dailyCapKey(playerID, day)
-	cap := s.DailyCapNIM()
+	cap := s.DailyCapNIM(playerID)
 
 	// Read-modify-write (tek transaction içinde)
 	var actualEarned float64
@@ -217,7 +222,7 @@ func (s *Store) QueueRewardCapped(playerID string, requestedNIM float64, coinCou
 
 	if actualNIM < requestedNIM {
 		log.Printf("[DAILY_CAP] CAPPED player=%s requested=%.4f actual=%.4f NIM (cap=%.0f)",
-			playerID[:min8s(playerID)], requestedNIM, actualNIM, s.DailyCapNIM())
+			playerID[:min8s(playerID)], requestedNIM, actualNIM, s.DailyCapNIM(playerID))
 	} else {
 		log.Printf("[DAILY_CAP] OK player=%s earned=%.4f NIM coins=%d",
 			playerID[:min8s(playerID)], actualNIM, coinCount)
@@ -268,7 +273,7 @@ type DailyCapStats struct {
 // GetDailyCapStats — stats endpoint'inden dönülecek cap özeti.
 func (s *Store) GetDailyCapStats(playerID string) DailyCapStats {
 	rec, err := s.GetDailyCapRecord(playerID)
-	cap := s.DailyCapNIM()
+	cap := s.DailyCapNIM(playerID)
 	if err != nil || rec == nil {
 		return DailyCapStats{Cap: cap, Remaining: cap, ResetAt: nextMidnightUTC3()}
 	}

@@ -9,14 +9,14 @@ const UITheme := preload("res://scripts/UITheme.gd")
 var BACKEND_URL : String = ApiConfig.base_url()
 
 # Warm bej palette (referans UI'dan)
-const _C_BG       := Color(0.957, 0.898, 0.800)   # panel arka planı
-const _C_CARD     := Color(0.940, 0.878, 0.776)   # kart arka planı
+const _C_BG       := Color(0.957, 0.898, 0.800)   # panel background
+const _C_CARD     := Color(0.940, 0.878, 0.776)   # card background
 const _C_BORDER   := Color(0.700, 0.520, 0.340)   # kart border
-const _C_BROWN    := Color(0.220, 0.130, 0.060)   # koyu kahve yazı
+const _C_BROWN    := Color(0.220, 0.130, 0.060)   # dark brown text
 const _C_MID      := Color(0.480, 0.340, 0.200)   # orta kahve (dim)
 const _C_ORANGE   := Color(0.780, 0.380, 0.120)   # turuncu aksan
-const _C_GOLD     := Color(0.820, 0.580, 0.100)   # altın
-const _C_GREEN    := Color(0.240, 0.620, 0.220)   # yeşil (completed)
+const _C_GOLD     := Color(0.820, 0.580, 0.100)   # gold
+const _C_GREEN    := Color(0.240, 0.620, 0.220)   # green (completed)
 const _C_SEP      := Color(0.700, 0.560, 0.400, 0.5)  # separator
 
 var _gm         : Node    = null
@@ -184,7 +184,7 @@ func _build_ui() -> void:
 	# reliably tap on a phone). Visual icon stays the same size; only the
 	# tappable button area grows, centered via CenterContainer.
 	var close_sz    := int(ref * 0.090)
-	# FIX: ikon butona göre orantılı — eskiden ref*0.045 sabit küçüktü
+	# FIX: icon now scales with the button — used to be a fixed, too-small ref*0.045
 	var close_ic_sz := int(close_sz * 0.72)
 	var close_btn := Button.new()
 	close_btn.custom_minimum_size = Vector2(close_sz, close_sz)
@@ -366,9 +366,9 @@ func _build_ui() -> void:
 	cap_title_row.add_child(cap_reset_lbl)
 	_stat_labels["cap_reset"] = cap_reset_lbl
 
-	# Bar placeholder — _add_cap_bar ile doldurulur
+	# Bar placeholder — filled in by _add_cap_bar
 	_stat_labels["cap_vbox"]    = cap_vbox
-	_stat_labels["cap_val_lbl"] = null  # _add_cap_bar oluşturur
+	_stat_labels["cap_val_lbl"] = null  # created by _add_cap_bar
 	_stat_labels["cap_pct_lbl"] = null
 	_add_cap_bar(cap_vbox, 0.0, 0, 100, ref, false)
 
@@ -424,7 +424,7 @@ func _build_ui() -> void:
 		icon_row.size_flags_horizontal = Control.SIZE_SHRINK_CENTER
 		cv.add_child(icon_row)
 
-		# Lucide icon — UITheme ile çizilir, renk garantili. A bit bigger than
+		# Lucide icon — drawn via UITheme, color guaranteed. A bit bigger than
 		# before (1.045 → 1.35x) per request, still keyed off `ref` so it
 		# scales the same way across screen sizes.
 		var icon_rect := UITheme.lucide_icon(s["icon"], int(ic_s * 1.35), _C_ORANGE)
@@ -503,6 +503,56 @@ func _build_ui() -> void:
 	_reward_root.add_child(tx_loading)
 
 	UITheme.set_scroll_passthrough(_outer_vbox)
+
+
+## Gold XP progress bar — same rounded-corner/resize-safe construction as
+## _add_cap_bar below, just a fixed gold fill color and no "is_full" state
+## (max level is handled by the caller passing pct=1.0 and the xp label
+## text saying "Max level" instead of "X XP to next level").
+func _add_level_bar(vbox: VBoxContainer, pct: float, ref: float) -> void:
+	var fill_col := Color(0.820, 0.580, 0.100)  # gold — matches _C_GOLD used elsewhere in this file
+	var bar_h    := int(ref * 0.022)
+	const CORNER := 3
+
+	var bar_outer := Control.new()
+	bar_outer.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	bar_outer.custom_minimum_size   = Vector2(0, bar_h)
+	bar_outer.clip_contents         = true
+	vbox.add_child(bar_outer)
+
+	var bg := ColorRect.new()
+	bg.color = Color(0.780, 0.650, 0.500)
+	bg.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	bar_outer.add_child(bg)
+
+	var fill := ColorRect.new()
+	fill.color    = fill_col
+	fill.position = Vector2(CORNER, CORNER)
+	fill.size     = Vector2(0, bar_h - CORNER * 2)
+	bar_outer.add_child(fill)
+
+	var c_tl := ColorRect.new(); c_tl.color = _C_CARD
+	var c_tr := ColorRect.new(); c_tr.color = _C_CARD
+	var c_bl := ColorRect.new(); c_bl.color = _C_CARD
+	var c_br := ColorRect.new(); c_br.color = _C_CARD
+	for c in [c_tl, c_tr, c_bl, c_br]:
+		c.size = Vector2(CORNER, CORNER)
+		bar_outer.add_child(c)
+
+	var _apply := func():
+		var w := bar_outer.size.x
+		if w <= 0: return
+		fill.size.x  = maxf((w - CORNER * 2) * pct, 0.0)
+		c_tl.position = Vector2(0,          0)
+		c_bl.position = Vector2(0,          bar_h - CORNER)
+		c_tr.position = Vector2(w - CORNER, 0)
+		c_br.position = Vector2(w - CORNER, bar_h - CORNER)
+
+	bar_outer.resized.connect(_apply)
+	bar_outer.draw.connect(func():
+		if bar_outer.size.x > 0: _apply.call()
+	)
+	bar_outer.queue_redraw()
 
 
 func _add_cap_bar(vbox: VBoxContainer, pct: float, earned: int, cap_max: int, ref: float, is_full: bool) -> void:
@@ -807,10 +857,10 @@ func _on_stats_response(_result: int, response_code: int, _headers: PackedString
 			else:
 				_stat_labels["cap_reset"].text = "Resets soon"
 
-		# Bar'ı yeniden çiz
+		# Redraw the bar
 		if _stat_labels.has("cap_vbox") and is_instance_valid(_stat_labels["cap_vbox"]):
 			var cvbox : VBoxContainer = _stat_labels["cap_vbox"]
-			# Önceki bar satırlarını temizle (title row hariç — o index 0)
+			# Clear previous bar rows (except the title row — that's index 0)
 			for i in range(cvbox.get_child_count() - 1, 0, -1):
 				cvbox.get_child(i).queue_free()
 			var ref2 : float = minf(minf(get_viewport().get_visible_rect().size.x,
@@ -1034,9 +1084,49 @@ func _build_recent(games: Array) -> void:
 			row.add_child(watch_btn)
 			var sid_cap := session_id
 			watch_btn.pressed.connect(func(): _fetch_and_watch(sid_cap, watch_btn))
+
+			# Copy/share a direct link to this run's replay (ApiConfig.replay_url)
+			# so the viewer can send it on, same Web Share/clipboard path as
+			# Main.gd's Share Score button and VSPanel's invite link.
+			var link_btn := Button.new()
+			link_btn.visible = false
+			link_btn.text = ""
+			# BUG FIX: "link-2.png" isn't actually present in the exported
+			# lucide icon set, so this always fell through to the emoji
+			# fallback below — and unlike the desktop editor (which
+			# substitutes a system emoji font for missing glyphs), the
+			# web/HTML5 export has no emoji glyph support at all, so "🔗"
+			# rendered as a broken/missing glyph there specifically (this is
+			# why it looked fine everywhere except web). Try a couple of
+			# plausible lucide filenames, and if none exist, fall back to a
+			# plain "LINK" text label instead of an emoji — that always
+			# renders through the same font-fallback chain
+			# UITheme._apply_pixel_font sets up for every other label.
+			var _link_candidates : Array[String] = ["link-2", "link", "external-link"]
+			var _link_ic := ""
+			for _cand in _link_candidates:
+				var _p : String = UITheme.LUCIDE_PATH + _cand + ".png"
+				if ResourceLoader.exists(_p):
+					_link_ic = _p
+					break
+			if _link_ic != "":
+				link_btn.icon = load(_link_ic)
+				link_btn.expand_icon = true
+				link_btn.icon_alignment          = HORIZONTAL_ALIGNMENT_CENTER
+				link_btn.vertical_icon_alignment = VERTICAL_ALIGNMENT_CENTER
+				link_btn.add_theme_constant_override("icon_max_width", int(w_size * 0.5))
+			else:
+				link_btn.text = "LINK"
+				UITheme._apply_pixel_font(link_btn)
+				link_btn.add_theme_font_size_override("font_size", int(ref * 0.016))
+			link_btn.size_flags_horizontal = Control.SIZE_SHRINK_END
+			_replay_icon_btn(link_btn, w_size)
+			link_btn.tooltip_text = "Copy replay link"
+			row.add_child(link_btn)
+			# DISABLED: link_btn.pressed.connect(func(): _share_replay_link(sid_cap))
 		else:
 			var spacer := Control.new()
-			spacer.custom_minimum_size = Vector2(int(ref * 0.056), 0)
+			spacer.custom_minimum_size = Vector2(int(ref * 0.056 * 2 + ref * 0.006), 0)
 			spacer.size_flags_horizontal = Control.SIZE_SHRINK_END
 			row.add_child(spacer)
 
@@ -1047,6 +1137,16 @@ func _build_recent(games: Array) -> void:
 # ---------------------------------------------------------------------------
 # REPLAY FETCH
 # ---------------------------------------------------------------------------
+
+## Copies/shares a run's replay link (ApiConfig.replay_url) so the viewer
+## can send it on directly — same Web Share API / clipboard-fallback path
+## VSPanel's invite link and Main.gd's Share Score button already use.
+func _share_replay_link(session_id: String) -> void:
+	if session_id == "":
+		return
+	var url := ApiConfig.replay_url(session_id)
+	ApiConfig.share_link("Watch this replay:", url)
+
 
 func _fetch_and_watch(session_id: String, btn: Button) -> void:
 	if _auth_token == "":

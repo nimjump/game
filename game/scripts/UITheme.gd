@@ -618,8 +618,13 @@ static func confirm_external_link(parent: Node, url: String, ref: float) -> void
 	# Leaving height to auto-size from content while only anchoring at 0.5
 	# with no explicit top/bottom offsets pins the box to the top of the
 	# screen instead of centering it — a real bug if left as-is here.
-	var pw := ref * 0.82
-	var ph := ref * 0.34
+	# UX: bumped up from the original 0.82/0.34/0.032/0.024/etc — those sizes
+	# read noticeably smaller than the rest of the game's UI (default
+	# apply_label() alone is already ref*0.032, i.e. as big as this dialog's
+	# TITLE used to be). This is a "stop and read me" confirmation gate, not
+	# fine print, so it should read at least as large as normal UI text.
+	var pw := ref * 0.86
+	var ph := ref * 0.40
 	var pc := PanelContainer.new()
 	pc.anchor_left   = 0.5; pc.anchor_right  = 0.5
 	pc.anchor_top    = 0.5; pc.anchor_bottom = 0.5
@@ -632,46 +637,46 @@ static func confirm_external_link(parent: Node, url: String, ref: float) -> void
 	pc_st.border_color = BORDER
 	pc_st.set_border_width_all(3)
 	pc_st.set_corner_radius_all(16)
-	pc_st.content_margin_left   = ref * 0.045
-	pc_st.content_margin_right  = ref * 0.045
-	pc_st.content_margin_top    = ref * 0.032
-	pc_st.content_margin_bottom = ref * 0.032
+	pc_st.content_margin_left   = ref * 0.052
+	pc_st.content_margin_right  = ref * 0.052
+	pc_st.content_margin_top    = ref * 0.040
+	pc_st.content_margin_bottom = ref * 0.040
 	pc.add_theme_stylebox_override("panel", pc_st)
 	overlay.add_child(pc)
 
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", int(ref * 0.020))
+	vb.add_theme_constant_override("separation", int(ref * 0.024))
 	pc.add_child(vb)
 
 	var hdr := HBoxContainer.new()
-	hdr.add_theme_constant_override("separation", int(ref * 0.012))
+	hdr.add_theme_constant_override("separation", int(ref * 0.014))
 	vb.add_child(hdr)
-	hdr.add_child(lucide_icon("alert-triangle", int(ref * 0.040), ORANGE))
+	hdr.add_child(lucide_icon("alert-triangle", int(ref * 0.048), ORANGE))
 	var title := Label.new()
 	title.text = "Leaving the app"
-	apply_label(title, BROWN, int(ref * 0.032))
+	apply_label(title, BROWN, int(ref * 0.040))
 	hdr.add_child(title)
 
 	var body := Label.new()
 	body.text = "This will open an external website in your browser:"
 	body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	apply_label(body, MID, int(ref * 0.024))
+	apply_label(body, MID, int(ref * 0.030))
 	vb.add_child(body)
 
 	var host_lbl := Label.new()
 	host_lbl.text = host
 	host_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
-	apply_label(host_lbl, ORANGE, int(ref * 0.028))
+	apply_label(host_lbl, ORANGE, int(ref * 0.034))
 	vb.add_child(host_lbl)
 
 	var btn_row := HBoxContainer.new()
-	btn_row.add_theme_constant_override("separation", int(ref * 0.016))
+	btn_row.add_theme_constant_override("separation", int(ref * 0.018))
 	vb.add_child(btn_row)
 
 	var cancel_btn := Button.new()
 	cancel_btn.text = "Cancel"
 	cancel_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	cancel_btn.custom_minimum_size.y = int(ref * 0.064)
+	cancel_btn.custom_minimum_size.y = int(ref * 0.084)
 	apply_ghost_button(cancel_btn)
 	btn_row.add_child(cancel_btn)
 	cancel_btn.pressed.connect(func(): overlay.queue_free())
@@ -679,7 +684,7 @@ static func confirm_external_link(parent: Node, url: String, ref: float) -> void
 	var open_btn := Button.new()
 	open_btn.text = "Open"
 	open_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	open_btn.custom_minimum_size.y = int(ref * 0.064)
+	open_btn.custom_minimum_size.y = int(ref * 0.084)
 	apply_play_button(open_btn)
 	btn_row.add_child(open_btn)
 	open_btn.pressed.connect(func():
@@ -730,7 +735,9 @@ static func confirm_action(parent: Node, title_text: String, body_text: String, 
 	center.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	overlay.add_child(center)
 
-	var pw := ref * 0.82
+	# UX: bumped up from the original 0.82/0.032/0.024/etc — see the matching
+	# comment in confirm_external_link() above (same twin dialog, same fix).
+	var pw := ref * 0.86
 	var pc := PanelContainer.new()
 	pc.custom_minimum_size = Vector2(pw, 0)
 	var pc_st := StyleBoxFlat.new()
@@ -738,40 +745,40 @@ static func confirm_action(parent: Node, title_text: String, body_text: String, 
 	pc_st.border_color = BORDER
 	pc_st.set_border_width_all(3)
 	pc_st.set_corner_radius_all(16)
-	pc_st.content_margin_left   = ref * 0.045
-	pc_st.content_margin_right  = ref * 0.045
-	pc_st.content_margin_top    = ref * 0.032
-	pc_st.content_margin_bottom = ref * 0.032
+	pc_st.content_margin_left   = ref * 0.052
+	pc_st.content_margin_right  = ref * 0.052
+	pc_st.content_margin_top    = ref * 0.040
+	pc_st.content_margin_bottom = ref * 0.040
 	pc.add_theme_stylebox_override("panel", pc_st)
 	center.add_child(pc)
 
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", int(ref * 0.020))
+	vb.add_theme_constant_override("separation", int(ref * 0.024))
 	pc.add_child(vb)
 
 	var hdr := HBoxContainer.new()
-	hdr.add_theme_constant_override("separation", int(ref * 0.012))
+	hdr.add_theme_constant_override("separation", int(ref * 0.014))
 	vb.add_child(hdr)
-	hdr.add_child(lucide_icon("alert-triangle", int(ref * 0.040), ORANGE))
+	hdr.add_child(lucide_icon("alert-triangle", int(ref * 0.048), ORANGE))
 	var title := Label.new()
 	title.text = title_text
-	apply_label(title, BROWN, int(ref * 0.032))
+	apply_label(title, BROWN, int(ref * 0.040))
 	hdr.add_child(title)
 
 	var body := Label.new()
 	body.text = body_text
 	body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
-	apply_label(body, MID, int(ref * 0.024))
+	apply_label(body, MID, int(ref * 0.030))
 	vb.add_child(body)
 
 	var btn_row := HBoxContainer.new()
-	btn_row.add_theme_constant_override("separation", int(ref * 0.016))
+	btn_row.add_theme_constant_override("separation", int(ref * 0.018))
 	vb.add_child(btn_row)
 
 	var no_btn := Button.new()
 	no_btn.text = "No"
 	no_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	no_btn.custom_minimum_size.y = int(ref * 0.064)
+	no_btn.custom_minimum_size.y = int(ref * 0.084)
 	apply_ghost_button(no_btn)
 	btn_row.add_child(no_btn)
 	no_btn.pressed.connect(func(): overlay.queue_free())
@@ -779,7 +786,7 @@ static func confirm_action(parent: Node, title_text: String, body_text: String, 
 	var yes_btn := Button.new()
 	yes_btn.text = confirm_label
 	yes_btn.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	yes_btn.custom_minimum_size.y = int(ref * 0.064)
+	yes_btn.custom_minimum_size.y = int(ref * 0.084)
 	apply_play_button(yes_btn)
 	if danger:
 		var dn := StyleBoxFlat.new(); var dh := StyleBoxFlat.new(); var dp := StyleBoxFlat.new()

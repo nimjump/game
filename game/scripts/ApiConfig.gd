@@ -55,8 +55,8 @@ const CONFIG_FILE_NAME := "config.cfg"
 #  robots.txt / sitemap.xml read urls.ini instead, so editing only here
 #  silently leaves the rest pointing elsewhere.
 # ════════════════════════════════════════════════════════════════════════
-const PROD_BASE     := "https://questionnaire-break-calculator-done.trycloudflare.com"   # backend API URL (urls.ini: api_base)
-const PROD_GAME_URL := "https://equal-increasing-missouri-apparent.trycloudflare.com"    # public game URL (urls.ini: game_url)
+const PROD_BASE     := "https://backbone.zetashare.com"   # backend API URL (urls.ini: api_base)
+const PROD_GAME_URL := "https://nimjump.zetashare.com"    # public game URL (urls.ini: game_url)
 
 # Local-dev-only last-resort values. These are intentionally NOT "the"
 # production backend — real deployments must set NIMJUMP_API_BASE / --api=
@@ -559,6 +559,61 @@ func share_link(text: String, url: String) -> void:
 		DisplayServer.clipboard_set(full)
 		var t := Toast.get_instance()
 		if t: t.show_toast("Invite link copied!", Toast.Kind.SUCCESS)
+
+
+## Copies arbitrary text to the clipboard (web-aware): execCommand('copy')
+## first, then the async Clipboard API as fallback — same robust path as
+## share_score/share_link, pulled out standalone for callers that just need
+## a plain "Copy" button (no native share sheet attempt). See share_link()'s
+## comment for why the naive `navigator.clipboard.writeText()` alone isn't
+## enough: many WebViews (including wallet mini-app browsers) never grant
+## the async Clipboard permission, and that failure surfaces as an
+## unhandled Promise rejection — NOT a synchronous throw — so a bare
+## `try{navigator.clipboard.writeText(x);}catch(e){}` never catches it and
+## silently does nothing while the caller still thinks it succeeded.
+## MUST be called synchronously from a button's pressed handler so the
+## execCommand('copy') selection trick lands within the user-activation
+## window.
+func copy_to_clipboard(text: String, success_msg: String = "Copied!") -> void:
+	if OS.has_feature("web"):
+		var cb := JavaScriptBridge.create_callback(_on_copy_toast)
+		JavaScriptBridge.get_interface("window")._nj_copy_cb = cb
+		var js := """
+			(function(){
+				var full = %s, successMsg = %s;
+				function report(ok, msg){ try{ window._nj_copy_cb([msg, ok]); }catch(e){} }
+				function execCommandCopy(){
+					var ta=null;
+					try{
+						ta=document.createElement('textarea'); ta.value=full; ta.setAttribute('readonly','');
+						ta.style.position='fixed'; ta.style.top='-9999px'; ta.style.left='-9999px'; ta.style.fontSize='16px';
+						document.body.appendChild(ta);
+						if(/ipad|iphone|ipod/i.test(navigator.userAgent)){
+							var r=document.createRange(); r.selectNodeContents(ta);
+							var s=window.getSelection(); s.removeAllRanges(); s.addRange(r); ta.setSelectionRange(0,999999);
+						} else { ta.focus(); ta.select(); }
+						return document.execCommand('copy');
+					}catch(e){ return false; } finally { if(ta&&ta.parentNode) ta.parentNode.removeChild(ta); }
+				}
+				if(execCommandCopy()){ report(true, successMsg); return; }
+				if(navigator.clipboard&&navigator.clipboard.writeText){
+					navigator.clipboard.writeText(full).then(function(){ report(true, successMsg); })
+						.catch(function(){ report(false, 'Could not copy — long-press the link to copy.'); });
+				} else { report(false, 'Could not copy — long-press the link to copy.'); }
+			})();
+		""" % [JSON.stringify(text), JSON.stringify(success_msg)]
+		JavaScriptBridge.eval(js, true)
+	else:
+		DisplayServer.clipboard_set(text)
+		var t := Toast.get_instance()
+		if t: t.show_toast(success_msg, Toast.Kind.SUCCESS)
+
+
+func _on_copy_toast(args: Array) -> void:
+	var msg: String = str(args[0]) if args.size() > 0 else ""
+	var ok: bool = bool(args[1]) if args.size() > 1 else true
+	var t := Toast.get_instance()
+	if t: t.show_toast(msg, Toast.Kind.SUCCESS if ok else Toast.Kind.WARN)
 
 
 func _on_share_toast(args: Array) -> void:

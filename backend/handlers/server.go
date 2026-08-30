@@ -251,6 +251,7 @@ func (s *Server) Register(r *router.Router) {
 	r.POST("/backend/nickname", rl(s.handleNicknameSet))
 	r.GET("/backend/nickname/check", rl(s.handleNicknameCheck))
 	r.GET("/backend/stats", rl(s.handleStats))
+	r.GET("/backend/profile", rl(s.handleProfile))
 	r.GET("/backend/quests", rl(s.handleQuests))
 	// NOTE: POST /backend/quests/progress was removed — quest progress is now
 	// applied only as a server-side side effect of replay verification (see
@@ -941,6 +942,10 @@ func (s *Server) handleSubmit(ctx *fasthttp.RequestCtx) {
 				} else {
 					log.Printf("[QUEST_PROGRESS] failed player=%s: %v", playerID, qerr)
 				}
+
+				// Same server-verified-only trust boundary as quest progress
+				// above — only ever runs on a non-flagged result.ServerScore.
+				// cap (game/daily_earn_cap.go's DailyCapNIM already reads it
 
 				// ── Coin → NIM ödülü (daily cap uygulanır) ────────────────
 				if result.QuestCoins > 0 {
