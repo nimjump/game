@@ -22,21 +22,13 @@
 > 1. **Gameplay automation (bot).** While technically possible, developing and maintaining a competitive bot would require significant effort. The game features a wide variety of enemies whose behavior, movement, and speed are determined dynamically based on the score and deterministic RNG. Very little of the gameplay is static or follows fixed patterns, meaning a bot would need to continuously adapt rather than rely on scripted inputs. Even if such a bot were developed, future gameplay updates would likely require substantial rework, making the approach costly and impractical relative to the potential rewards.
 
 
->
+>Fixed 10.08.2026 !!!
 
-> 2. **Arbitrary seed generation.** To support offline play, the current implementation generates the game seed on the client. A malicious user could repeatedly generate seeds until finding one that produces a favorable game. This limitation is currently accepted because offline play is considered a core feature of the game. Given the complexity of this attack and the importance of offline play, this tradeoff was considered acceptable by me for the current release.
+> 2. ~~**Arbitrary seed generation.**~~ **Fixed 10.08.2026.** To support offline play, the previous implementation generated the game seed on the client, which allowed a malicious user to repeatedly generate seeds until finding one that produced a favorable game. This has been resolved by replacing client-generated seeds with **server-issued seed batches**. While the player is online, the server issues a batch of signed seeds (for example, 100), which are then consumed during offline gameplay. When the player reconnects and claims rewards, the server verifies that every submitted seed is authentic, unused, and was originally issued by the server.
 
->
+> This approach preserves offline play as a core feature of the game while preventing players from generating arbitrary seeds in search of favorable outcomes.
 
-> ### Planned Solution
 
->
-
-> The planned solution is to replace arbitrary client-generated seeds with **server-issued seed batches**. While the player is online, the server will issue a batch of signed seeds (for example, 100). These seeds can then be consumed during offline gameplay. When the player reconnects and claims rewards, the server will verify that every submitted seed is authentic, unused, and was originally issued by the server.
-
->
-
-> This approach preserves offline play while preventing players from generating arbitrary seeds in search of favorable outcomes.
 
 
 
