@@ -320,6 +320,52 @@ func _build_ui() -> void:
 	)
 	best_row.add_child(share_btn)
 
+	# ── Level card ────────────────────────────────────────
+	# Data comes straight from /backend/stats (level/xp/xp_into_level/
+	# xp_for_next_level/daily_cap_multiplier — see backend's stats.go patch)
+	# so this needs no extra request beyond the one _refresh() already makes.
+	var lvl_card := PanelContainer.new()
+	lvl_card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lvl_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	lvl_card.visible = false
+	var lvl_st := StyleBoxFlat.new()
+	lvl_st.bg_color = _C_CARD
+	lvl_st.border_color = _C_BORDER
+	lvl_st.set_border_width_all(2)
+	lvl_st.set_corner_radius_all(10)
+	lvl_card.add_theme_stylebox_override("panel", lvl_st)
+	_outer_vbox.add_child(lvl_card)
+
+	var lvl_mc := _mpad(int(ref * 0.016))
+	lvl_card.add_child(lvl_mc)
+	var lvl_vbox := VBoxContainer.new()
+	lvl_vbox.add_theme_constant_override("separation", int(ref * 0.006))
+	lvl_mc.add_child(lvl_vbox)
+
+	var lvl_title_row := HBoxContainer.new()
+	lvl_title_row.add_theme_constant_override("separation", int(ref * 0.008))
+	lvl_vbox.add_child(lvl_title_row)
+	lvl_title_row.add_child(UITheme.lucide_icon("star", int(ref * 0.030), _C_GOLD))
+	var lvl_title := Label.new()
+	lvl_title.text = "Level"
+	lvl_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	UITheme.apply_label(lvl_title, _C_MID, int(ref * 0.024))
+	lvl_title_row.add_child(lvl_title)
+	var lvl_val_lbl := Label.new()
+	lvl_val_lbl.text = "Lv. 1"
+	UITheme.apply_label(lvl_val_lbl, _C_BROWN, int(ref * 0.030))
+	lvl_title_row.add_child(lvl_val_lbl)
+	_stat_labels["level_val"] = lvl_val_lbl
+
+	var lvl_xp_lbl := Label.new()
+	lvl_xp_lbl.text = "0 XP to next level"
+	UITheme.apply_label(lvl_xp_lbl, _C_MID, int(ref * 0.020))
+	lvl_vbox.add_child(lvl_xp_lbl)
+	_stat_labels["level_xp_lbl"] = lvl_xp_lbl
+
+	_stat_labels["level_vbox"] = lvl_vbox
+	_add_level_bar(lvl_vbox, 0.0, ref)
+
 	# ── Daily NIM Cap card ──────────────────────────────
 	var cap_card := PanelContainer.new()
 	cap_card.name = "CapCard"
@@ -866,6 +912,25 @@ func _on_stats_response(_result: int, response_code: int, _headers: PackedString
 			var ref2 : float = minf(minf(get_viewport().get_visible_rect().size.x,
 				get_viewport().get_visible_rect().size.y), GameConstants.VW)
 			_add_cap_bar(cvbox, pct, int(earned), int(cap_max), ref2, is_full)
+
+	# ── Level / XP ──────────────────────────────────────
+	var level    : int = int(data.get("level", 1))
+	var xp_into  : int = int(data.get("xp_into_level", 0))
+	var xp_next  : int = int(data.get("xp_for_next_level", 0))
+	if _stat_labels.has("level_val"):
+		_stat_labels["level_val"].text = "Lv. %d" % level
+	if _stat_labels.has("level_xp_lbl"):
+		_stat_labels["level_xp_lbl"].text = ("%d XP to next level" % (xp_next - xp_into)) if xp_next > 0 else "Max level"
+	if _stat_labels.has("level_vbox") and is_instance_valid(_stat_labels["level_vbox"]):
+		var lvbox : VBoxContainer = _stat_labels["level_vbox"]
+		# Bar is child index 2 (title row=0, xp label=1, bar=2) — drop and
+		# redraw it same as _add_cap_bar's redraw block above.
+		if lvbox.get_child_count() > 2:
+			lvbox.get_child(2).queue_free()
+		var lvl_pct : float = 1.0 if xp_next <= 0 else clampf(float(xp_into) / float(xp_next), 0.0, 1.0)
+		var ref3 : float = minf(minf(get_viewport().get_visible_rect().size.x,
+			get_viewport().get_visible_rect().size.y), GameConstants.VW)
+		_add_level_bar(lvbox, lvl_pct, ref3)
 
 	var recent_games = data.get("recent_games", [])
 	if typeof(recent_games) != TYPE_ARRAY:

@@ -1000,6 +1000,12 @@ func simulate_tick() -> void:
 		if platforms != null:
 			for plat in platforms:
 				if not is_instance_valid(plat): continue
+				# A platform enters _breaking at the exact tick its collision
+				# layer is disabled. This manual collision path must apply the
+				# same rule as the visual/physics path; otherwise the player can
+				# land on a platform that has already started falling. That was
+				# especially visible during replay verification near a break.
+				if bool(plat.get("_breaking")): continue
 				# Platform bounds
 				var plat_top    : float = plat.global_position.y - ph * 0.5
 				var plat_bottom : float = plat.global_position.y + ph * 0.5
@@ -1057,6 +1063,13 @@ func simulate_tick() -> void:
 		if _prev_velocity_y > 0.001:
 			if _landed_collider and _landed_collider.has_method("on_player_landed"):
 				_landed_collider.on_player_landed()
+			# A spring is gameplay, not a frame-rate visual overlap. Resolve
+			# springs attached to the exact platform we just landed on here,
+			# before the platform break timer can remove it. The GM also keeps
+			# the swept-interactable path as a fallback; used_ref prevents a
+			# double bounce in the same tick.
+			if _game_manager != null and _game_manager.has_method("trigger_springs_on_landing"):
+				_game_manager.call("trigger_springs_on_landing", _landed_collider)
 
 	# Screen edge wrap
 	if global_position.x > _vw + 20.0:
@@ -1385,6 +1398,19 @@ func hit_enemy() -> void:
 			tw.tween_callback(func():
 				if not is_dead and is_instance_valid(_anim_sprite): _anim_sprite.play("stand")
 			)
+
+
+## Beam/laser vuruş girişi — hit_enemy() ile aynı kurallar, ama vuruşun
+## gerçekten bağlanıp bağlanmadığını (hasar ya da kalkan kaybı) bildirir.
+## Böylece beam'ler tek-atımlık haklarını / hasar cooldown'larını etkisiz
+## temaslarda (god-mode, powerup uçuşu, hurt invincibility) boşa harcamaz:
+## beam, oyuncu gerçekten hasar alana kadar tehlikeli kalır.
+func try_beam_hit() -> bool:
+	if god_mode: return false
+	if is_powered_up: return false
+	if _invincible > 0.0: return false
+	hit_enemy()
+	return true
 
 
 func die() -> void:

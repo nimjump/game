@@ -136,6 +136,10 @@ var _onboarding_overlay : Control = null   # ilk açılışta bir kez gösterile
 var _onboarding_layer   : CanvasLayer = null
 var _onboarding_panel   : PanelContainer = null   # the centred card inside _onboarding_overlay —
 													# see _reposition_onboarding()'s doc comment
+var _spaceupdate_layer   : CanvasLayer = null    # "NEW UPDATE — Deep Space" kartı, cihazda bir kez
+var _spaceupdate_overlay : Control = null
+var _spaceupdate_panel   : PanelContainer = null
+var _space_update_shown  : bool = false          # oturum-içi tekrar kilidi (web-dışı test dahil)
 var _streak_badge      : Control = null   # lobide sürekli görünen "🔥 N" streak rozeti
 var _streak_badge_lbl  : Label   = null
 # Claimable NIM reward — see backend/game/streak_reward.go. NOT auto-paid;
@@ -409,6 +413,22 @@ func _reposition_onboarding() -> void:
 	if is_instance_valid(_onboarding_panel):
 		var _pcmin := _onboarding_panel.get_combined_minimum_size()
 		_onboarding_panel.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
+
+
+## _reposition_onboarding() ile aynı — update kartının genişliğini güncel
+## viewport'tan yeniden hesaplar. Cheap no-op if the card isn't open.
+func _reposition_space_update() -> void:
+	if not is_instance_valid(_spaceupdate_panel):
+		return
+	var _vp := get_viewport().get_visible_rect().size
+	var _panel_w : float = minf(_vp.x * 0.88, _vp.y * 0.95)
+	if absf(_panel_w - _spaceupdate_panel.custom_minimum_size.x) < 0.5:
+		return
+	_spaceupdate_panel.custom_minimum_size = Vector2(_panel_w, _spaceupdate_panel.custom_minimum_size.y)
+	await get_tree().process_frame
+	if is_instance_valid(_spaceupdate_panel):
+		var _pcmin := _spaceupdate_panel.get_combined_minimum_size()
+		_spaceupdate_panel.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
 
 
 ## PLAY/Settings butonlarını (start ekranı) _build_start_ui()'de baz alınan
@@ -2070,6 +2090,7 @@ func _on_viewport_resized() -> void:
 	_ref = minf(minf(_vw, _vh), GameConstants.VW)  # cap: design ref is 600x800, don't scale UI past it on big screens
 	_refresh_safe_area_bottom()  # rotasyonda safe-area değişebilir (ör. landscape'te home indicator yanda) — bar/HUD reposition dahil, bkz. fonksiyon içi
 	_reposition_onboarding()  # onboarding card lives outside _ui_layer/_started's reach — see its own doc comment
+	_reposition_space_update()  # update card lives in its own layer too — same reason
 
 	# Küçük boyut değişikliklerini yoksay (klavye, status bar vs.)
 	# Sadece gerçek yönelim değişikliği (genişlik/yükseklik yer değiştirdi) rebuild yap
@@ -4008,6 +4029,8 @@ func _build_start_ui() -> void:
 	_update_streak_badge()
 	_fetch_streak_status()
 	_maybe_show_onboarding()
+	if not is_instance_valid(_onboarding_overlay):
+		_maybe_show_space_update()   # onboarding çıkmadıysa (eski oyuncu) update kartı direkt
 	_check_pending_submissions()
 
 
@@ -6165,6 +6188,176 @@ func _dismiss_onboarding() -> void:
 	_onboarding_overlay = null
 	_onboarding_layer   = null
 	_onboarding_panel   = null
+	_maybe_show_space_update()   # ilk girişte How-to-Play'den hemen sonra update kartı
+
+
+# ─────────────────────────────────────────────────────
+#  SPACE UPDATE OVERLAY — shown once, ever, per device
+# ─────────────────────────────────────────────────────
+# "NEW UPDATE" kartı: yeni Deep Space biyomunu anlatır. Onboarding kartıyla
+# AYNI görsel sistem (sıcak palet, fontlar, buton, açılış animasyonu) — sadece
+# içerik ve üstteki mor rozet farklı. İlk girişte onboarding kapandıktan hemen
+# sonra gösterilir; sonraki girişlerde (daha görülmediyse) lobide direkt açılır.
+# localStorage anahtarı: nj_space_update_seen.
+func _maybe_show_space_update() -> void:
+	if _space_update_shown:
+		return  # bu oturumda zaten kuruldu — üst üste binme
+	if is_instance_valid(_spaceupdate_overlay):
+		return
+	if OS.has_feature("web"):
+		var already_seen = JavaScriptBridge.eval("!!localStorage.getItem('nj_space_update_seen')", true)
+		if already_seen:
+			return
+	_space_update_shown = true
+	_build_space_update_overlay()
+
+
+func _build_space_update_overlay() -> void:
+	# Onboarding ile aynı sıcak palet — tüm tam-ekran kartlar tutarlı.
+	const OB_BG     := Color(0.957, 0.898, 0.800)
+	const OB_BORDER := Color(0.700, 0.520, 0.340)
+	const OB_BROWN  := Color(0.220, 0.130, 0.060)
+	const OB_MID    := Color(0.480, 0.340, 0.200)
+	const UP_BADGE  := Color(0.290, 0.200, 0.620)   # uzay moru rozet
+
+	# Kendi CanvasLayer'ı (61) — onboarding (60) hâlâ soluyorken üstte açılır.
+	_spaceupdate_layer = CanvasLayer.new()
+	_spaceupdate_layer.layer = 61
+	add_child(_spaceupdate_layer)
+
+	_spaceupdate_overlay = Control.new()
+	_spaceupdate_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_spaceupdate_layer.add_child(_spaceupdate_overlay)
+
+	var dim := ColorRect.new()
+	dim.color = Color(0, 0, 0, 0.65)
+	dim.modulate.a = 0.0   # fades in below, instead of popping in instantly
+	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	_spaceupdate_overlay.add_child(dim)
+
+	var pc := PanelContainer.new()
+	var _vp := get_viewport().get_visible_rect().size
+	var _panel_w : float = minf(_vp.x * 0.88, _vp.y * 0.95)
+	pc.anchor_left = 0.5; pc.anchor_right = 0.5
+	pc.anchor_top  = 0.5; pc.anchor_bottom = 0.5
+	pc.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	pc.grow_vertical = Control.GROW_DIRECTION_BOTH
+	pc.custom_minimum_size = Vector2(_panel_w, 0)   # height follows content
+	_spaceupdate_panel = pc
+	var pc_st := StyleBoxFlat.new()
+	pc_st.bg_color = OB_BG
+	pc_st.border_color = OB_BORDER
+	pc_st.set_border_width_all(3)
+	pc_st.set_corner_radius_all(16)
+	pc_st.shadow_color = Color(0, 0, 0, 0.3)
+	pc_st.shadow_size  = 12
+	pc.add_theme_stylebox_override("panel", pc_st)
+	_spaceupdate_overlay.add_child(pc)
+	pc.modulate.a = 0.0
+	pc.scale      = Vector2(0.92, 0.92)
+
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", int(_p(0.020)))
+	pc.add_child(vb)
+
+	var mc := _make_margin_container(int(_p(0.052)))
+	mc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vb.add_child(mc)
+
+	var inner := VBoxContainer.new()
+	inner.add_theme_constant_override("separation", int(_p(0.022)))
+	mc.add_child(inner)
+
+	# Mor "NEW UPDATE" rozeti — ortalanmış hap.
+	var pill_wrap := CenterContainer.new()
+	inner.add_child(pill_wrap)
+	var pill := PanelContainer.new()
+	var pill_st := StyleBoxFlat.new()
+	pill_st.bg_color = UP_BADGE
+	pill_st.set_corner_radius_all(14)
+	pill_st.content_margin_left = _p(0.030)
+	pill_st.content_margin_right = _p(0.030)
+	pill_st.content_margin_top = _p(0.012)
+	pill_st.content_margin_bottom = _p(0.012)
+	pill.add_theme_stylebox_override("panel", pill_st)
+	pill_wrap.add_child(pill)
+	var pill_hb := HBoxContainer.new()
+	pill_hb.add_theme_constant_override("separation", int(_p(0.014)))
+	pill_hb.alignment = BoxContainer.ALIGNMENT_CENTER
+	pill.add_child(pill_hb)
+	pill_hb.add_child(UITheme.lucide_icon("sparkles", int(_p(0.038)), Color.WHITE))
+	var pill_lbl := Label.new()
+	pill_lbl.text = "NEW UPDATE"
+	pill_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	UITheme.apply_label(pill_lbl, Color.WHITE, int(_p(0.034)))
+	pill_hb.add_child(pill_lbl)
+
+	var title := Label.new()
+	title.text = "Deep Space Has Landed!"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	UITheme.apply_label(title, OB_BROWN, int(_p(0.064)))
+	inner.add_child(title)
+
+	var rows := [
+		["star",            "A brand-new biome is live: climb to 2,000 points to enter Deep Space!"],
+		["zap",             "UFOs and pink aliens fire real lasers — don't touch the beams!"],
+		["alert-triangle",  "Blue aliens hop between platforms, and yellow ones are super fast!"],
+		["check",           "Stomp every alien from above, just like any other enemy."],
+		["rotate-ccw",      "Deep Space returns every 2,500 points. See you among the stars!"],
+	]
+	for row in rows:
+		var hb := HBoxContainer.new()
+		hb.add_theme_constant_override("separation", int(_p(0.020)))
+		inner.add_child(hb)
+		var ic := UITheme.lucide_icon(row[0], int(_p(0.052)), OB_BROWN)
+		hb.add_child(ic)
+		var txt := Label.new()
+		txt.text = row[1]
+		txt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		txt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(txt, OB_MID, int(_p(0.036)))
+		hb.add_child(txt)
+
+	var gap := Control.new()
+	gap.custom_minimum_size = Vector2(0, int(_p(0.012)))
+	inner.add_child(gap)
+
+	var got_it := Button.new()
+	got_it.text = "Got it!"
+	got_it.custom_minimum_size = Vector2(0, int(_p(0.088)))
+	UITheme.apply_play_button(got_it)
+	got_it.add_theme_font_size_override("font_size", int(_p(0.034)))
+	got_it.pressed.connect(_dismiss_space_update)
+	inner.add_child(got_it)
+
+	var _pcmin := pc.get_combined_minimum_size()
+	pc.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
+
+	var ov_tw := create_tween()
+	if ov_tw:
+		ov_tw.set_parallel(true)
+		ov_tw.tween_property(dim, "modulate:a", 1.0, 0.25)
+		ov_tw.tween_property(pc,  "modulate:a", 1.0, 0.28)
+		ov_tw.tween_property(pc,  "scale", Vector2.ONE, 0.28).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+
+
+func _dismiss_space_update() -> void:
+	if OS.has_feature("web"):
+		JavaScriptBridge.eval("localStorage.setItem('nj_space_update_seen', '1')", true)
+	if is_instance_valid(_spaceupdate_overlay):
+		var ov := _spaceupdate_overlay
+		var ovl := _spaceupdate_layer
+		var tw := create_tween()
+		if tw:
+			tw.tween_property(ov, "modulate:a", 0.0, 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+			tw.tween_callback(func(): if is_instance_valid(ovl): ovl.queue_free())
+		else:
+			if is_instance_valid(ovl): ovl.queue_free()
+	_spaceupdate_overlay = null
+	_spaceupdate_layer   = null
+	_spaceupdate_panel   = null
 
 
 func _close_settings() -> void:
@@ -6414,9 +6607,29 @@ func _rearm_gyro_if_needed() -> void:
 		if _gt: _gt.show_toast("Motion access unavailable — switched to Tap for this session.", Toast.Kind.WARN)
 
 
+func _start_local_godot_game() -> void:
+	_play_waiting_for_auth = false
+	_auth_failed_retry_done = false
+	_started = true
+	_block_lb_replay = true
+	if is_instance_valid(_leaderboard_panel): _leaderboard_panel.hide_panel()
+	if is_instance_valid(_stats_panel):       _stats_panel.hide_panel()
+	if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
+	_do_start_game()
+
+
 func _on_play_pressed() -> void:
 	_start_bgm_if_needed()  # ilk etkileşim → BGM başlat
 	if _started: return
+
+	# Godot editor/desktop test mode has no Nimiq wallet or browser auth.
+	# Do not arm the web auth wait here; otherwise Play stays stuck at
+	# "already waiting on auth" and the native Godot build never reaches the
+	# game. Web exports keep the normal signed/guest flow below unchanged.
+	if not OS.has_feature("web"):
+		print("[MAIN] local Godot run — bypassing web auth and starting guest game")
+		_start_local_godot_game()
+		return
 
 	await _rearm_gyro_if_needed()
 	if _started: return
@@ -8477,10 +8690,10 @@ func transition_background(biome_id: String) -> void:
 	if not is_instance_valid(_bg_rect) or not is_instance_valid(_bg_rect2): return
 	var new_tex : Texture2D = UITheme.get_background_texture_by_id(biome_id)
 	if new_tex == null: return
-	# Candy biome — pembemsi tint
+	# Space biome — koyu mavi/mor uzay tonu.
 	var tint := Color(1.0, 1.0, 1.0, 1.0)
-	if biome_id == "candy":
-		tint = Color(1.0, 0.82, 0.92, 1.0)
+	if biome_id == "space":
+		tint = Color(0.62, 0.70, 1.0, 1.0)
 	_bg_rect2.texture    = new_tex
 	_bg_rect2.modulate   = Color(tint.r, tint.g, tint.b, 0.0)
 	var tw := create_tween()
@@ -8507,9 +8720,9 @@ func _spawn_transition_creature(biome_id: String) -> void:
 		"sky":
 			tex_path = "res://assets/enemies/flyman/fly.png"
 			tint     = Color(0.6, 0.4, 1.5, 0.50)
-		"candy":
+		"space":
 			tex_path = "res://assets/enemies/ufo/ufo_idle.png"
-			tint     = Color(1.5, 0.5, 1.2, 0.55)   # pembe/mor UFO
+			tint     = Color(0.45, 0.65, 1.5, 0.55)   # mavi/mor UFO
 		_:  # grass (döngü başı)
 			tex_path = "res://assets/enemies/sun/idle1.png"
 			tint     = Color(0.4, 0.8, 1.5, 0.45)

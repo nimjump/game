@@ -55,7 +55,7 @@ const BACKGROUNDS := [
 	{"id": "ice_forest", "name": "Snow Forest",  "file": "backgroundForest.png"},
 	{"id": "castle",     "name": "Castle",       "file": "backgroundCastles.png"},
 	{"id": "ice_desert", "name": "Glacial Desert","file": "backgroundDesert.png"},
-	{"id": "candy",      "name": "Candy Land",   "file": "backgroundColorFall.png"},
+	{"id": "space",      "name": "Deep Space",   "file": "backgroundSpace.png"},
 ]
 
 static func get_theme_assets(_theme_name: String = ACTIVE_THEME) -> Dictionary:
@@ -451,7 +451,14 @@ static func get_background_texture(index: int) -> Texture2D:
 	if ResourceLoader.exists(path):
 		tex = load(path)
 	else:
-		push_warning("[UITheme] Background file NOT FOUND: " + path)
+		# Space art is optional in script-only/server builds. Keep the biome
+		# selectable and fall back to the sky texture instead of returning a
+		# blank background when the art pack is not present.
+		if String(data["id"]) == "space":
+			var fallback := BG_PATH + "backgroundEmpty.png"
+			if ResourceLoader.exists(fallback): tex = load(fallback)
+		if tex == null:
+			push_warning("[UITheme] Background file NOT FOUND: " + path)
 	_bg_tex_cache[index] = tex
 	return tex
 
@@ -466,9 +473,9 @@ static func get_background_texture_by_id(id: String) -> Texture2D:
 	return get_background_texture(get_background_index_by_id(id))
 
 # Calculates background index based on score.
-# 4 biomes cycle every 500 pts: grass → desert → fall → sky → repeat (candy devre dışı)
+# 5 biyom cycle every 500 pts: grass → desert → fall → sky → space.
 static func get_background_index_for_score(score: int) -> int:
-	const BIOME_INDICES := [0, 3, 4, 2]  # grass, desert, fall, sky
+	const BIOME_INDICES := [2, 3, 0, 4, 8]  # grass, desert, fall, sky, space
 	var slot := (maxi(score, 0) / 500) % BIOME_INDICES.size()
 	return BIOME_INDICES[slot]
 

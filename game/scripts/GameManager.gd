@@ -230,7 +230,11 @@ signal replay_tick_changed(tick: int, total: int)
 # ── Divergence detector ──────────────────────────────────────────────
 # During RECORDING store (pos, score) every tick; compare during PLAYING
 var _dbg_snapshots : Array = []   # [{pos, score, vel_y}]
-var _dbg_enabled   : bool  = OS.is_debug_build()  # production: off → zero alloc per tick
+var _dbg_enabled   : bool  = OS.is_debug_build()
+# Only compare a replay against the local recording that produced it. Watching
+# somebody else's replay must never reuse the previous player's trace; doing so
+# produced misleading [DIV] messages and made clean replays look suspicious.
+var _replay_debug_compare : bool = false  # production: off → zero alloc per tick
 
 # ── Always-on lightweight checkpoint log (client + server, RELEASE builds too) ──
 # _dbg_enabled (above) is debug-build-only AND only ever compares a client's own
@@ -268,7 +272,7 @@ const _CARD_POWERUP_LIST : Array[String] = ["jetpack", "drunk", "wings", "earthq
 const _CARD_IS_GOOD_LIST : Array[bool]   = [true, false, true, false, true, false]
 const _CARD_GOOD_SLOTS   : Array[int]    = [0, 2, 4]
 const _CARD_BAD_SLOTS    : Array[int]    = [1, 3, 5]
-const _BIOME_IDX         : Dictionary    = {"grass": 0, "desert": 1, "fall": 4, "sky": 2, "candy": 5}
+const _BIOME_IDX         : Dictionary    = {"grass": 0, "desert": 1, "fall": 4, "sky": 2, "space": 5}
 
 # ── Hoisted temp arrays for _check_interactables (avoids per-tick allocation) ──
 var _ci_to_remove  : Array[int]   = []
@@ -596,7 +600,7 @@ func _run_one_tick() -> void:
 
 	# ── Divergence detector ──────────────────────────────────────────
 	# Also skipped during seek_to_tick()'s silent burst — see comment above.
-	if _dbg_enabled and not _is_seeking and player_ready:
+	if _dbg_enabled and _replay_debug_compare and not _is_seeking and player_ready:
 		var snap_pos   : Vector2 = player.global_position
 		var snap_score : int     = score
 		var snap_vel   : float   = player.velocity.y
@@ -624,6 +628,12 @@ func _run_one_tick() -> void:
 		if _replay_tick_count == 1:
 			_ckpt_log.clear()  # new run — drop any stale entries from a previous game/replay
 		if _replay_tick_count % _CKPT_EVERY == 0:
+			var _breaking_count := 0
+			var _crumble_count := 0
+			for _cp in _platforms:
+				if not is_instance_valid(_cp): continue
+				if bool(_cp.get("_breaking")): _breaking_count += 1
+				if bool(_cp.get("_crumble_shaking")): _crumble_count += 1
 			_ckpt_log.append({
 				"t":  _replay_tick_count,
 				"s":  score,
@@ -636,6 +646,9 @@ func _run_one_tick() -> void:
 				# _rng.state is a full 64-bit int — stringified so JSON (IEEE-754
 				# double under the hood) can't silently lose precision on it.
 				"rng": str(_rng.state),
+				"platforms": _platforms.size(),
+				"breaking": _breaking_count,
+				"crumbling": _crumble_count,
 			})
 
 
@@ -677,7 +690,7 @@ func _simulate_gm_tick() -> void:
 				# seek was pure wasted work slowing the "instant" jump down.
 				if not _is_headless and not _is_seeking and _replay_tick_count % 6 == 0:
 					replay_tick_changed.emit(_replay_tick_count, _replay_total_ticks)
-				if _dbg_enabled and not _is_seeking and _replay_tick_count % 100 == 0:
+				if _dbg_enabled and _replay_debug_compare and not _is_seeking and _replay_tick_count % 100 == 0:
 					print("[SNAP] tick=%d score=%d pos=(%.2f,%.2f) vel_y=%.2f rng=%d" % [_replay_tick_count, score, player.position.x, player.position.y, player.velocity.y, _rng.state])
 			else:
 				_game_over     = true
@@ -1362,7 +1375,9 @@ func _enemies_for_biome(p_score: int = -1) -> Array[Enemy.EnemyType]:
 				Enemy.EnemyType.SLIME_BLOCK,
 				Enemy.EnemyType.GHOST,
 			]
-		"candy":
+		"space":
+			# Uzay biyomu: mevcut uzaylılar tekrar aktif. Her tipin kendi
+			# hareket/AI davranışı Enemy.gd içinde korunur.
 			pool = [
 				Enemy.EnemyType.UFO,
 				Enemy.EnemyType.ALIEN_GREEN,
@@ -1790,7 +1805,15 @@ func _check_interactables() -> void:
 			# preserves "was above it a moment ago" as the real signal for
 			# "approached from above", instead of re-introducing the exact
 			# from-below false-trigger the original bugfix above closed.
-			var falling : bool = player.velocity.y >= 0.0
+			# Player.simulate_tick() runs BEFORE this function and changes
+			# velocity.y immediately on a normal platform landing (it sets
+			# JUMP_SPEED). Reading player.velocity.y here therefore sees the
+			# POST-landing upward velocity, not the velocity that approached
+			# the spring. That made a spring on a breaking platform fire in
+			# live timing but be rejected during replay at the boundary.
+			# _tick_entry_velocity_y is captured at the very start of the same
+			# deterministic tick, before platform landing/bounce resolution.
+			var falling : bool = float(player.get("_tick_entry_velocity_y")) >= 0.0
 			if is_spring and (seg_y0 > ay + 0.05 or not falling):
 				continue
 			if not is_spring and not is_spike and not is_persistent:
@@ -1811,6 +1834,31 @@ func _check_interactables() -> void:
 		var ri : int = _ci_deduped[i]
 		if ri < _interactables.size():
 			_interactables.remove_at(ri)
+
+func trigger_springs_on_landing(plat: Node) -> void:
+	# Deterministic landing hook. The old spring path depended only on the
+	# swept circle test after Player.simulate_tick(); when the same tick also
+	# started a platform break, tiny client/native boundary differences could
+	# make the spring trigger on one side but not the other. Landing already
+	# resolved the exact platform, so use that authoritative event.
+	if not is_instance_valid(plat) or not is_instance_valid(player): return
+	if bool(plat.get("_breaking")):
+		# The platform may have entered break state on this landing; the spring
+		# is still allowed to finish the landing bounce before removal.
+		pass
+	var p_half_w : float = VW * player.HITBOX_W_RATIO
+	for entry in _interactables:
+		if entry.get("type", "") != "spring": continue
+		var area_raw = entry.get("area")
+		if not is_instance_valid(area_raw): continue
+		var area := area_raw as Area2D
+		if area == null or area.get_parent() != plat: continue
+		var used_ref : Array = (entry.get("data") as Dictionary).get("used_ref", [false])
+		if used_ref[0]: continue
+		var spring_r := VW * 0.023 * 1.6
+		if absf(player.global_position.x - area.global_position.x) <= p_half_w + spring_r + 0.05:
+			_trigger_interactable(entry, area)
+
 
 func _trigger_interactable(entry: Dictionary, area: Area2D) -> void:
 	var type : String  = entry["type"]
@@ -1971,13 +2019,17 @@ func _difficulty() -> float:
 
 
 func _biome_name_for_score(s: int) -> String:
-	# 4 biom, 500'er puanlık dilimler, 2000'de başa döner (grass→desert→fall→sky→grass→...)
-	var cycle : int = s % 2000
-	if cycle < 0: cycle += 2000   # negatif skor güvenliği
+	# 5 biyom, 500'er puanlık dilimler:
+	# grass → desert → fall → sky → space → tekrar grass.
+	# Uzay biyomu özellikle 2000-2499 aralığındadır; bu aralıkta
+	# uzaylı havuzu açılır ve Enemy.gd içindeki özel AI'lar çalışır.
+	var cycle : int = s % 2500
+	if cycle < 0: cycle += 2500   # negatif skor güvenliği
 	if cycle < 500:  return "grass"
 	if cycle < 1000: return "desert"
 	if cycle < 1500: return "fall"
-	return "sky"
+	if cycle < 2000: return "sky"
+	return "space"
 
 
 func _ground_set_for_score(s: int) -> Dictionary:
@@ -2725,6 +2777,7 @@ func _init_game_from_seed() -> void:
 	_replay_log         = PackedByteArray()
 	_replay_seed        = 0
 	_replay_nickname    = ""
+	_replay_debug_compare = false
 	_replay_total_ticks = 0
 	_replay_tick        = 0   # kept in sync with _replay_tick_count during PLAYING
 	_replay_tick_count  = 0
@@ -2788,6 +2841,8 @@ func start_replay() -> void:
 		_replay_total_ticks += max(1, (_rle_db >> 2) & 0x3F)  # matches PLAYING path: max(1, ...)
 		_rle_di += 1
 	print("[REPLAY] Playback starting — bytes=%d decoded_ticks=%d seed=%d" % [_replay_log.size(), _replay_total_ticks, _replay_seed])
+	if not _replay_debug_compare:
+		_dbg_snapshots.clear()
 
 	# ── Save the player's OWN seed for returning to lobby (only on first entry) ──
 	if _replay_mode != ReplayMode.PLAYING:
@@ -3182,11 +3237,16 @@ func start_replay_external(ext_seed: int, ext_log: PackedByteArray, ext_char: in
 	_replay_player_seed = ext_player_seed
 	_replay_gyro_active = ext_gyro_active   # gyro-only movement ramp — see set_gyro_control_active doc comment
 	_replay_nickname    = ext_nickname   # set before start_replay so it survives
+	# Empty nickname is the local game-over replay. Leaderboard/stats/VS/web
+	# viewers use a non-empty marker and must not be compared to our old trace.
+	_replay_debug_compare = (ext_nickname == "")
 	start_replay()
 	_replay_nickname    = ext_nickname   # re-set after, start_replay() may clear it
 
 func set_replay_speed(spd: float) -> void:
-	_replay_speed     = spd
+	# Transport controls must never feed NaN/negative/zero into the accumulator.
+	# A zero/invalid value could leave the bar apparently frozen after a seek.
+	_replay_speed     = clampf(spd if is_finite(spd) else 1.0, 0.25, 16.0)
 	_replay_speed_acc = 0.0  # reset accumulated excess ticks
 
 func set_replay_paused(paused: bool) -> void:
@@ -3202,6 +3262,7 @@ func stop_replay() -> void:
 	_replay_mode        = ReplayMode.OFF
 	_replay_paused      = false
 	_replay_nickname    = ""
+	_replay_debug_compare = false
 	_replay_total_ticks = 0
 	_replay_tick        = 0
 	_replay_tick_count  = 0

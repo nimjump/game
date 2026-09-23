@@ -446,6 +446,9 @@ func _render_card(data: Dictionary) -> void:
 	var address  : String = str(data.get("player_id", ""))
 	_target_address = address
 	var nickname : String = UITheme.display_name(str(data.get("nickname", "")), address)
+	var level    : int    = int(data.get("level", 1))
+	var xp_into  : int    = int(data.get("xp_into_level", 0))
+	var xp_next  : int    = int(data.get("xp_for_next_level", 0))
 	var daily_rank  : int = int(data.get("daily_rank", 0))
 	var weekly_rank : int = int(data.get("weekly_rank", 0))
 
@@ -491,8 +494,73 @@ func _render_card(data: Dictionary) -> void:
 				_copy_address(address)
 		)
 
-	# Daily/weekly rank, if any — shown as a small caption under the name
-	# header.
+	# ── Donate / Send NIM ─────────────────────────────────────────────────
+	# Direct wallet-to-wallet transfer — goes straight through the Nimiq
+	# provider/Hub (NimiqJS.request_payment, same channel VSPanel's entry
+	# fee uses), NEVER through our backend. There's nothing for the server
+	# to confirm here (unlike a VS room entry fee, which the backend has to
+	# verify happened before starting a match) — it's just a personal
+	# transfer with a memo, so no /backend/* call is made at all.
+	#
+	# The toggle button sits in the blank space under the nickname/address
+	# (name_col is taller than its labels because it's stretched to the
+	# avatar's height) instead of floating as its own full-width row — a
+	# spacer pushes it to the bottom of that leftover space. The expandable
+	# amount/message form still opens as its own full-width block below the
+	# header row.
+	if address != "" and address != _own_address:
+		var donate_ui := _build_send_ui(address, ref)
+		var donate_spacer := Control.new()
+		donate_spacer.size_flags_vertical = Control.SIZE_EXPAND_FILL
+		name_col.add_child(donate_spacer)
+		name_col.add_child(donate_ui["toggle"])
+		_send_row = donate_ui["form"]
+		_content.add_child(_send_row)
+
+	# ── Level card — same bordered card + star icon + gold rounded-corner
+	# progress bar as StatsPanel's Level card (_add_level_bar), instead of
+	# a bare ColorRect bar floating with no card around it.
+	var lvl_card := PanelContainer.new()
+	lvl_card.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lvl_card.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var lvl_st := StyleBoxFlat.new()
+	lvl_st.bg_color = _C_CARD
+	lvl_st.border_color = _C_BORDER
+	lvl_st.set_border_width_all(2)
+	lvl_st.set_corner_radius_all(10)
+	lvl_card.add_theme_stylebox_override("panel", lvl_st)
+	_content.add_child(lvl_card)
+
+	var lvl_mc := _mpad(int(ref * 0.016))
+	lvl_card.add_child(lvl_mc)
+	var lvl_vbox := VBoxContainer.new()
+	lvl_vbox.add_theme_constant_override("separation", int(ref * 0.006))
+	lvl_mc.add_child(lvl_vbox)
+
+	var lvl_title_row := HBoxContainer.new()
+	lvl_title_row.add_theme_constant_override("separation", int(ref * 0.008))
+	lvl_vbox.add_child(lvl_title_row)
+	lvl_title_row.add_child(UITheme.lucide_icon("star", int(ref * 0.030), _C_GOLD))
+	var lvl_title := Label.new()
+	lvl_title.text = "Level"
+	lvl_title.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	UITheme.apply_label(lvl_title, _C_MID, int(ref * 0.024))
+	lvl_title_row.add_child(lvl_title)
+	var lvl_val_lbl := Label.new()
+	lvl_val_lbl.text = "Lv. %d" % level
+	UITheme.apply_label(lvl_val_lbl, _C_BROWN, int(ref * 0.030))
+	lvl_title_row.add_child(lvl_val_lbl)
+
+	var lvl_xp_lbl := Label.new()
+	lvl_xp_lbl.text = ("%d XP to next level" % (xp_next - xp_into)) if xp_next > 0 else "Max level"
+	UITheme.apply_label(lvl_xp_lbl, _C_MID, int(ref * 0.020))
+	lvl_vbox.add_child(lvl_xp_lbl)
+
+	var xp_pct := 1.0 if xp_next <= 0 else clampf(float(xp_into) / float(xp_next), 0.0, 1.0)
+	_add_level_bar(lvl_vbox, xp_pct, ref)
+
+	# Daily/weekly rank, if any — shown as a small caption under the level
+	# card rather than crammed into the name header.
 	if daily_rank > 0 or weekly_rank > 0:
 		var rank_row := HBoxContainer.new()
 		rank_row.add_theme_constant_override("separation", int(ref * 0.008))

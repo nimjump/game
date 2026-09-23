@@ -153,10 +153,10 @@ func _burn_spike_bottom() -> void:
 ## DİKKAT: _biome_name_for_score() biome adını döndürür (grass/desert/fall/sky),
 ## ama _add_deco/_spawn_platform'daki spike branch kontrolü TOPRAK adını
 ## (grass/sand/snow/stone/wood/cake) kullanır — bunlar farklı string'lerdir!
-## _BIOME_IDX = {"grass":0,"desert":1,"fall":4,"sky":2,"candy":5} ve
+## _BIOME_IDX = {"grass":0,"desert":1,"fall":4,"sky":2,"space":5} ve
 ## ground_pairs sırası = [grass, sand, snow, stone, wood, cake] (idx 0..5).
 const _GROUND_SET_NAME_BY_IDX := ["grass", "sand", "snow", "stone", "wood", "cake"]
-const _BIOME_IDX_LOCAL : Dictionary = {"grass": 0, "desert": 1, "fall": 4, "sky": 2, "candy": 5}
+const _BIOME_IDX_LOCAL : Dictionary = {"grass": 0, "desert": 1, "fall": 4, "sky": 2, "space": 5}
 
 func _ground_name_for_score(s: int) -> String:
 	var bname := _biome_name_for_score(s)
@@ -166,11 +166,12 @@ func _ground_name_for_score(s: int) -> String:
 	return _GROUND_SET_NAME_BY_IDX[0]
 
 
-## GameManager._biome_name_for_score ile AYNI — 4 biom, 500'er dilim, 2000'de döngü.
+## GameManager._biome_name_for_score ile AYNI — 5 biyom, 500'er dilim, 2500'de döngü.
 func _biome_name_for_score(s: int) -> String:
-	var cycle : int = s % 2000
-	if cycle < 0: cycle += 2000
+	var cycle : int = s % 2500
+	if cycle < 0: cycle += 2500
 	if cycle < 500:  return "grass"
 	if cycle < 1000: return "desert"
 	if cycle < 1500: return "fall"
-	return "sky"
+	if cycle < 2000: return "sky"
+	return "space"

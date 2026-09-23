@@ -645,7 +645,7 @@ func _build_list(data: Variant) -> void:
 				elif _armed[0]:
 					_armed[0] = false
 					if ev.global_position.distance_to(_press_gpos[0]) < ref * 0.045:
-						profile_requested.emit(_row_address)
+						pass  # DISABLED: profile_requested.emit(_row_address)
 		)
 
 		var row_mc := _make_margin(pad)

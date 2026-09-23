@@ -70,10 +70,15 @@ const PLATFORM_GAP_FIX := {
 	EnemyType.SPIDER:       -0.026,
 	EnemyType.GHOST:        0.0,
 	EnemyType.UFO:          0.0,
-	EnemyType.ALIEN_GREEN:  0.052,
-	EnemyType.ALIEN_BLUE:   0.052,
-	EnemyType.ALIEN_PINK:   0.052,
-	EnemyType.ALIEN_YELLOW: 0.041,
+	# Alien sprites are scaled to 2.25x (about 9% VW half-height). The
+	# override below is an OFFSET added to PLATFORM_STAND_GAP (0.055 VW),
+	# so 0.035 produces the intended TOTAL 0.090 VW. Using 0.090 here made
+	# the initial snap place aliens 0.145 VW above the platform, while their
+	# jump landing code used 0.090 VW — a visible spawn/landing mismatch.
+	EnemyType.ALIEN_GREEN:  0.035,
+	EnemyType.ALIEN_BLUE:   0.035,
+	EnemyType.ALIEN_PINK:   0.035,
+	EnemyType.ALIEN_YELLOW: 0.035,
 }
 
 # ── FLYMAN ───────────────────────────────────────────────────────────
@@ -116,14 +121,11 @@ const BARNACLE_ATTACK_INTERVAL := 1.5
 var _slime_attack_cd := 0.0
 var _slime_nodes     : Array[Node] = []
 
-# user request: thrown/spat particle attacks (green slime rock, purple slime
-# mini, worm dirt block, cloud rain) shouldn't fire until score 2000+ — most
-# creatures use this same _biome_particle_tex() projectile, not just slime.
-# `difficulty` here is GameManager._difficulty() = score/3000 clamped [0,1],
-# so score 2000 == difficulty 2000/3000. Deterministic pure function of
-# difficulty (no RNG involved in the gate itself), so this stays replay-safe.
-const RANGED_ATK_MIN_SCORE      := 2000.0
-const RANGED_ATK_MIN_DIFFICULTY := RANGED_ATK_MIN_SCORE / 3000.0
+# Thrown/spat particle attacks stay locked until the score reaches 10,000.
+# This is checked from the deterministic GameManager score directly rather
+# than _difficulty(), because _difficulty() deliberately caps at 1.0 around
+# score 3,000 and therefore cannot represent a 10,000-point threshold.
+const RANGED_ATK_MIN_SCORE: int = 10000
 
 # ── SNAIL ────────────────────────────────────────────────────────────
 var _in_shell    := false
@@ -245,6 +247,11 @@ var _ufo_warn_node    : Node  = null  # uyarı (kırmızı nokta) sprite
 var _ufo_beam_area    : Area2D = null  # ışın hasar alanı
 var _ufo_beam_timer   := 0.0
 var _ufo_warn_timer   := 0.0
+var _ufo_damage_cd    := 0.0
+var _ufo_laser_sprite: Sprite2D = null
+var _ufo_muzzle_sprite: Sprite2D = null
+var _ufo_ground_sprite: Sprite2D = null
+var _ufo_impact_sprite: Sprite2D = null
 
 # ── ALIEN ────────────────────────────────────────────────────────────
 var ALIEN_SPEED      : float = 0.0
@@ -257,9 +264,50 @@ const ALIEN_IDLE_CHANCE      := 0.5
 const ALIEN_IDLE_MIN         := 1.5
 const ALIEN_IDLE_MAX         := 3.5
 var _alien_shoot_timer := 0.0
-const ALIEN_SHOOT_INTERVAL := 3.0
+const ALIEN_SHOOT_INTERVAL := 10.0   # pembe alien: 10 sn'de 1 atış, beam 2 sn kalır
 const ALIEN_SHOOT_WARN := 0.4
+const ALIEN_LASER_DURATION := 0.45
+const ALIEN_LASER_RANGE := 0.42
+const ALIEN_LASER_WIDTH := 0.055
 var _alien_shooting := false
+var _alien_laser_timer: float = 0.0
+var _alien_laser_damage_cd: float = 0.0
+var _alien_laser_hit := false
+var _alien_laser_start := Vector2.ZERO
+var _alien_laser_end := Vector2.ZERO
+var _alien_laser_sprite: Sprite2D = null
+var _alien_muzzle_sprite: Sprite2D = null
+var _alien_impact_sprite: Sprite2D = null
+const _ALIEN_LASER_TEX := preload("res://assets/particles/laser_beam.png")
+const _TEX_LASER_BURST := preload("res://assets/particles/laser_burst.png")
+const _TEX_LASER_GROUND := preload("res://assets/particles/laser_ground.png")
+# ── Laser görsel ölçüleri (uzay biyomu) ──────────────────────────────
+# Beam inceltildi: 0.035 VW (21px) → 0.014 VW (~8px).
+const LASER_BEAM_W := 0.014
+# Beam vuruş payı (px) — beam yarım-genişliği (~4px) + küçük affetme.
+# Vuruş, oyuncu MERKEZİ ile değil, oyuncu HITBOX'ı (14.4 x 20) + bu pay ile
+# beam segmentinin kesişimiyle test edilir (_laser_hits_player). Böylece
+# beam vücuda değdiği an hasar işler; hızlı düşüşte tick-atlama (tunneling)
+# da süpürme (swept) testiyle kapanır. Büyüt = daha affedici vuruş.
+const LASER_HIT_PAD := 7.0
+# Namlu çıkış noktaları — beam artık merkezden/yukarıdan değil, silahın
+# ucundan çıkıyor (UFO göbeği / alien göğsü).
+const UFO_MUZZLE_DOWN_VW := 0.035
+const ALIEN_MUZZLE_DOWN_VW := 0.020
+# Efekt boyutları (VW oranı).
+const UFO_MUZZLE_SIZE_VW := 0.055
+const UFO_GROUND_W_VW := 0.110
+const UFO_IMPACT_BURST_VW := 0.050
+# UFO beam eklem ölçüleri (px) — beam'in iki ucu da efektlerin içine gömülür,
+# kesik kenar asla görünmez; beam tam olarak efektlerden çıkıyor gibi durur.
+const UFO_BEAM_TOP_TUCK := 6.0   # üst uç namlu flash'ının içine gömülür
+const UFO_BEAM_SINK := 5.0       # alt uç yer efektinin çekirdeğine gömülür
+const UFO_GROUND_JOINT_Y := 60.0 # ground dokusunda çekirdek noktası (ölçüldü: beyaz 49-75)
+const ALIEN_MUZZLE_SIZE_VW := 0.050
+const ALIEN_IMPACT_SIZE_VW := 0.070
+# Alien beam uçları bu kadar px burst'lerin içine gömülür (sadece görsel);
+# kesik kenar görünmez, beam tam olarak flash'lardan çıkıyor gibi durur.
+const ALIEN_BEAM_SINK := 5.0
 
 # ── WORM ─────────────────────────────────────────────────────────────
 const WORM_BABY_SCALE      := 0.8   # was 0.6 — too small per request, bumped up (still smaller than adult)
@@ -516,14 +564,22 @@ func _pool_track_tween(entry: Dictionary, tw: Tween) -> void:
 	list.append(tw)
 	entry["node"].set_meta("_tweens", list)
 
+func _ranged_attacks_unlocked() -> bool:
+	var gm: Node = _gm_ref if is_instance_valid(_gm_ref) else get_parent()
+	if not is_instance_valid(gm):
+		return false
+	return int(gm.get("score")) >= RANGED_ATK_MIN_SCORE
+
+
 func _biome_particle_tex() -> Texture2D:
 	var s : int = int(_gm_ref.get("score")) if is_instance_valid(_gm_ref) else 0
-	var slot := (maxi(s, 0) / 500) % 4
+	var slot := (maxi(s, 0) / 500) % 5
 	match slot:
 		0: return _TEX_PARTICLE_GREEN
 		1: return _TEX_PARTICLE_GREY
 		2: return _TEX_PARTICLE_BEIGE
-		_: return _TEX_PARTICLE_BLUE
+		3: return _TEX_PARTICLE_BLUE
+		_: return _TEX_PARTICLE_BLUE  # space: mevcut mavi parçacık fallback
 
 # EN-11: free pool nodes when this enemy is removed from the tree
 func _exit_tree() -> void:
@@ -791,7 +847,7 @@ func _special_setup() -> void:
 			_start_vertical_bob(12.0, 2.2)
 
 		EnemyType.UFO:
-			UFO_HOVER_SPEED = _vw * 0.0027 * GameConstants.SPEED_BUFF
+			UFO_HOVER_SPEED = _vw * 0.0009 * GameConstants.SPEED_BUFF
 			UFO_HOVER_RANGE = _vw * 0.30
 			if sf and sf.has_animation("idle"): _anim.play("idle")
 			elif sf: _anim.play(sf.get_animation_names()[0])
@@ -799,14 +855,16 @@ func _special_setup() -> void:
 			_start_vertical_bob(_vh * 0.025, 3.5)
 			_ufo_fire_timer = _rng.randf_range(UFO_FIRE_INTERVAL_MIN, UFO_FIRE_INTERVAL_MAX)
 			_ufo_firing     = false
+			_ufo_beam_timer = 0.0
+			_ufo_damage_cd  = 0.0
 			if not _is_headless and is_instance_valid(_anim):
 				_anim.scale *= 1.3
 
 		EnemyType.ALIEN_GREEN:
+			# Green is one of the two simple aliens: only a calm left/right
+			# patrol. It deliberately does not use the platform-jump engine.
 			ALIEN_SPEED = _vw * lerpf(0.0008, 0.0015, difficulty) * GameConstants.SPEED_BUFF
-			_frog_cur_platform = _platform
-			_frog_gm           = get_parent()
-			_alien_jump_timer  = _rng.randf_range(ALIEN_JUMP_INTERVAL, ALIEN_JUMP_INTERVAL * 1.5)
+			can_fly = false
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			_start_patrol(ALIEN_SPEED)
 			if is_instance_valid(_col): _col.position.y = _vw * 0.06
@@ -814,7 +872,15 @@ func _special_setup() -> void:
 				_anim.scale *= 2.25
 
 		EnemyType.ALIEN_BLUE:
+			# Blue is the platform-jumper. Reuse the tested frog jump engine
+			# so landing, clamps and tick/replay behaviour stay consistent.
 			ALIEN_SPEED = _vw * lerpf(0.0006, 0.0012, difficulty) * GameConstants.SPEED_BUFF
+			can_fly             = false
+			_frog_jumping       = false
+			_frog_home_platform = _platform
+			_frog_cur_platform  = _platform
+			_frog_gm            = get_parent()
+			_alien_jump_timer   = _rng.randf_range(2.6, 4.0)
 			if sf and sf.has_animation("walk"): _anim.play("walk")
 			_start_patrol(ALIEN_SPEED)
 			if is_instance_valid(_col): _col.position.y = _vw * 0.06
@@ -1048,8 +1114,10 @@ func _special_process(delta: float) -> void:
 			_ufo_ai(delta)
 		EnemyType.ALIEN_GREEN:
 			_alien_green_ai(delta)
-		EnemyType.ALIEN_BLUE, EnemyType.ALIEN_YELLOW:
-			pass  # sadece patrol
+		EnemyType.ALIEN_BLUE:
+			_alien_blue_ai(delta)
+		EnemyType.ALIEN_YELLOW:
+			pass  # ikinci basit alien: sadece sağ/sol patrol
 		EnemyType.ALIEN_PINK:
 			_alien_pink_ai(delta)
 
@@ -1261,10 +1329,10 @@ func _cloud_ai(_delta: float) -> void:
 	# Rain: player is below us (dy > 0) and close on X
 	_cloud_rain_timer = maxf(0.0, _cloud_rain_timer - FIXED_DELTA)
 	if dy > 0.0 and abs(p.global_position.x - global_position.x) < CLOUD_RAIN_RANGE_X and _cloud_rain_timer <= 0.0:
-		# user request: rain-drop particle attack locked out below score 2000,
+		# user request: rain-drop particle attack locked out below score 10000,
 		# same as the other thrown-particle attacks — cooldown still rolls so
 		# pacing stays identical whether or not it actually fires.
-		if difficulty >= RANGED_ATK_MIN_DIFFICULTY:
+		if _ranged_attacks_unlocked():
 			_cloud_spawn_rain()
 		_cloud_rain_timer = CLOUD_RAIN_CD
 
@@ -1464,6 +1532,8 @@ func _frog_get_neighbor_platforms() -> Array:
 	var best_down_d: float = INF
 	for pl in plat_list:
 		if not is_instance_valid(pl): continue
+		if pl.get("platform_type") == Platform.PlatformType.BROKEN: continue
+		if pl.get("_breaking") == true: continue
 		var pdx : float = abs(pl.global_position.x - anchor.x)
 		var pdy : float = pl.global_position.y - anchor.y   # +down, -up
 		if pdx > max_dx: continue          # too far sideways — unreachable
@@ -1510,6 +1580,25 @@ func _spider_best_platform_vertical(candidates: Array) -> Node:
 
 # Jump to target platform Y, choose a sensible X point on top of the platform
 func _frog_jump_to_platform(target_plat: Node) -> void:
+	# Platforms can be recycled while the enemy is deciding its target. Never
+	# start a move segment from a stale platform reference; that was the source
+	# of occasional mid-jump freezes/teleports.
+	if not is_instance_valid(target_plat) or not target_plat.is_inside_tree():
+		# Hedef geçersizleşmişse alien kendi platformuna zıplamaz — sadece
+		# vazgeçip patrol'e devam eder (frog'un eski fallback'i korunur).
+		if enemy_type >= EnemyType.ALIEN_GREEN and enemy_type <= EnemyType.ALIEN_YELLOW:
+			_frog_jumping = false
+			_snap_disabled = false
+			_xclamp_disabled = false
+			_snap_dirty = true
+			if not _patrol_active:
+				_start_patrol_from(global_position.x, ALIEN_SPEED, true)
+			if is_instance_valid(_anim):
+				var sf0 := _anim.sprite_frames
+				if sf0 and sf0.has_animation("walk"): _anim.play("walk")
+			return
+		_frog_do_jump_same_platform(1.0 if _rng.randf() < 0.5 else -1.0)
+		return
 	_frog_jumping     = true
 	_frog_jump_cd     = _rng_range(1.5, 2.6)  # slightly longer pause before next jump
 	_snap_disabled    = true
@@ -1544,7 +1633,10 @@ func _frog_jump_to_platform(target_plat: Node) -> void:
 	var land_y  : float
 	var is_alien := enemy_type in [EnemyType.ALIEN_GREEN, EnemyType.ALIEN_BLUE,
 								   EnemyType.ALIEN_PINK, EnemyType.ALIEN_YELLOW]
-	var y_gap := _vw * 0.09 if is_alien else _platform_gap()
+	# Use the same resolved gap as initial platform snapping. Previously alien
+	# landing used a hard-coded 0.09 while initial spawn used the override on
+	# top of PLATFORM_STAND_GAP, so aliens visibly changed height after a hop.
+	var y_gap: float = _platform_gap()
 	if ps and ps.shape:
 		land_y = target_plat.global_position.y - ps.shape.size.y * 0.5 - y_gap
 	else:
@@ -1565,7 +1657,7 @@ func _frog_jump_to_platform(target_plat: Node) -> void:
 	# Slightly slower overall pace (lower divisor), and a higher floor so a SHORT
 	# hop (small dist_2d) doesn't snap to a near-instant minimum — close jumps now
 	# take noticeably longer instead of looking twitchy.
-	var jump_time : float = clampf(dist_2d / (_vw * 0.46), 0.34, 0.78)
+	var jump_time : float = clampf(dist_2d / (_vw * 0.46) * 1.5, 0.51, 1.17)
 
 	_move_to(peak_pos, jump_time * 0.5, false, true)
 	_move_to(land_pos, jump_time * 0.5, true, false, false, func():
@@ -1580,7 +1672,9 @@ func _frog_jump_to_platform(target_plat: Node) -> void:
 			var sf := _anim.sprite_frames
 			if is_alien:
 				if sf and sf.has_animation("walk"): _anim.play("walk")
-				_start_patrol_from(global_position.x, ALIEN_SPEED, false)
+				# resume=TRUE: indiği konumdan devam eder, patrol fazı rastgele
+				# sıfırlanıp küçük bir ışınlanma yapmaz (önceki FALSE'tu).
+				_start_patrol_from(global_position.x, ALIEN_SPEED, true)
 			elif sf and sf.has_animation("idle"):
 				_anim_play("idle")
 	)
@@ -1610,7 +1704,7 @@ func _frog_do_jump_same_platform(dir: float) -> void:
 	var sp_dist  : float   = abs(target_x - gpos.x)
 	# Same fix as the cross-platform jump: lower pace + higher floor so jumping
 	# to a NEARBY spot doesn't snap to a near-instant hop.
-	var sp_time  : float   = clampf(sp_dist / (_vw * 0.46), 0.30, 0.55)
+	var sp_time  : float   = clampf(sp_dist / (_vw * 0.46) * 1.5, 0.45, 0.825)
 	_move_to(peak_pos, sp_time * 0.5, false, true)
 	_move_to(land_pos, sp_time * 0.5, true, false, false, func():
 		_snap_disabled = false
@@ -1716,17 +1810,17 @@ func _slime_ai(_delta: float) -> void:
 				# BUG FIX: eskiden "if not _is_headless:" ile çağrılıyordu, yani
 				# headless'ta bu saldırının kaydettiği gerçek proj_damage hiç
 				# oluşmuyordu (bkz. _init_tex_cache'teki not). Artık her modda çağrılıyor.
-				# user request: rock-spit particle attack locked out below score 2000
+				# user request: rock-spit particle attack locked out below score 10000
 				# — cooldown still rolls every time so RNG stream/pacing stays identical
 				# whether or not the spit itself fires.
-				if difficulty >= RANGED_ATK_MIN_DIFFICULTY:
+				if _ranged_attacks_unlocked():
 					_slime_green_spit(p)
 				_slime_attack_cd = _rng_range(4.0, 6.0) * (1.0 - difficulty * 0.2)
 		EnemyType.SLIME_PURPLE:
 			var r := _vw * 0.167; if dist_sq < r * r:
-				# user request: mini-spawn particle attack locked out below score 2000,
+				# user request: mini-spawn particle attack locked out below score 10000,
 				# same as the other thrown-particle attacks.
-				if difficulty >= RANGED_ATK_MIN_DIFFICULTY:
+				if _ranged_attacks_unlocked():
 					_slime_purple_spawn_mini(p)   # BUG FIX: aynı şekilde artık her modda çalışıyor
 				_slime_attack_cd = _rng_range(4.5, 7.0) * (1.0 - difficulty * 0.3)
 
@@ -1950,10 +2044,10 @@ func _worm_ai(_delta: float) -> void:
 	var p := _get_player()
 	if not p: return
 	if global_position.distance_squared_to(p.global_position) < WORM_DIRT_RANGE * WORM_DIRT_RANGE and _worm_dirt_timer <= 0.0:
-		# user request: dirt-block particle throw locked out below score 2000,
+		# user request: dirt-block particle throw locked out below score 10000,
 		# same as the other thrown-particle attacks — cooldown still rolls so
 		# pacing/RNG stream stays identical whether or not it actually fires.
-		if difficulty >= RANGED_ATK_MIN_DIFFICULTY:
+		if _ranged_attacks_unlocked():
 			_worm_throw_dirt(p)
 		_worm_dirt_timer = WORM_DIRT_COOLDOWN * (1.0 - difficulty * 0.3)
 
@@ -2056,8 +2150,12 @@ func _worm_split_and_die(_stomper: Node) -> void:
 	var gm := get_parent()
 	if gm and gm.has_method("apply_camera_shake"):
 		gm.apply_camera_shake(4.0, 0.18)
-	for offset in [Vector2(-_vw * 0.037, 0), Vector2(_vw * 0.037, 0)]:
-		_worm_spawn_baby(offset)
+	# Worms now die as a single enemy. Keep the split/baby implementation
+	# below for compatibility and future tuning, but do not invoke it on death.
+	const WORM_SPLIT_ON_DEATH: bool = false
+	if WORM_SPLIT_ON_DEATH:
+		for offset in [Vector2(-_vw * 0.037, 0), Vector2(_vw * 0.037, 0)]:
+			_worm_spawn_baby(offset)
 	if is_instance_valid(_anim) and _anim.sprite_frames:
 		if _anim.sprite_frames.has_animation("hurt"):
 			if is_instance_valid(_anim): _anim.play("hurt")
@@ -2503,6 +2601,10 @@ func _spider_web_jump_to(target_plat: Node) -> void:
 func _on_removed() -> void:
 	if enemy_type == EnemyType.SPIDER:
 		_spider_despawn_web()
+	if enemy_type == EnemyType.UFO or (enemy_type >= EnemyType.ALIEN_GREEN and enemy_type <= EnemyType.ALIEN_YELLOW):
+		# Ölümde beam'ler anında gizlenir (ölüm tween'iyle büyüyüp sönmesinler).
+		_hide_ufo_laser()
+		_hide_alien_laser()
 
 
 func _spider_despawn_web() -> void:
@@ -2563,71 +2665,316 @@ func _ghost_ai(_delta: float) -> void:
 			_move_cancel()
 
 
-func _ufo_ai(_delta: float) -> void:
-	pass  # sadece patrol
+func _ufo_ai(delta: float) -> void:
+	# UFO beam — ince dikey laser + namlu parlaması (burst) + yer impact'i (ground).
+	# FIX: beam artık UFO merkezinden (yukarından) değil, göbeğinden çıkıyor.
+	# Beam ince (LASER_BEAM_W); vuruş hitbox+süpürme testiyle (_laser_hits_player).
+	_ufo_fire_timer = maxf(0.0, _ufo_fire_timer - delta)
+	_ufo_damage_cd = maxf(0.0, _ufo_damage_cd - delta)
+	var muzzle: Vector2 = global_position + Vector2(0.0, _vw * UFO_MUZZLE_DOWN_VW)
+	var beam_end: Vector2 = muzzle + Vector2(0.0, _vh * 0.30)
+	if _ufo_firing:
+		_ufo_beam_timer -= delta
+		if not _is_headless:
+			var beam_top: Vector2 = muzzle - Vector2(0.0, UFO_BEAM_TOP_TUCK)
+			var beam_bot: Vector2 = beam_end + Vector2(0.0, UFO_BEAM_SINK)
+			var beam_len: float = beam_bot.y - beam_top.y
+			_ufo_laser_sprite = _ensure_laser_child(_ufo_laser_sprite, _ALIEN_LASER_TEX, 6)
+			_ufo_laser_sprite.global_position = (beam_top + beam_bot) * 0.5
+			_ufo_laser_sprite.rotation = 0.0
+			_ufo_laser_sprite.scale = Vector2((_vw * LASER_BEAM_W) / 38.0, beam_len / 100.0)
+			_ufo_laser_sprite.visible = true
+			# Namlu parlaması — burst, UFO göbeğinde oturur; beam üst ucu içinde.
+			_ufo_muzzle_sprite = _ensure_laser_child(_ufo_muzzle_sprite, _TEX_LASER_BURST, 7)
+			_ufo_muzzle_sprite.global_position = muzzle
+			var ms: float = (_vw * UFO_MUZZLE_SIZE_VW) / 188.0
+			_ufo_muzzle_sprite.scale = Vector2(ms, ms)
+			_ufo_muzzle_sprite.visible = true
+			_ufo_muzzle_sprite.rotation += delta * 2.5
+			# Yer impact'i — dokunun çekirdek noktası (UFO_GROUND_JOINT_Y) tam
+			# beam_end'e oturur; taban çizgisi şok dalgası gibi altta kalır,
+			# beam alt ucu çekirdeğin içinde gömülüdür.
+			_ufo_ground_sprite = _ensure_laser_child(_ufo_ground_sprite, _TEX_LASER_GROUND, 7)
+			var gs: float = (_vw * UFO_GROUND_W_VW) / 172.0
+			var pulse: float = 1.0 + 0.06 * sin(float(Time.get_ticks_msec()) * 0.02)
+			_ufo_ground_sprite.scale = Vector2(gs, gs) * pulse
+			_ufo_ground_sprite.global_position = beam_end - Vector2(0.0, (UFO_GROUND_JOINT_Y - 39.0) * gs * pulse)
+			_ufo_ground_sprite.visible = true
+			# Eklem flaşı — beam ile yer efektinin birleşimini maskeler; beam
+			# tam olarak buradan çıkıyor gibi görünür.
+			_ufo_impact_sprite = _ensure_laser_child(_ufo_impact_sprite, _TEX_LASER_BURST, 8)
+			_ufo_impact_sprite.global_position = beam_end
+			var js: float = (_vw * UFO_IMPACT_BURST_VW) / 188.0
+			_ufo_impact_sprite.scale = Vector2(js, js)
+			_ufo_impact_sprite.visible = true
+			_ufo_impact_sprite.rotation -= delta * 3.0
+			# Hafif titreme — beam canlı dursun (sadece görsel, oyunu etkilemez).
+			var flick: float = 0.92 + 0.08 * sin(float(Time.get_ticks_msec()) * 0.025)
+			_ufo_laser_sprite.modulate = Color(1, 1, 1, flick)
+			_ufo_muzzle_sprite.modulate = Color(1, 1, 1, 0.9 + 0.1 * sin(float(Time.get_ticks_msec()) * 0.03))
+			_ufo_impact_sprite.modulate = Color(1, 1, 1, 0.85 + 0.15 * sin(float(Time.get_ticks_msec()) * 0.035))
+		if _ufo_beam_timer <= 0.0:
+			_ufo_firing = false
+			_hide_ufo_laser()
+			return
+		var p: Node = _get_player()
+		if is_instance_valid(p) and _ufo_damage_cd <= 0.0:
+			if _laser_hits_player(p, muzzle, beam_end):
+				if p.try_beam_hit():
+					_ufo_damage_cd = 0.45
+		return
+	if _ufo_fire_timer <= 0.0:
+		_ufo_firing = true
+		_ufo_beam_timer = UFO_BEAM_DURATION
+		_ufo_damage_cd = 0.0
+		_ufo_fire_timer = _rng.randf_range(UFO_FIRE_INTERVAL_MIN, UFO_FIRE_INTERVAL_MAX)
+		if not _is_headless and is_instance_valid(_anim) and _anim.sprite_frames:
+			if _anim.sprite_frames.has_animation("idle"):
+				_anim.play("idle")
 
 
 func _alien_green_ai(_delta: float) -> void:
-	const FIXED_DELTA := 1.0 / 60.0
-	if _frog_jumping: return
-	# %30 zıpla, %70 yürümeye devam et
-	if _rng.randf() > 0.30: return
-	var neighbors : Array = _frog_get_neighbor_platforms()
-	if neighbors.is_empty(): return
-	var candidates : Array = neighbors.filter(func(pl): return pl != _frog_cur_platform)
-	if candidates.is_empty(): candidates = neighbors
-	var target_plat : Node = candidates[_rng.randi() % candidates.size()]
-	if not _is_headless and is_instance_valid(_anim) and _anim.sprite_frames:
-		if _anim.sprite_frames.has_animation("jump"): _anim.play("jump")
-	_frog_jump_to_platform(target_plat)
+	# Intentionally empty: patrol is driven by EnemyBase._tick_patrol().
+	# Keeping this explicit avoids accidentally adding per-tick movement here.
+	pass
 
 
 func _alien_blue_ai(_delta: float) -> void:
 	const FIXED_DELTA := 1.0 / 60.0
+	if _frog_jumping: return
 	_alien_jump_timer -= FIXED_DELTA
 	if _alien_jump_timer > 0.0: return
-	_alien_jump_timer = _rng.randf_range(ALIEN_JUMP_INTERVAL * 0.6, ALIEN_JUMP_INTERVAL)
-	var p := _get_player()
-	var jump_dir := 1.0
-	if is_instance_valid(p):
-		jump_dir = signf(p.global_position.x - global_position.x)
-		if jump_dir == 0.0: jump_dir = 1.0
-	elif is_instance_valid(_anim):
-		jump_dir = -1.0 if _anim.flip_h else 1.0
-	if not _is_headless and is_instance_valid(_anim) and _anim.sprite_frames:
-		if _anim.sprite_frames.has_animation("jump"): _anim.play("jump")
-	_stop_patrol()
-	var jump_dist := _vw * _rng.randf_range(0.12, 0.22)
-	var land_x := global_position.x + jump_dir * jump_dist
-	var peak   := Vector2(global_position.x + jump_dir * jump_dist * 0.5,
-						  global_position.y - _vh * 0.10)
-	var land   := Vector2(land_x, global_position.y)
-	_move_to(peak, 0.22, false, true)
-	_move_to(land, 0.22, true, false, false, func():
+	_alien_jump_timer = _rng.randf_range(2.6, 4.0)
+	var neighbors := _frog_get_neighbor_platforms()
+	# Mavi alien SADECE başka platforma zıplar — üstünde durduğuna asla.
+	# Kimlik (stale ref güvenliği için hem _frog_cur_platform hem _platform)
+	# + seviye kontrolü (bulucunun "o platform" kuralı: |Δy| ≤ 2.0) ile elenir.
+	var anchor_y: float = global_position.y
+	if is_instance_valid(_frog_cur_platform):
+		anchor_y = _frog_cur_platform.global_position.y
+	elif is_instance_valid(_platform):
+		anchor_y = _platform.global_position.y
+	var candidates: Array = []
+	for pl in neighbors:
+		if not is_instance_valid(pl):
+			continue
+		if pl == _frog_cur_platform or pl == _platform:
+			continue
+		if absf(pl.global_position.y - anchor_y) <= 2.0:
+			continue
+		candidates.append(pl)
+	if not candidates.is_empty():
+		var target_plat : Node = candidates[_rng.randi() % candidates.size()]
 		if not _is_headless and is_instance_valid(_anim) and _anim.sprite_frames:
-			if _anim.sprite_frames.has_animation("walk"): _anim.play("walk")
-		_start_patrol(ALIEN_SPEED * 0.5)
-	)
-	_anim_flip(jump_dir)
+			if _anim.sprite_frames.has_animation("jump"): _anim.play("jump")
+		_frog_jump_to_platform(target_plat)
+	else:
+		# Ulaşılabilir başka platform yoksa kendi üstünde zıplama — sadece
+		# patrol'e devam et, sonraki timer'da tekrar dene.
+		if not _patrol_active:
+			_start_patrol_from(global_position.x, ALIEN_SPEED, true)
 
 
 func _alien_pink_ai(_delta: float) -> void:
-	const FIXED_DELTA := 1.0 / 60.0
-	if _alien_shooting: return
-	_alien_shoot_timer -= FIXED_DELTA
-	if _alien_shoot_timer > 0.0: return
-	_alien_shoot_timer = _rng.randf_range(ALIEN_SHOOT_INTERVAL * 0.7, ALIEN_SHOOT_INTERVAL * 1.3)
-	_alien_shooting = true
-	_stop_patrol()
-	if not _is_headless and is_instance_valid(_anim) and _anim.sprite_frames:
-		if _anim.sprite_frames.has_animation("shoot"): _anim.play("shoot")
-	var tw := _make_tween()
-	if tw:
-		tw.tween_interval(1.2)
-		tw.tween_callback(func():
-			if not is_instance_valid(self) or _state == "dead": return
+	# Pink alien fires a fixed destination laser. It does not track the player
+	# after firing: the endpoint is chosen once, stays for two seconds, then
+	# the beam disappears. Gameplay uses the same segment in headless mode.
+	# FIX: beam artık merkezden/yukarıdan değil, namludan (göğüs hizası) çıkar.
+	# Beam inceltildi (0.035 → LASER_BEAM_W), hitbox da görselle tutarlı daraltıldı.
+	# Namlu + uç noktalarında burst efektleri var.
+	const FIXED_DELTA: float = 1.0 / 60.0
+	_alien_shoot_timer = maxf(0.0, _alien_shoot_timer - FIXED_DELTA)
+	if _alien_shooting:
+		_alien_laser_timer = maxf(0.0, _alien_laser_timer - FIXED_DELTA)
+		var player: Node = _get_player()
+		if is_instance_valid(player) and not _alien_laser_hit:
+			if _laser_hits_player(player, _alien_laser_start, _alien_laser_end):
+				if player.try_beam_hit():
+					_alien_laser_hit = true
+		if not _is_headless:
+			_alien_laser_flicker()
+		if _alien_laser_timer <= 0.0:
 			_alien_shooting = false
-			if not _is_headless and is_instance_valid(_anim) and _anim.sprite_frames:
-				if _anim.sprite_frames.has_animation("walk"): _anim.play("walk")
+			_hide_alien_laser()
 			_start_patrol_from(global_position.x, ALIEN_SPEED, true)
-		)
+			if not _is_headless and is_instance_valid(_anim) and _anim.sprite_frames and _anim.sprite_frames.has_animation("walk"):
+				_anim.play("walk")
+		return
+	if _alien_shoot_timer > 0.0:
+		return
+	_alien_shoot_timer = _rng.randf_range(ALIEN_SHOOT_INTERVAL * 0.9, ALIEN_SHOOT_INTERVAL * 1.1)
+	_alien_shooting = true
+	_alien_laser_timer = 2.0
+	_alien_laser_hit = false
+	_stop_patrol()
+	# Namlu: göğüs/silah hizası — merkezin biraz altı. Nişan da namludan alınır,
+	# böylece beam görsel çıkış noktasıyla aynı doğrultuda gider.
+	var muzzle: Vector2 = global_position + Vector2(0.0, _vw * ALIEN_MUZZLE_DOWN_VW)
+	var player: Node = _get_player()
+	var direction := Vector2.UP
+	if is_instance_valid(player):
+		direction = (player.global_position - muzzle).normalized()
+	# Only the upper 180-degree arc is allowed. If the player is below,
+	# choose the nearest upward direction instead of firing downward.
+	if direction.y > 0.0:
+		direction.y = -0.05
+		direction = direction.normalized()
+	_alien_laser_start = muzzle
+	_alien_laser_end = muzzle + direction * (_vw * 0.30)
+	if not _is_headless:
+		_alien_laser_sprite = _ensure_laser_child(_alien_laser_sprite, _ALIEN_LASER_TEX, 6)
+		# Görsel beam vuruş segmentinden iki uçta da SINK kadar uzundur —
+		# uçlar burst çekirdeklerinin içinde gömülü kalır (vuruş aynı).
+		var beam_a: Vector2 = _alien_laser_start - direction * ALIEN_BEAM_SINK
+		var beam_b: Vector2 = _alien_laser_end + direction * ALIEN_BEAM_SINK
+		_alien_laser_sprite.global_position = (beam_a + beam_b) * 0.5
+		_alien_laser_sprite.rotation = direction.angle() - PI * 0.5
+		_alien_laser_sprite.scale = Vector2((_vw * LASER_BEAM_W) / 38.0, ((_vw * 0.30) + ALIEN_BEAM_SINK * 2.0) / 100.0)
+		_alien_laser_sprite.visible = true
+		_alien_laser_sprite.modulate = Color(1, 1, 1, 1)
+		# Namlu parlaması — beam'in alien'den çıktığı noktayı net gösterir.
+		_alien_muzzle_sprite = _ensure_laser_child(_alien_muzzle_sprite, _TEX_LASER_BURST, 7)
+		_alien_muzzle_sprite.global_position = _alien_laser_start
+		var mms: float = (_vw * ALIEN_MUZZLE_SIZE_VW) / 188.0
+		_alien_muzzle_sprite.scale = Vector2(mms, mms)
+		_alien_muzzle_sprite.visible = true
+		_alien_muzzle_sprite.modulate = Color(1, 1, 1, 1)
+		# Uç impact'i — beam'in bittiği noktada patlama parlaması.
+		_alien_impact_sprite = _ensure_laser_child(_alien_impact_sprite, _TEX_LASER_BURST, 7)
+		_alien_impact_sprite.global_position = _alien_laser_end
+		var ims: float = (_vw * ALIEN_IMPACT_SIZE_VW) / 188.0
+		_alien_impact_sprite.scale = Vector2(ims, ims)
+		_alien_impact_sprite.visible = true
+		_alien_impact_sprite.modulate = Color(1, 1, 1, 1)
+	if not _is_headless and is_instance_valid(_anim) and _anim.sprite_frames and _anim.sprite_frames.has_animation("shoot"):
+		_anim.play("shoot")
+
+
+# ── Laser yardımcıları (uzay biyomu) ───────────────────────────────────
+# Sadece görsel — headless oyunu etkilemez. Hepsi _is_headless guard'ı altında çağrılır.
+func _ensure_laser_child(cur: Sprite2D, tex: Texture2D, z: int) -> Sprite2D:
+	if is_instance_valid(cur):
+		if cur.texture != tex:
+			cur.texture = tex
+		cur.z_index = z
+		return cur
+	var spr := Sprite2D.new()
+	spr.texture = tex
+	spr.z_index = z
+	spr.centered = true
+	add_child(spr)
+	return spr
+
+
+func _hide_ufo_laser() -> void:
+	if is_instance_valid(_ufo_laser_sprite):
+		_ufo_laser_sprite.visible = false
+	if is_instance_valid(_ufo_muzzle_sprite):
+		_ufo_muzzle_sprite.visible = false
+	if is_instance_valid(_ufo_ground_sprite):
+		_ufo_ground_sprite.visible = false
+	if is_instance_valid(_ufo_impact_sprite):
+		_ufo_impact_sprite.visible = false
+
+
+func _hide_alien_laser() -> void:
+	if is_instance_valid(_alien_laser_sprite):
+		_alien_laser_sprite.visible = false
+	if is_instance_valid(_alien_muzzle_sprite):
+		_alien_muzzle_sprite.visible = false
+	if is_instance_valid(_alien_impact_sprite):
+		_alien_impact_sprite.visible = false
+
+
+func _alien_laser_flicker() -> void:
+	var t: float = float(Time.get_ticks_msec()) * 0.025
+	if is_instance_valid(_alien_laser_sprite) and _alien_laser_sprite.visible:
+		_alien_laser_sprite.modulate = Color(1, 1, 1, 0.9 + 0.1 * sin(t))
+	if is_instance_valid(_alien_muzzle_sprite) and _alien_muzzle_sprite.visible:
+		_alien_muzzle_sprite.rotation += (1.0 / 60.0) * 3.0
+		_alien_muzzle_sprite.modulate = Color(1, 1, 1, 0.85 + 0.15 * sin(t * 1.3))
+		var mms: float = (_vw * ALIEN_MUZZLE_SIZE_VW) / 188.0 * (1.0 + 0.08 * sin(t * 1.3))
+		_alien_muzzle_sprite.scale = Vector2(mms, mms)
+	if is_instance_valid(_alien_impact_sprite) and _alien_impact_sprite.visible:
+		_alien_impact_sprite.rotation -= (1.0 / 60.0) * 2.0
+		var k: float = clampf(_alien_laser_timer / 2.0, 0.0, 1.0)
+		_alien_impact_sprite.modulate = Color(1, 1, 1, 0.65 + 0.35 * k)
+		var ims: float = (_vw * ALIEN_IMPACT_SIZE_VW) / 188.0 * (1.0 + 0.10 * sin(t * 0.9 + 1.0))
+		_alien_impact_sprite.scale = Vector2(ims, ims)
+
+
+# Beam vuruş testi — oyuncu hitbox'ının bu tick'teki SÜPÜRÜLMÜŞ kutusu
+# (tick-giriş + şu-an konumu birleşimi) ile beam segmentinin kesişimi.
+# Nokta-mesafe testinden farklı olarak hızlı harekette tick-atlama yapmaz
+# ve beam vücuda değdiği an (merkez daha uzaktayken bile) hasarı işletir.
+# Sadece +,-,*,/ ve karşılaştırma kullanır — determinizm güvenli (sin/cos yok).
+func _laser_hits_player(p: Node, a: Vector2, b: Vector2) -> bool:
+	if not is_instance_valid(p):
+		return false
+	var cur: Vector2 = p.global_position
+	var ex0: float = cur.x
+	var ey0: float = cur.y
+	var entry: Variant = p.get("_tick_entry_position")
+	if entry is Vector2:
+		ex0 = (entry as Vector2).x
+		ey0 = (entry as Vector2).y
+		# WRAP FIX (_tick_player_overlap ile aynı): ekran-sarma ışınlanmasında
+		# giriş→çıkış tüm ekranı kateder gibi görünür; o tick süpürme yapma.
+		if absf(cur.x - ex0) > _vw * 0.5:
+			ex0 = cur.x
+			ey0 = cur.y
+	# Oyuncu hitbox yarı-ölçüleri — Player.gd HITBOX_W/H_RATIO ile aynı değerler.
+	var phw: float = _vw * 0.024
+	var phh: float = _vh * 0.025
+	var pad: float = LASER_HIT_PAD
+	var minx: float = minf(ex0, cur.x) - phw - pad
+	var maxx: float = maxf(ex0, cur.x) + phw + pad
+	var miny: float = minf(ey0, cur.y) - phh - pad
+	var maxy: float = maxf(ey0, cur.y) + phh + pad
+	return _seg_intersects_aabb(a, b, minx, miny, maxx, maxy)
+
+
+# Segment-vs-AABB kesişimi (slab yöntemi). Determinizm güvenli.
+func _seg_intersects_aabb(a: Vector2, b: Vector2, minx: float, miny: float, maxx: float, maxy: float) -> bool:
+	var tmin := 0.0
+	var tmax := 1.0
+	var dx: float = b.x - a.x
+	var dy: float = b.y - a.y
+	if absf(dx) < 0.000001:
+		if a.x < minx or a.x > maxx:
+			return false
+	else:
+		var t1: float = (minx - a.x) / dx
+		var t2: float = (maxx - a.x) / dx
+		if t1 > t2:
+			var tt: float = t1
+			t1 = t2
+			t2 = tt
+		tmin = maxf(tmin, t1)
+		tmax = minf(tmax, t2)
+		if tmin > tmax:
+			return false
+	if absf(dy) < 0.000001:
+		if a.y < miny or a.y > maxy:
+			return false
+	else:
+		var u1: float = (miny - a.y) / dy
+		var u2: float = (maxy - a.y) / dy
+		if u1 > u2:
+			var uu: float = u1
+			u1 = u2
+			u2 = uu
+		tmin = maxf(tmin, u1)
+		tmax = minf(tmax, u2)
+		if tmin > tmax:
+			return false
+	return true
+
+
+func _distance_to_segment(point: Vector2, start: Vector2, finish: Vector2) -> float:
+	var segment: Vector2 = finish - start
+	var length_sq: float = segment.length_squared()
+	if length_sq <= 0.0001:
+		return point.distance_to(start)
+	var t: float = clampf((point - start).dot(segment) / length_sq, 0.0, 1.0)
+	return point.distance_to(start + segment * t)
