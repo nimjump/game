@@ -700,13 +700,140 @@ static func confirm_external_link(parent: Node, url: String, ref: float) -> void
 	)
 
 
+# ── Checkbox row (square box + label) ────────────────────────────────────────
+# A real CHECKBOX, deliberately not a CheckButton switch: the theme's
+# toggle_on/toggle_off sprites read as "on/off setting" switches, which is the
+# wrong affordance for a one-off "don't show this again"-style opt-out.
+#
+# The whole row is the tap target (a toggle-mode Button wrapping box + label),
+# not just the little square — on a phone a bare ~24px box is a frustrating
+# thing to aim at, and this game is played on phones.
+#
+# Returns the Button so the caller can read `.button_pressed` or connect to
+# `.toggled`. `ref` is the caller's usual reference size so it scales with the
+# dialog/panel it sits in.
+static func make_checkbox_row(ref: float, text: String, checked: bool = false, label_color: Color = Color(0.480, 0.340, 0.200), font_size: int = 0) -> Button:
+	const BORDER := Color(0.700, 0.520, 0.340)
+	const BROWN  := Color(0.220, 0.130, 0.060)
+	const ORANGE := Color(0.780, 0.380, 0.120)
+	const CREAM  := Color(0.992, 0.973, 0.933)
+
+	var box_d := int(ref * 0.046)
+
+	var row := Button.new()
+	row.toggle_mode    = true
+	row.button_pressed = checked
+	row.text           = ""
+	row.alignment      = HORIZONTAL_ALIGNMENT_LEFT
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.custom_minimum_size     = Vector2(0, int(box_d + ref * 0.030))
+
+	# Transparent at rest; a faint warm wash on hover/press so it's obvious the
+	# whole strip is pressable — an invisible hit area feels broken/unresponsive.
+	var _row_st := func(bg: Color) -> StyleBoxFlat:
+		var s := StyleBoxFlat.new()
+		s.bg_color = bg
+		s.set_corner_radius_all(10)
+		return s
+	row.add_theme_stylebox_override("normal",  _row_st.call(Color(0, 0, 0, 0)))
+	row.add_theme_stylebox_override("hover",   _row_st.call(Color(BORDER.r, BORDER.g, BORDER.b, 0.15)))
+	row.add_theme_stylebox_override("pressed", _row_st.call(Color(BORDER.r, BORDER.g, BORDER.b, 0.24)))
+	row.add_theme_stylebox_override("disabled", _row_st.call(Color(0, 0, 0, 0)))
+	# No focus ring: every other control in these dialogs is styled flat, and a
+	# default Godot focus outline here looks like a rendering glitch.
+	row.add_theme_stylebox_override("focus", _get_empty_box())
+	_apply_hand_cursor(row)
+	_apply_pixel_font(row)
+
+	# Padding lives on a MarginContainer, NOT on the styleboxes above — child
+	# anchors resolve against the Button's full rect, so stylebox content
+	# margins would not have padded the row content at all.
+	var mc := MarginContainer.new()
+	mc.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	mc.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	mc.add_theme_constant_override("margin_left",   int(ref * 0.014))
+	mc.add_theme_constant_override("margin_right",  int(ref * 0.014))
+	mc.add_theme_constant_override("margin_top",    int(ref * 0.010))
+	mc.add_theme_constant_override("margin_bottom", int(ref * 0.010))
+	row.add_child(mc)
+
+	var inner := HBoxContainer.new()
+	inner.add_theme_constant_override("separation", int(ref * 0.020))
+	inner.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	mc.add_child(inner)
+
+	# ── the box ──
+	var box := PanelContainer.new()
+	box.custom_minimum_size = Vector2(box_d, box_d)
+	box.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	box.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var box_st := StyleBoxFlat.new()
+	box_st.set_corner_radius_all(maxi(4, int(box_d * 0.24)))
+	box_st.set_border_width_all(maxi(2, int(box_d * 0.09)))
+	box.add_theme_stylebox_override("panel", box_st)
+	inner.add_child(box)
+
+	var box_center := CenterContainer.new()
+	box_center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	box.add_child(box_center)
+
+	# lucide "check" — the same icon set the rest of the UI uses, so the tick
+	# matches the line weight of everything around it.
+	var tick := lucide_icon("check", int(box_d * 0.74), CREAM)
+	tick.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	box_center.add_child(tick)
+
+	var lbl := Label.new()
+	lbl.text = text
+	lbl.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	lbl.size_flags_vertical   = Control.SIZE_SHRINK_CENTER
+	lbl.vertical_alignment    = VERTICAL_ALIGNMENT_CENTER
+	lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	apply_label(lbl, label_color, font_size if font_size > 0 else int(ref * 0.028))
+	inner.add_child(lbl)
+
+	var repaint := func(on: bool):
+		if on:
+			box_st.bg_color     = ORANGE
+			box_st.border_color = BROWN
+			tick.visible = true
+		else:
+			box_st.bg_color     = CREAM
+			box_st.border_color = BORDER
+			tick.visible = false
+	repaint.call(row.button_pressed)
+
+	row.toggled.connect(func(on: bool):
+		repaint.call(on)
+		# Fade the tick in rather than scaling it — scale would need a valid
+		# pivot_offset, which isn't reliable before the first layout pass.
+		if on:
+			tick.modulate.a = 0.0
+			var tw := tick.create_tween()
+			if tw: tw.tween_property(tick, "modulate:a", 1.0, 0.12)
+	)
+	return row
+
+
 # ── Generic "are you sure?" confirmation ─────────────────────────────────────
 # Same centered dim-overlay dialog as confirm_external_link (self-removing,
 # no deferred-tween cleanup so it can't leave an invisible input-eating layer
 # behind), but with caller-supplied title/body/confirm label and an on_confirm
 # callback. Use for any destructive/irreversible action (cancel a match, etc.).
 # `danger` tints the confirm button red instead of the usual orange.
-static func confirm_action(parent: Node, title_text: String, body_text: String, confirm_label: String, ref: float, on_confirm: Callable, danger: bool = true) -> void:
+#
+# Optional checkbox: pass a non-empty `checkbox_text` to get a themed checkbox
+# row between the body and the buttons (see make_checkbox_row). `checkbox_checked`
+# is its initial state and `on_checkbox_changed` fires with the new bool every
+# time the player toggles it. All three are trailing defaults, so every existing
+# call site keeps working untouched.
+#
+# The checkbox is only a *signal* — this dialog never persists anything itself.
+# Saving happens in the caller's on_confirm handler (so dismissing via "No" or
+# by tapping the dim background does NOT commit the opt-out, which is the whole
+# point: "don't show again" must be paired with an actual "yes, continue").
+static func confirm_action(parent: Node, title_text: String, body_text: String, confirm_label: String, ref: float, on_confirm: Callable, danger: bool = true, checkbox_text: String = "", checkbox_checked: bool = false, on_checkbox_changed: Callable = Callable()) -> void:
 	const BG      := Color(0.957, 0.898, 0.800)
 	const BORDER  := Color(0.700, 0.520, 0.340)
 	const BROWN   := Color(0.220, 0.130, 0.060)
@@ -777,6 +904,15 @@ static func confirm_action(parent: Node, title_text: String, body_text: String, 
 	body.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	apply_label(body, MID, int(ref * 0.030))
 	vb.add_child(body)
+
+	# Optional checkbox row — only built when the caller asked for one, so the
+	# no-checkbox call sites render exactly as they did before.
+	var check_row : Button = null
+	if checkbox_text != "":
+		check_row = make_checkbox_row(ref, checkbox_text, checkbox_checked, MID, int(ref * 0.028))
+		vb.add_child(check_row)
+		if on_checkbox_changed.is_valid():
+			check_row.toggled.connect(func(on: bool): on_checkbox_changed.call(on))
 
 	var btn_row := HBoxContainer.new()
 	btn_row.add_theme_constant_override("separation", int(ref * 0.018))

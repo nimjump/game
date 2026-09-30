@@ -37,6 +37,13 @@ var _volume     := 0.5   # default for a fresh user — was 1.0 (full). Anyone w
 var _is_ios     := false
 var _char_index := 0
 var _vibration  := true
+# "Don't show this again" on the guest-play confirmation (see _on_auth_failed).
+# A player with no wallet hits that dialog on EVERY run, which turns a useful
+# warning into pure friction — this lets them opt out once. Persisted with the
+# rest of the settings (survives the "Play Again" -> reload_current_scene()
+# cycle and a full WebView reload), and re-enableable any time from Settings,
+# so opting out is never a one-way door.
+var _guest_warn_suppressed := false
 var _save_timer : SceneTreeTimer = null  # debounce: coalesce rapid _save_settings calls
 var _landscape_overlay : CanvasLayer = null   # shown when device is landscape
 
@@ -1860,9 +1867,42 @@ func _on_auth_failed(reason: String) -> void:
 			if is_instance_valid(_stats_panel):       _stats_panel.hide_panel()
 			if is_instance_valid(_quest_panel):       _quest_panel.hide_panel()
 			_do_start_game()
+		# ── "Don't show this again" ────────────────────────────────────────
+		# A player with no wallet installed hits this dialog on literally every
+		# single run, forever. After the first couple of times it stops being a
+		# warning and starts being a tax on playing at all — so let them opt
+		# out once. Kept honest in three ways:
+		#   1. the flag is ONLY committed when they press Continue. The
+		#      dialog's "No" button and its tap-the-dim-to-dismiss path both
+		#      close it without ever running on_confirm, so backing out never
+		#      silently mutes the warning.
+		#   2. we say out loud (toast) that it just got muted and where to
+		#      undo it, so nobody is surprised later by a run that starts with
+		#      no prompt at all.
+		#   3. there's a switch in Settings to turn the warning back on — an
+		#      opt-out with no way back would be a trap.
+		# Still shows the suppressed path in the log so a support thread can
+		# tell "the dialog never appeared" apart from "the player muted it".
+		if _guest_warn_suppressed:
+			print("[MAIN] auth failed (%s) — guest warning suppressed via 'don't show again', starting as guest without the dialog" % reason)
+			_start_as_guest.call()
+			return
+		var _dont_show : Array = [false]   # captured by reference so on_confirm can read the final state
+		var _start_as_guest_with_optout := func():
+			if bool(_dont_show[0]):
+				_guest_warn_suppressed = true
+				# Write it NOW instead of going through _save_settings()'s
+				# 300ms debounce — the very next line can kick off a run/scene
+				# transition, and a debounced write that loses that race would
+				# silently forget the choice the player just made.
+				_save_settings_flush()
+				var _t := Toast.get_instance()
+				if _t: _t.show_toast("Playing as a guest — we won't ask again. Turn the warning back on anytime in Settings.", Toast.Kind.INFO)
+			_start_as_guest.call()
 		UITheme.confirm_action(_ui_root, "You're not signed in",
 			"You'll play as a guest — no score saving, no earnings. Would you like to continue?",
-			"Continue", _ref, _start_as_guest, false)
+			"Continue", _ref, _start_as_guest_with_optout, false,
+			"Don't show this again", false, func(on: bool): _dont_show[0] = on)
 	elif not _started:
 		print("[MAIN] auth failed (%s) — background attempt, player hasn't pressed Play, staying in lobby" % reason)
 
@@ -2886,6 +2926,7 @@ func _save_settings_flush() -> void:
 		"char_index":      _char_index,
 		"bg_selected":     _bg_selected,
 		"bg_auto":         _bg_auto,
+		"guest_warn_suppressed": _guest_warn_suppressed,
 	}
 	# BUG FIX: same class of bug as GameManager.gd's _ls_set() — see that
 	# function's comment. Naive .replace("'", "\\'") escaping breaks the
@@ -2925,6 +2966,7 @@ func _load_settings() -> void:
 	if d.has("char_index"):       _char_index       = int(d["char_index"])
 	if d.has("bg_selected"):      _bg_selected      = int(d["bg_selected"])
 	if d.has("bg_auto"):          _bg_auto          = bool(d["bg_auto"])
+	if d.has("guest_warn_suppressed"): _guest_warn_suppressed = bool(d["guest_warn_suppressed"])
 
 
 func _anchored(node: Control, preset: int) -> Control:
@@ -5578,6 +5620,60 @@ func _build_settings_popup() -> void:
 					connect_btn.disabled = false
 			)
 			nc_row.add_child(connect_btn)
+
+	# ── Guest-play warning ─────────────────────────
+	# The undo switch for the "Don't show this again" checkbox on the
+	# "You're not signed in" dialog (see _on_auth_failed). Deliberately ALWAYS
+	# rendered, not only when the player has opted out: a setting that only
+	# appears after you've already disabled the thing it controls is
+	# undiscoverable by definition, and someone who ticked that box months ago
+	# (or on a shared device) needs to be able to find their way back.
+	var gw_pc := PanelContainer.new()
+	gw_pc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gw_pc.add_theme_stylebox_override("panel", _card_st.call())
+	vbox.add_child(gw_pc)
+
+	var gw_mc := _make_margin_container(pad)
+	gw_mc.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gw_pc.add_child(gw_mc)
+
+	var gw_vbox := VBoxContainer.new()
+	gw_vbox.add_theme_constant_override("separation", int(_p(0.006)))
+	gw_vbox.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gw_mc.add_child(gw_vbox)
+
+	var gw_row := HBoxContainer.new()
+	gw_row.add_theme_constant_override("separation", int(_p(0.016)))
+	gw_vbox.add_child(gw_row)
+
+	# Same alert-triangle the dialog itself shows, so the two are visually
+	# recognisable as the same thing.
+	gw_row.add_child(UITheme.lucide_icon("alert-triangle", int(_p(0.038)), ICON_ORANGE))
+
+	var gw_lbl := Label.new()
+	gw_lbl.text = "Guest play warning"
+	gw_lbl.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	gw_lbl.vertical_alignment    = VERTICAL_ALIGNMENT_CENTER
+	UITheme.apply_label(gw_lbl, S_BROWN, fs)
+	gw_row.add_child(gw_lbl)
+
+	# Inverted on purpose: the setting reads as "warn me" (ON = good default)
+	# while the stored flag is "suppressed", so the toggle shows ON for anyone
+	# who never touched the checkbox.
+	var gw_toggle := CheckButton.new()
+	UITheme.apply_toggle_button(gw_toggle)
+	gw_toggle.button_pressed = not _guest_warn_suppressed
+	gw_toggle.toggled.connect(func(p: bool):
+		_guest_warn_suppressed = not p
+		_save_settings()
+	)
+	gw_row.add_child(gw_toggle)
+
+	var gw_info := Label.new()
+	gw_info.text = "Ask before starting a run with no wallet connected — that run won't save a score or earn anything."
+	gw_info.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	UITheme.apply_label(gw_info, S_MID, int(_p(0.022)))
+	gw_vbox.add_child(gw_info)
 
 	# ── About ──────────────────────────────────────
 	var about_pc := PanelContainer.new()
