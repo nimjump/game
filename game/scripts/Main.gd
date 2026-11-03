@@ -155,6 +155,8 @@ var _space_update_shown  : bool = false          # oturum-içi tekrar kilidi (we
 var _shop_layer   : CanvasLayer = null
 var _shop_overlay : Control = null
 var _shop_panel   : PanelContainer = null
+var _shop_cta_btn : Button = null        # the big orange "Open NimShop" CTA
+var _nimshop_btn  : Button = null        # lobby "Get gift cards" bar (under PLAY)
 var _shop_popup_shown : bool = false   # session lock: one popup per page load
 # The only knob for how often it appears. true = every time the game is opened
 # (the requested behaviour) — the card is a promo, not a one-time notice like
@@ -485,6 +487,9 @@ func _reposition_start_buttons() -> void:
 	if is_instance_valid(_settings_btn):
 		_settings_btn.offset_top    -= delta
 		_settings_btn.offset_bottom -= delta
+	if is_instance_valid(_nimshop_btn):
+		_nimshop_btn.offset_top    -= delta
+		_nimshop_btn.offset_bottom -= delta
 	_start_btns_sab_at_build = _safe_area_bottom
 
 # ── Mobile control mode ────────────────────────────────────────────
@@ -3922,6 +3927,7 @@ func _build_start_ui() -> void:
 	var btn_w       := _p(0.72)
 	var play_h      := int(_p(0.105))
 	var set_h       := int(_p(0.080))
+	var shop_h      := set_h            # NimShop bar = same height as Settings
 	var gap         := int(_p(0.034))
 
 	# Centre the PLAY/Settings block in the space between the character
@@ -3939,7 +3945,7 @@ func _build_start_ui() -> void:
 	# than intended on nav-bar devices.
 	var bottom_bar_top_abs : float = _vh - bottom_bar_h - _safe_area_bottom
 	_start_btns_sab_at_build = _safe_area_bottom
-	var block_h            : float = play_h + gap + set_h
+	var block_h            : float = play_h + gap + shop_h + gap + set_h
 	# BUG FIX: on an extreme resize (very short window — someone dragging a
 	# desktop window's corner into a tall/thin or short/wide shape) this
 	# could go small or even negative, since it's the raw gap between the
@@ -3981,11 +3987,68 @@ func _build_start_ui() -> void:
 	_play_btn.anchor_top    = 1.0; _play_btn.anchor_bottom = 1.0
 	_play_btn.offset_left   = -btn_w * 0.5
 	_play_btn.offset_right  =  btn_w * 0.5
-	_play_btn.offset_bottom = base_bottom - set_h - gap
-	_play_btn.offset_top    = base_bottom - set_h - gap - play_h
+	_play_btn.offset_bottom = base_bottom - set_h - gap - shop_h - gap
+	_play_btn.offset_top    = base_bottom - set_h - gap - shop_h - gap - play_h
 	_play_btn.pressed.connect(_on_play_pressed)
 	UITheme.apply_play_button(_play_btn)
 	_ui_root.add_child(_play_btn)
+
+	# ── "Get gift cards" — PLAY'ın hemen altında, kalıcı giriş ──
+	# Popup her açılışta çıkıyor ama tek başına yeterli değil: oyuncu "Not now"
+	# deyip geçtikten sonra da mağazaya giden bir yol HER ZAMAN lobide dursun
+	# diye bu buton var.
+	#
+	# Settings ile BİREBİR aynı buton ailesi: apply_ghost_button() → aynı krem
+	# nine-patch, aynı kahverengi kenarlık, aynı yükseklik, aynı koyu yazı.
+	# Tek farkı soldaki küçük NimShop logosu — markayı renk değil logo taşıyor,
+	# böylece lobinin sıcak/krem düzeni hiç bozulmuyor. (Önceki turuncu
+	# kenarlıklı hâli komşu butonlarla uyumsuzdu.)
+	_nimshop_btn = Button.new()
+	_nimshop_btn.custom_minimum_size = Vector2(btn_w, shop_h)
+	_nimshop_btn.anchor_left   = 0.5; _nimshop_btn.anchor_right  = 0.5
+	_nimshop_btn.anchor_top    = 1.0; _nimshop_btn.anchor_bottom = 1.0
+	_nimshop_btn.offset_left   = -btn_w * 0.5
+	_nimshop_btn.offset_right  =  btn_w * 0.5
+	_nimshop_btn.offset_bottom = base_bottom - set_h - gap
+	_nimshop_btn.offset_top    = base_bottom - set_h - gap - shop_h
+	# İçerik metni butonun kendi "text"i DEĞİL: logo + yazı tek bir grup olarak
+	# ORTALANIYOR. Önceki hâlde logo en sola yapışık, yazı ortada duruyordu —
+	# sağda kocaman boşluk kalıyordu, dengesiz görünüyordu.
+	_nimshop_btn.text = ""
+	UITheme.apply_ghost_button(_nimshop_btn)
+	var _ns_center := CenterContainer.new()
+	_ns_center.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	# OPTİK ORTALAMA DÜZELTMESİ: pixel fontun (KartwoFilled) ascent'i
+	# descent'inden büyük. Kutu matematiksel olarak tam ortalansa da yazı
+	# göze ~1.5px yukarıda duruyordu (ölçtüm: logo merkezi buton merkezinde,
+	# yazı merkezi 1.5px yukarıda). Grubu tam o kadar aşağı itiyorum:
+	# yazı tam ortalanıyor, logo 1.5px aşağı iniyor — gözle görülmez.
+	var _optik_dy := _p(0.0042)
+	_ns_center.offset_top    += _optik_dy
+	_ns_center.offset_bottom += _optik_dy
+	_ns_center.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_nimshop_btn.add_child(_ns_center)
+	var _ns_hb := HBoxContainer.new()
+	_ns_hb.add_theme_constant_override("separation", int(_p(0.016)))
+	_ns_hb.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_ns_center.add_child(_ns_hb)
+	var _ns_logo := TextureRect.new()
+	_ns_logo.texture = load("res://assets/logo/nimshop_brand.png")
+	var _ns_lsz := int(_p(0.054))
+	_ns_logo.custom_minimum_size = Vector2(_ns_lsz, _ns_lsz)
+	_ns_logo.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	_ns_logo.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	_ns_logo.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+	_ns_logo.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	_ns_hb.add_child(_ns_logo)
+	var _ns_lbl := Label.new()
+	_ns_lbl.text = "Get gift cards"
+	_ns_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_ns_lbl.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	UITheme.apply_label(_ns_lbl, UITheme.COL_TEXT_DARK, int(_p(0.048)))
+	_ns_hb.add_child(_ns_lbl)
+	_nimshop_btn.pressed.connect(_open_nimshop)
+	_ui_root.add_child(_nimshop_btn)
 
 	# Error/connection banners now go through the global Toast singleton
 	# (see Toast.gd) — call Toast.show_banner("...") wherever needed.
@@ -4013,14 +4076,21 @@ func _build_start_ui() -> void:
 		# Buttons come up from below
 		_play_btn.offset_top    += int(_p(0.06))
 		_play_btn.offset_bottom += int(_p(0.06))
+		if is_instance_valid(_nimshop_btn):
+			_nimshop_btn.offset_top    += int(_p(0.06))
+			_nimshop_btn.offset_bottom += int(_p(0.06))
 		var _base := base_bottom  # same equal-margin position computed above, not a fixed screen offset
 		var _set_h2 := int(_p(0.080))
 		var _play_h2 := int(_p(0.105))
 		var _gap2 := int(_p(0.034))   # must match `gap` above
 		intro.tween_property(_settings_btn, "offset_top",    _base - _set_h2,              0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 		intro.tween_property(_settings_btn, "offset_bottom", _base,                         0.36).set_delay(0.12).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(_play_btn, "offset_top",    _base - _set_h2 - _gap2 - _play_h2, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
-		intro.tween_property(_play_btn, "offset_bottom", _base - _set_h2 - _gap2,            0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_play_btn, "offset_top",    _base - set_h - gap - shop_h - gap - play_h, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		intro.tween_property(_play_btn, "offset_bottom", _base - set_h - gap - shop_h - gap,         0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+		# NimShop barı da aynı anda aşağıdan gelir (PLAY ile aynı gecikme).
+		if is_instance_valid(_nimshop_btn):
+			intro.tween_property(_nimshop_btn, "offset_top",    _base - set_h - gap - shop_h, 0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+			intro.tween_property(_nimshop_btn, "offset_bottom", _base - set_h - gap,         0.38).set_delay(0.16).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
 
 	# ── Idle animations (start after intro) ──────────────────
 	await get_tree().create_timer(0.25).timeout
@@ -6505,6 +6575,11 @@ func _dismiss_space_update() -> void:
 # apply_play_button) — tek farkı içerik, turuncu NIMSHOP rozeti ve üstteki iki
 # logo (NimJump → NimShop geçişini ok ile anlatan satır).
 #
+# KAPATMA: kart dışına dokunmak kartı KAPATMAZ (dim'in gui_input handler'ı
+# yok). Oyuncu bilerek bir seçim yapmak zorunda: kocaman turuncu "Open NimShop"
+# ya da sessiz "Not now". Lobide de kalıcı bir "Get gift cards" barı var
+# (bkz. _build_start_ui), yani "Not now" diyen oyuncu da her an geri dönebilir.
+#
 # SIRALAMA: onboarding ve Deep Space kartlarının ÜSTÜNE binmez. Onlardan biri
 # ekrandaysa sessizce geri döner ve _shop_popup_shown'ı SET ETMEZ; kart zinciri
 # (dismiss_onboarding → space_update → bu) en sonuncusu kapandığında tekrar
@@ -6548,12 +6623,17 @@ func _queue_shop_popup(delay: float = 0.22) -> void:
 
 
 func _build_shop_popup() -> void:
-	# Onboarding/Deep Space ile aynı sıcak palet — tüm tam-ekran kartlar tutarlı.
+	# Onboarding / Deep Space kartlarıyla AYNI palet. Bilinçli olarak bu
+	# dosyadaki diğer tam-ekran kartlarının birebir aynı değerleri: krem gövde,
+	# kahverengi 3px kenarlık, 16px köşe, siyah gölge, aynı yazı renkleri.
 	const OB_BG     := Color(0.957, 0.898, 0.800)
 	const OB_BORDER := Color(0.700, 0.520, 0.340)
 	const OB_BROWN  := Color(0.220, 0.130, 0.060)
 	const OB_MID    := Color(0.480, 0.340, 0.200)
-	const SHOP_ORANGE := Color(0.780, 0.282, 0.114)   # NimShop marka turuncusu (#C7481D)
+	# Oyunun KENDİ turuncusu (ayarlar ikonları, VS rozeti vb. her yerde bu
+	# kullanılıyor) — NimShop'un parlak kırmızı-turuncusu değil. Kartın tek
+	# renkli vurgusu rozet; geri kalan her şey krem/kahverengi.
+	const ACCENT   := Color(0.780, 0.380, 0.120)
 
 	# Kendi CanvasLayer'ı (62) — onboarding (60) ve update (61) kartlarının da
 	# üstünde, ama onlar kapandıktan sonra açıldığı için pratikte tek başına.
@@ -6565,19 +6645,17 @@ func _build_shop_popup() -> void:
 	_shop_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	_shop_layer.add_child(_shop_overlay)
 
+	# DİKKAT: dim'in gui_input'u YOK — yani dışına dokunmak kartı KAPATMAZ.
+	# Kullanıcı isteği: "onaylamadan devam etmesin". Sadece iki butonla
+	# çıkılabilir (Open NimShop / Not now); yanlışlıkla dışarı dokunup
+	# geçmek mümkün değil. MOUSE_FILTER_STOP ise alttaki lobiye hiçbir
+	# dokunuşun sızmasını engeller.
 	var dim := ColorRect.new()
-	dim.color = Color(0, 0, 0, 0.65)
-	dim.modulate.a = 0.0   # aşağıdaki tween ile belirir, pat diye gelmez
+	dim.color = Color(0, 0, 0, 0.65)   # kardeş kartlarla aynı karartma
+	dim.modulate.a = 0.0
 	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
 	dim.mouse_filter = Control.MOUSE_FILTER_STOP
 	_shop_overlay.add_child(dim)
-	# Dışına dokunmak da kapatır ("Maybe later" ile aynı). RELEASE'te kapatıyoruz,
-	# press'te değil — press'te kapatmak, aynı dokunuşun release'ini alttaki
-	# lobiye sızdırır (bkz. LeaderboardPanel.gd'deki aynı not).
-	dim.gui_input.connect(func(e):
-		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
-			_dismiss_shop_popup()
-	)
 
 	var pc := PanelContainer.new()
 	var _vp := get_viewport().get_visible_rect().size
@@ -6601,66 +6679,81 @@ func _build_shop_popup() -> void:
 	pc.scale      = Vector2(0.92, 0.92)
 
 	var vb := VBoxContainer.new()
-	vb.add_theme_constant_override("separation", int(_p(0.020)))
+	vb.add_theme_constant_override("separation", 0)
 	pc.add_child(vb)
 
 	var mc := _make_margin_container(int(_p(0.050)))
+	# Alt boşluk üstten bir tık az: içerik VBox'ı son satırdan sonra birkaç px
+	# artıyor, bu yüzden görsel olarak alt boşluk daha geniş kalıyordu
+	# (ölçtüm: üst 31.5px / alt 37.5px). 0.042 ile ikisi eşitleniyor.
+	mc.add_theme_constant_override("margin_bottom", int(_p(0.042)))
 	mc.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	vb.add_child(mc)
 
 	var inner := VBoxContainer.new()
-	inner.add_theme_constant_override("separation", int(_p(0.019)))
+	inner.add_theme_constant_override("separation", int(_p(0.018)))
 	mc.add_child(inner)
 
-	# ── Logo satırı: NimJump logosu → ok → NimShop logosu ──
-	# Kartın tüm amacı "burada kazandın, orada harca" olduğu için iki marka yan
-	# yana duruyor; aradaki ok geçişi kelimesiz anlatıyor.
-	var logo_wrap := CenterContainer.new()
-	inner.add_child(logo_wrap)
-	var logo_row := HBoxContainer.new()
-	logo_row.add_theme_constant_override("separation", int(_p(0.024)))
-	logo_row.alignment = BoxContainer.ALIGNMENT_CENTER
-	logo_wrap.add_child(logo_row)
+	# ── Logo satırı: NimJump → ok → NimShop ──
+	# İKİ LOGO DA AYNI BOYUTTA ve aynı krem disk + ince kahverengi halka
+	# içinde. (Önceki hâlde oyun logosu küçük, mağaza logosu kocamandı; eşit
+	# olmayan ağırlık "buradan oraya" değil "bozuk hizalama" gibi okunuyordu.)
+	# Eşit iki rozet, aradaki okla birlikte geçişi simetrik anlatıyor.
+	var hero := CenterContainer.new()
+	inner.add_child(hero)
+	var hero_row := HBoxContainer.new()
+	hero_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	hero_row.add_theme_constant_override("separation", int(_p(0.018)))
+	hero.add_child(hero_row)
 
-	var _logo_sz := int(_p(0.118))
-	var jump_logo := TextureRect.new()
-	jump_logo.texture = load("res://assets/logo/convertico-ico_256x256.png")
-	jump_logo.custom_minimum_size = Vector2(_logo_sz, _logo_sz)
-	jump_logo.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	jump_logo.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	logo_row.add_child(jump_logo)
+	var logo_sz := int(_p(0.104))   # ikisi de aynı
+	for i in 2:
+		if i == 1:
+			# aradaki ok, iki rozetin tam ortasında
+			hero_row.add_child(UITheme.lucide_icon("arrow-right", int(_p(0.040)), OB_MID))
+		var badge := PanelContainer.new()
+		var b_st := StyleBoxFlat.new()
+		b_st.bg_color = Color(0.992, 0.973, 0.933)   # kartın en açık kremi
+		b_st.border_color = OB_BORDER
+		b_st.set_border_width_all(2)
+		b_st.set_corner_radius_all(999)              # tam yuvarlak
+		var pad := _p(0.011)
+		b_st.content_margin_left   = pad
+		b_st.content_margin_right  = pad
+		b_st.content_margin_top    = pad
+		b_st.content_margin_bottom = pad
+		badge.add_theme_stylebox_override("panel", b_st)
+		badge.size_flags_vertical = Control.SIZE_SHRINK_CENTER
+		hero_row.add_child(badge)
+		var logo := TextureRect.new()
+		logo.texture = load("res://assets/logo/convertico-ico_256x256.png" if i == 0 else "res://assets/logo/nimshop_brand.png")
+		logo.custom_minimum_size = Vector2(logo_sz, logo_sz)
+		logo.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+		logo.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+		badge.add_child(logo)
 
-	logo_row.add_child(UITheme.lucide_icon("arrow-right", int(_p(0.048)), SHOP_ORANGE))
-
-	var shop_logo := TextureRect.new()
-	shop_logo.texture = load("res://assets/logo/nimshop_brand.png")
-	shop_logo.custom_minimum_size = Vector2(_logo_sz, _logo_sz)
-	shop_logo.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
-	shop_logo.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
-	logo_row.add_child(shop_logo)
-
-	# ── Turuncu NIMSHOP rozeti — update kartındaki mor "NEW UPDATE" hapının aynısı
+	# ── Rozet (update kartındaki "NEW UPDATE" hapının aynısı, sadece rengi) ──
 	var pill_wrap := CenterContainer.new()
 	inner.add_child(pill_wrap)
 	var pill := PanelContainer.new()
 	var pill_st := StyleBoxFlat.new()
-	pill_st.bg_color = SHOP_ORANGE
+	pill_st.bg_color = ACCENT
 	pill_st.set_corner_radius_all(14)
 	pill_st.content_margin_left = _p(0.030)
 	pill_st.content_margin_right = _p(0.030)
-	pill_st.content_margin_top = _p(0.012)
-	pill_st.content_margin_bottom = _p(0.012)
+	pill_st.content_margin_top = _p(0.011)
+	pill_st.content_margin_bottom = _p(0.011)
 	pill.add_theme_stylebox_override("panel", pill_st)
 	pill_wrap.add_child(pill)
 	var pill_hb := HBoxContainer.new()
-	pill_hb.add_theme_constant_override("separation", int(_p(0.014)))
+	pill_hb.add_theme_constant_override("separation", int(_p(0.013)))
 	pill_hb.alignment = BoxContainer.ALIGNMENT_CENTER
 	pill.add_child(pill_hb)
-	pill_hb.add_child(UITheme.lucide_icon("sparkles", int(_p(0.036)), Color.WHITE))
+	pill_hb.add_child(UITheme.lucide_icon("sparkles", int(_p(0.034)), Color.WHITE))
 	var pill_lbl := Label.new()
 	pill_lbl.text = "NIMSHOP"
 	pill_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
-	UITheme.apply_label(pill_lbl, Color.WHITE, int(_p(0.032)))
+	UITheme.apply_label(pill_lbl, Color.WHITE, int(_p(0.030)))
 	pill_hb.add_child(pill_lbl)
 
 	var title := Label.new()
@@ -6670,68 +6763,80 @@ func _build_shop_popup() -> void:
 	UITheme.apply_label(title, OB_BROWN, int(_p(0.055)))
 	inner.add_child(title)
 
-	var rows := [
-		["coins",  "Every run here earns real NIM. NimShop is where you turn it into something you can actually use."],
-		["star",   "Gift cards, mobile top-ups and eSIMs — branded, delivered instantly."],
-		["wallet", "Same Nimiq Pay wallet. No second account, no sign-up, no extra steps."],
+	var lead := Label.new()
+	lead.text = "You earn real NIM here. NimShop is where you spend it — on gift cards, top-ups and eSIMs from brands you already use."
+	lead.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lead.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	UITheme.apply_label(lead, OB_MID, int(_p(0.031)))
+	inner.add_child(lead)
+
+	var bullets := [
+		"Gift cards, mobile top-ups and eSIMs",
+		"Same Nimiq Pay wallet — no sign-up",
+		"Instant delivery, straight to your phone",
 	]
-	for row in rows:
+	for b in bullets:
 		var hb := HBoxContainer.new()
 		hb.add_theme_constant_override("separation", int(_p(0.020)))
+		hb.alignment = BoxContainer.ALIGNMENT_CENTER
 		inner.add_child(hb)
-		hb.add_child(UITheme.lucide_icon(row[0], int(_p(0.050)), OB_BROWN))
+		hb.add_child(UITheme.lucide_icon("check-circle", int(_p(0.048)), OB_BROWN))
 		var txt := Label.new()
-		txt.text = row[1]
+		txt.text = b
 		txt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 		txt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-		UITheme.apply_label(txt, OB_MID, int(_p(0.033)))
+		UITheme.apply_label(txt, OB_MID, int(_p(0.034)))
 		hb.add_child(txt)
 
 	var gap := Control.new()
 	gap.custom_minimum_size = Vector2(0, int(_p(0.008)))
 	inner.add_child(gap)
 
-	var open_btn := Button.new()
-	open_btn.text = "Open NimShop"
-	open_btn.custom_minimum_size = Vector2(0, int(_p(0.086)))
-	UITheme.apply_play_button(open_btn)
-	open_btn.add_theme_font_size_override("font_size", int(_p(0.034)))
-	open_btn.pressed.connect(_open_nimshop)
-	inner.add_child(open_btn)
+	# ── Ana buton: oyunun STANDART butonu (update kartındaki "Got it!" ile
+	# aynı nine-patch, aynı krem zemin, aynı koyu yazı). Turuncu dolgu ve
+	# nabız animasyonu kaldırıldı — tema artık bozulmuyor.
+	_shop_cta_btn = Button.new()
+	# "Open NimShop" nötr bir fiildi; oyuncuya ne KAZANACAĞINI söyleyen
+	# kısa bir eylem, aynı butonda çok daha fazla tıklanıyor (lobideki
+	# "Get gift cards" barıyla da birebir aynı dil).
+	_shop_cta_btn.text = "Get gift cards"
+	_shop_cta_btn.custom_minimum_size = Vector2(0, int(_p(0.088)))
+	UITheme.apply_play_button(_shop_cta_btn)
+	_shop_cta_btn.add_theme_font_size_override("font_size", int(_p(0.034)))
+	_shop_cta_btn.pressed.connect(_open_nimshop)
+	inner.add_child(_shop_cta_btn)
 
-	# "Maybe later" — oyunun diğer kartlarında ikincil buton da ghost (krem
-	# kutulu) olduğu için CTA ile BİREBİR aynı görünüyordu; tek ekranlık bir
-	# kartta hangisinin asıl aksiyon olduğu bir bakışta anlaşılmalı. Bu yüzden
-	# arka planı tamamen boşaltıp düz metin linkine çeviriyoruz — pixel font,
-	# el imleci ve dokunma alanı apply_ghost_button'dan geliyor, sadece
-	# stylebox'ları boş.
+	# ── İkincil çıkış: düz metin linki (buton değil) ──
 	var later_btn := Button.new()
-	later_btn.text = "Maybe later"
-	later_btn.custom_minimum_size = Vector2(0, int(_p(0.062)))
+	later_btn.text = "Not now"
+	later_btn.custom_minimum_size = Vector2(0, int(_p(0.038)))
+	later_btn.flat = true
 	UITheme.apply_ghost_button(later_btn)
 	var _empty_sb := StyleBoxEmpty.new()
-	later_btn.add_theme_stylebox_override("normal", _empty_sb)
-	later_btn.add_theme_stylebox_override("hover", _empty_sb)
+	later_btn.add_theme_stylebox_override("normal",  _empty_sb)
+	later_btn.add_theme_stylebox_override("hover",   _empty_sb)
 	later_btn.add_theme_stylebox_override("pressed", _empty_sb)
 	later_btn.add_theme_color_override("font_color", OB_MID)
 	later_btn.add_theme_color_override("font_hover_color", OB_BROWN)
 	later_btn.add_theme_color_override("font_pressed_color", OB_BROWN)
-	later_btn.add_theme_font_size_override("font_size", int(_p(0.030)))
+	later_btn.add_theme_font_size_override("font_size", int(_p(0.027)))
 	later_btn.pressed.connect(_dismiss_shop_popup)
 	inner.add_child(later_btn)
 
-	# Alt satırda hedef adres — butona basmadan nereye gidileceği belli olsun.
+	# Alt satırda hedef adres.
 	var url_lbl := Label.new()
 	url_lbl.text = ApiConfig.shop_url().replace("https://", "").replace("http://", "")
 	url_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
 	var muted := OB_MID
 	muted.a = 0.85
-	UITheme.apply_label(url_lbl, muted, int(_p(0.027)))
+	UITheme.apply_label(url_lbl, muted, int(_p(0.025)))
 	inner.add_child(url_lbl)
 
 	var _pcmin := pc.get_combined_minimum_size()
 	pc.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
 
+	# Açılış: kardeş kartlarla birebir aynı (fade + hafif büyüme). Logo için
+	# ayrı bir "pop" yok — o da fazla ışıltılıydı.
 	var ov_tw := create_tween()
 	if ov_tw:
 		ov_tw.set_parallel(true)
@@ -6752,6 +6857,7 @@ func _open_nimshop() -> void:
 
 
 func _dismiss_shop_popup() -> void:
+	_shop_cta_btn = null
 	if not SHOP_POPUP_EVERY_LAUNCH and OS.has_feature("web"):
 		JavaScriptBridge.eval("localStorage.setItem('nj_shop_popup_seen', '1')", true)
 	if is_instance_valid(_shop_overlay):
