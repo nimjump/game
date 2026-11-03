@@ -6,9 +6,9 @@ RUN THIS BEFORE EXPORTING. ApiConfig.gd's PROD_BASE / PROD_GAME_URL are
 compiled into the exported build, so editing them after an export does
 nothing until you export again.
 
-It reads api_base / game_url from setup/urls.ini and rewrites the two
-`const` lines in game/scripts/ApiConfig.gd in place. Only those two lines
-are touched.
+It reads api_base / game_url / shop_url from setup/urls.ini and rewrites the
+three matching `const` lines in game/scripts/ApiConfig.gd in place. Only those
+three lines are touched.
 
 Everything else on the client side (robots.txt, sitemap.xml, the SEO tags
 and the client-log API base in index.html) is placeholder-based and gets
@@ -29,7 +29,7 @@ import sys
 # launcher, not just the plain `python setup/apply_urls.py` case.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from urls_config import load_urls_or_exit
+from urls_config import load_shop_url_or_exit, load_urls_or_exit
 
 # game/scripts/ApiConfig.gd, relative to this script's parent folder (repo root).
 APICONFIG_RELPATH = pathlib.Path("game") / "scripts" / "ApiConfig.gd"
@@ -63,6 +63,7 @@ def main():
     check_only = "--check" in sys.argv[1:]
 
     api_base, game_url = load_urls_or_exit()
+    shop_url = load_shop_url_or_exit()
     path = repo_root() / APICONFIG_RELPATH
 
     if not path.is_file():
@@ -74,10 +75,12 @@ def main():
 
     text, base_changed, old_base = _replace_const(text, "PROD_BASE", api_base)
     text, game_changed, old_game = _replace_const(text, "PROD_GAME_URL", game_url)
+    text, shop_changed, old_shop = _replace_const(text, "PROD_SHOP_URL", shop_url)
 
     print(f"setup/urls.ini →")
     print(f"  api_base  = {api_base}")
-    print(f"  game_url  = {game_url}\n")
+    print(f"  game_url  = {game_url}")
+    print(f"  shop_url  = {shop_url}\n")
 
     if text == original:
         print(f"{APICONFIG_RELPATH} is already in sync — nothing to do.")
@@ -87,6 +90,8 @@ def main():
             print(f"  PROD_BASE      {old_base}  →  {api_base}")
         if game_changed:
             print(f"  PROD_GAME_URL  {old_game}  →  {game_url}")
+        if shop_changed:
+            print(f"  PROD_SHOP_URL  {old_shop}  →  {shop_url}")
         print("\nRun `python setup/apply_urls.py` (without --check) to fix, "
               "then re-export.")
         sys.exit(1)
@@ -97,6 +102,8 @@ def main():
             print(f"  PROD_BASE      {old_base}  →  {api_base}")
         if game_changed:
             print(f"  PROD_GAME_URL  {old_game}  →  {game_url}")
+        if shop_changed:
+            print(f"  PROD_SHOP_URL  {old_shop}  →  {shop_url}")
         print("\nRe-export the game in Godot for this to take effect.")
 
 

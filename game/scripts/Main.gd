@@ -147,6 +147,22 @@ var _spaceupdate_layer   : CanvasLayer = null    # "NEW UPDATE — Deep Space" k
 var _spaceupdate_overlay : Control = null
 var _spaceupdate_panel   : PanelContainer = null
 var _space_update_shown  : bool = false          # oturum-içi tekrar kilidi (web-dışı test dahil)
+
+# ── NimShop launch popup — see _maybe_show_shop_popup() ────────────────────
+# Hooks players straight from "you earned NIM here" to "here's where you spend
+# it" (shop.nimiqbase.com). Own CanvasLayer, same as the two intro cards above,
+# so a viewport-resize teardown/rebuild of the menu never frees or re-centres it.
+var _shop_layer   : CanvasLayer = null
+var _shop_overlay : Control = null
+var _shop_panel   : PanelContainer = null
+var _shop_popup_shown : bool = false   # session lock: one popup per page load
+# The only knob for how often it appears. true = every time the game is opened
+# (the requested behaviour) — the card is a promo, not a one-time notice like
+# the onboarding/Deep-Space cards, so it is deliberately NOT stored in
+# localStorage. Flip to false to make it once-ever-per-device instead; the
+# localStorage gate for that (`nj_shop_popup_seen`) is already wired up below.
+const SHOP_POPUP_EVERY_LAUNCH := true
+
 var _streak_badge      : Control = null   # lobide sürekli görünen "🔥 N" streak rozeti
 var _streak_badge_lbl  : Label   = null
 # Claimable NIM reward — see backend/game/streak_reward.go. NOT auto-paid;
@@ -436,6 +452,22 @@ func _reposition_space_update() -> void:
 	if is_instance_valid(_spaceupdate_panel):
 		var _pcmin := _spaceupdate_panel.get_combined_minimum_size()
 		_spaceupdate_panel.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
+
+
+## _reposition_space_update() ile aynı — NimShop kartının genişliğini güncel
+## viewport'tan yeniden hesaplar. Cheap no-op if the card isn't open.
+func _reposition_shop_popup() -> void:
+	if not is_instance_valid(_shop_panel):
+		return
+	var _vp := get_viewport().get_visible_rect().size
+	var _panel_w : float = minf(_vp.x * 0.88, _vp.y * 0.95)
+	if absf(_panel_w - _shop_panel.custom_minimum_size.x) < 0.5:
+		return
+	_shop_panel.custom_minimum_size = Vector2(_panel_w, _shop_panel.custom_minimum_size.y)
+	await get_tree().process_frame
+	if is_instance_valid(_shop_panel):
+		var _pcmin := _shop_panel.get_combined_minimum_size()
+		_shop_panel.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
 
 
 ## PLAY/Settings butonlarını (start ekranı) _build_start_ui()'de baz alınan
@@ -2131,6 +2163,7 @@ func _on_viewport_resized() -> void:
 	_refresh_safe_area_bottom()  # rotasyonda safe-area değişebilir (ör. landscape'te home indicator yanda) — bar/HUD reposition dahil, bkz. fonksiyon içi
 	_reposition_onboarding()  # onboarding card lives outside _ui_layer/_started's reach — see its own doc comment
 	_reposition_space_update()  # update card lives in its own layer too — same reason
+	_reposition_shop_popup()    # ...and so does the NimShop card
 
 	# Küçük boyut değişikliklerini yoksay (klavye, status bar vs.)
 	# Sadece gerçek yönelim değişikliği (genişlik/yükseklik yer değiştirdi) rebuild yap
@@ -4073,6 +4106,7 @@ func _build_start_ui() -> void:
 	_maybe_show_onboarding()
 	if not is_instance_valid(_onboarding_overlay):
 		_maybe_show_space_update()   # onboarding çıkmadıysa (eski oyuncu) update kartı direkt
+	_maybe_show_shop_popup()     # her açılışta: iki intro kartı da kapalıysa doğrudan NimShop kartı
 	_check_pending_submissions()
 
 
@@ -6285,6 +6319,7 @@ func _dismiss_onboarding() -> void:
 	_onboarding_layer   = null
 	_onboarding_panel   = null
 	_maybe_show_space_update()   # ilk girişte How-to-Play'den hemen sonra update kartı
+	_queue_shop_popup()   # ...ve ondan sonra NimShop kartı (kart zincirinin sonu)
 
 
 # ─────────────────────────────────────────────────────
@@ -6454,6 +6489,285 @@ func _dismiss_space_update() -> void:
 	_spaceupdate_overlay = null
 	_spaceupdate_layer   = null
 	_spaceupdate_panel   = null
+
+	_queue_shop_popup()   # kart zincirinin son halkası — bkz. _maybe_show_shop_popup()
+
+
+# ─────────────────────────────────────────────────────
+#  NIMSHOP LAUNCH POPUP — every time the game is opened
+# ─────────────────────────────────────────────────────
+# NEDEN VAR: oyuncu NimJump'ta NIM kazanıyor ama o NIM'i harcayacak bir yeri
+# olduğunu bilmiyor. Bu kart her açılışta (yalnızca bir kez değil) oyuncuyu
+# shop.nimiqbase.com'a yönlendirir.
+#
+# Görsel sistem onboarding/Deep Space kartlarıyla BİREBİR aynı (sıcak krem
+# palet, aynı kenarlık/köşe yarıçapı/gölge, aynı açılış animasyonu, aynı
+# apply_play_button) — tek farkı içerik, turuncu NIMSHOP rozeti ve üstteki iki
+# logo (NimJump → NimShop geçişini ok ile anlatan satır).
+#
+# SIRALAMA: onboarding ve Deep Space kartlarının ÜSTÜNE binmez. Onlardan biri
+# ekrandaysa sessizce geri döner ve _shop_popup_shown'ı SET ETMEZ; kart zinciri
+# (dismiss_onboarding → space_update → bu) en sonuncusu kapandığında tekrar
+# çağırır. localStorage'da "görüldü" kaydı TUTULMAZ — sayfa her yenilendiğinde
+# kart yine çıkar. Kalıcılaştırmak istersen tek satır: SHOP_POPUP_EVERY_LAUNCH'ı
+# false yap (aşağıdaki nj_shop_popup_seen kapısı zaten hazır).
+func _maybe_show_shop_popup() -> void:
+	if _shop_popup_shown:
+		return   # bu oturumda zaten kuruldu (resize rebuild'i ikinci kez açmasın)
+	if is_instance_valid(_shop_overlay):
+		return   # zaten ekranda
+	# Intro kartları tek seferlik, bu kart değil — onlar bitsin, sonra biz.
+	if is_instance_valid(_onboarding_overlay) or is_instance_valid(_spaceupdate_overlay):
+		return
+	# Bir VS/deeplink paneli açıldıysa üstüne kapatıcı bir promosyon binmesin.
+	if is_instance_valid(_vs_panel):
+		return
+	if not SHOP_POPUP_EVERY_LAUNCH:
+		if OS.has_feature("web"):
+			var already_seen = JavaScriptBridge.eval("!!localStorage.getItem('nj_shop_popup_seen')", true)
+			if already_seen:
+				return
+	_shop_popup_shown = true
+	_build_shop_popup()
+
+
+## Kapanan bir kartın ARDINDAN NimShop kartını açar. Küçük bir gecikme var:
+## önceki kart kendi fade-out tween'ini bitirsin diye (yoksa iki dim katmanı
+## aynı anda ekranda olur ve kısa bir "çift karartma" titremesi görünür).
+func _queue_shop_popup(delay: float = 0.22) -> void:
+	# SceneTreeTimer yerine node'a bağlı bir tween: "Play Again" sahneyi bu
+	# gecikme penceresinde yeniden yüklerse tween node'la birlikte ölür ve
+	# callback ölü bir instance'a düşmez (SceneTreeTimer öyle bir durumda
+	# "previously freed instance" hatası basardı).
+	var tw := create_tween()
+	if tw == null:
+		_maybe_show_shop_popup()   # tween kurulamazsa hiç değilse hemen dene
+		return
+	tw.tween_interval(delay)
+	tw.tween_callback(_maybe_show_shop_popup)
+
+
+func _build_shop_popup() -> void:
+	# Onboarding/Deep Space ile aynı sıcak palet — tüm tam-ekran kartlar tutarlı.
+	const OB_BG     := Color(0.957, 0.898, 0.800)
+	const OB_BORDER := Color(0.700, 0.520, 0.340)
+	const OB_BROWN  := Color(0.220, 0.130, 0.060)
+	const OB_MID    := Color(0.480, 0.340, 0.200)
+	const SHOP_ORANGE := Color(0.780, 0.282, 0.114)   # NimShop marka turuncusu (#C7481D)
+
+	# Kendi CanvasLayer'ı (62) — onboarding (60) ve update (61) kartlarının da
+	# üstünde, ama onlar kapandıktan sonra açıldığı için pratikte tek başına.
+	_shop_layer = CanvasLayer.new()
+	_shop_layer.layer = 62
+	add_child(_shop_layer)
+
+	_shop_overlay = Control.new()
+	_shop_overlay.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	_shop_layer.add_child(_shop_overlay)
+
+	var dim := ColorRect.new()
+	dim.color = Color(0, 0, 0, 0.65)
+	dim.modulate.a = 0.0   # aşağıdaki tween ile belirir, pat diye gelmez
+	dim.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	dim.mouse_filter = Control.MOUSE_FILTER_STOP
+	_shop_overlay.add_child(dim)
+	# Dışına dokunmak da kapatır ("Maybe later" ile aynı). RELEASE'te kapatıyoruz,
+	# press'te değil — press'te kapatmak, aynı dokunuşun release'ini alttaki
+	# lobiye sızdırır (bkz. LeaderboardPanel.gd'deki aynı not).
+	dim.gui_input.connect(func(e):
+		if e is InputEventMouseButton and not e.pressed and e.button_index == MOUSE_BUTTON_LEFT:
+			_dismiss_shop_popup()
+	)
+
+	var pc := PanelContainer.new()
+	var _vp := get_viewport().get_visible_rect().size
+	var _panel_w : float = minf(_vp.x * 0.88, _vp.y * 0.95)
+	pc.anchor_left = 0.5; pc.anchor_right = 0.5
+	pc.anchor_top  = 0.5; pc.anchor_bottom = 0.5
+	pc.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	pc.grow_vertical   = Control.GROW_DIRECTION_BOTH
+	pc.custom_minimum_size = Vector2(_panel_w, 0)   # yükseklik içerikten gelir
+	_shop_panel = pc
+	var pc_st := StyleBoxFlat.new()
+	pc_st.bg_color = OB_BG
+	pc_st.border_color = OB_BORDER
+	pc_st.set_border_width_all(3)
+	pc_st.set_corner_radius_all(16)
+	pc_st.shadow_color = Color(0, 0, 0, 0.3)
+	pc_st.shadow_size  = 12
+	pc.add_theme_stylebox_override("panel", pc_st)
+	_shop_overlay.add_child(pc)
+	pc.modulate.a = 0.0
+	pc.scale      = Vector2(0.92, 0.92)
+
+	var vb := VBoxContainer.new()
+	vb.add_theme_constant_override("separation", int(_p(0.020)))
+	pc.add_child(vb)
+
+	var mc := _make_margin_container(int(_p(0.050)))
+	mc.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	vb.add_child(mc)
+
+	var inner := VBoxContainer.new()
+	inner.add_theme_constant_override("separation", int(_p(0.019)))
+	mc.add_child(inner)
+
+	# ── Logo satırı: NimJump logosu → ok → NimShop logosu ──
+	# Kartın tüm amacı "burada kazandın, orada harca" olduğu için iki marka yan
+	# yana duruyor; aradaki ok geçişi kelimesiz anlatıyor.
+	var logo_wrap := CenterContainer.new()
+	inner.add_child(logo_wrap)
+	var logo_row := HBoxContainer.new()
+	logo_row.add_theme_constant_override("separation", int(_p(0.024)))
+	logo_row.alignment = BoxContainer.ALIGNMENT_CENTER
+	logo_wrap.add_child(logo_row)
+
+	var _logo_sz := int(_p(0.118))
+	var jump_logo := TextureRect.new()
+	jump_logo.texture = load("res://assets/logo/convertico-ico_256x256.png")
+	jump_logo.custom_minimum_size = Vector2(_logo_sz, _logo_sz)
+	jump_logo.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	jump_logo.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	logo_row.add_child(jump_logo)
+
+	logo_row.add_child(UITheme.lucide_icon("arrow-right", int(_p(0.048)), SHOP_ORANGE))
+
+	var shop_logo := TextureRect.new()
+	shop_logo.texture = load("res://assets/logo/nimshop_brand.png")
+	shop_logo.custom_minimum_size = Vector2(_logo_sz, _logo_sz)
+	shop_logo.expand_mode = TextureRect.EXPAND_IGNORE_SIZE
+	shop_logo.stretch_mode = TextureRect.STRETCH_KEEP_ASPECT_CENTERED
+	logo_row.add_child(shop_logo)
+
+	# ── Turuncu NIMSHOP rozeti — update kartındaki mor "NEW UPDATE" hapının aynısı
+	var pill_wrap := CenterContainer.new()
+	inner.add_child(pill_wrap)
+	var pill := PanelContainer.new()
+	var pill_st := StyleBoxFlat.new()
+	pill_st.bg_color = SHOP_ORANGE
+	pill_st.set_corner_radius_all(14)
+	pill_st.content_margin_left = _p(0.030)
+	pill_st.content_margin_right = _p(0.030)
+	pill_st.content_margin_top = _p(0.012)
+	pill_st.content_margin_bottom = _p(0.012)
+	pill.add_theme_stylebox_override("panel", pill_st)
+	pill_wrap.add_child(pill)
+	var pill_hb := HBoxContainer.new()
+	pill_hb.add_theme_constant_override("separation", int(_p(0.014)))
+	pill_hb.alignment = BoxContainer.ALIGNMENT_CENTER
+	pill.add_child(pill_hb)
+	pill_hb.add_child(UITheme.lucide_icon("sparkles", int(_p(0.036)), Color.WHITE))
+	var pill_lbl := Label.new()
+	pill_lbl.text = "NIMSHOP"
+	pill_lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	UITheme.apply_label(pill_lbl, Color.WHITE, int(_p(0.032)))
+	pill_hb.add_child(pill_lbl)
+
+	var title := Label.new()
+	title.text = "Spend your NimJump NIM!"
+	title.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	title.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	UITheme.apply_label(title, OB_BROWN, int(_p(0.055)))
+	inner.add_child(title)
+
+	var rows := [
+		["coins",  "Every run here earns real NIM. NimShop is where you turn it into something you can actually use."],
+		["star",   "Gift cards, mobile top-ups and eSIMs — branded, delivered instantly."],
+		["wallet", "Same Nimiq Pay wallet. No second account, no sign-up, no extra steps."],
+	]
+	for row in rows:
+		var hb := HBoxContainer.new()
+		hb.add_theme_constant_override("separation", int(_p(0.020)))
+		inner.add_child(hb)
+		hb.add_child(UITheme.lucide_icon(row[0], int(_p(0.050)), OB_BROWN))
+		var txt := Label.new()
+		txt.text = row[1]
+		txt.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+		txt.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+		UITheme.apply_label(txt, OB_MID, int(_p(0.033)))
+		hb.add_child(txt)
+
+	var gap := Control.new()
+	gap.custom_minimum_size = Vector2(0, int(_p(0.008)))
+	inner.add_child(gap)
+
+	var open_btn := Button.new()
+	open_btn.text = "Open NimShop"
+	open_btn.custom_minimum_size = Vector2(0, int(_p(0.086)))
+	UITheme.apply_play_button(open_btn)
+	open_btn.add_theme_font_size_override("font_size", int(_p(0.034)))
+	open_btn.pressed.connect(_open_nimshop)
+	inner.add_child(open_btn)
+
+	# "Maybe later" — oyunun diğer kartlarında ikincil buton da ghost (krem
+	# kutulu) olduğu için CTA ile BİREBİR aynı görünüyordu; tek ekranlık bir
+	# kartta hangisinin asıl aksiyon olduğu bir bakışta anlaşılmalı. Bu yüzden
+	# arka planı tamamen boşaltıp düz metin linkine çeviriyoruz — pixel font,
+	# el imleci ve dokunma alanı apply_ghost_button'dan geliyor, sadece
+	# stylebox'ları boş.
+	var later_btn := Button.new()
+	later_btn.text = "Maybe later"
+	later_btn.custom_minimum_size = Vector2(0, int(_p(0.062)))
+	UITheme.apply_ghost_button(later_btn)
+	var _empty_sb := StyleBoxEmpty.new()
+	later_btn.add_theme_stylebox_override("normal", _empty_sb)
+	later_btn.add_theme_stylebox_override("hover", _empty_sb)
+	later_btn.add_theme_stylebox_override("pressed", _empty_sb)
+	later_btn.add_theme_color_override("font_color", OB_MID)
+	later_btn.add_theme_color_override("font_hover_color", OB_BROWN)
+	later_btn.add_theme_color_override("font_pressed_color", OB_BROWN)
+	later_btn.add_theme_font_size_override("font_size", int(_p(0.030)))
+	later_btn.pressed.connect(_dismiss_shop_popup)
+	inner.add_child(later_btn)
+
+	# Alt satırda hedef adres — butona basmadan nereye gidileceği belli olsun.
+	var url_lbl := Label.new()
+	url_lbl.text = ApiConfig.shop_url().replace("https://", "").replace("http://", "")
+	url_lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	var muted := OB_MID
+	muted.a = 0.85
+	UITheme.apply_label(url_lbl, muted, int(_p(0.027)))
+	inner.add_child(url_lbl)
+
+	var _pcmin := pc.get_combined_minimum_size()
+	pc.pivot_offset = Vector2(_pcmin.x, _pcmin.y) * 0.5
+
+	var ov_tw := create_tween()
+	if ov_tw:
+		ov_tw.set_parallel(true)
+		ov_tw.tween_property(dim, "modulate:a", 1.0, 0.25)
+		ov_tw.tween_property(pc,  "modulate:a", 1.0, 0.28)
+		ov_tw.tween_property(pc,  "scale", Vector2.ONE, 0.28).set_trans(Tween.TRANS_BACK).set_ease(Tween.EASE_OUT)
+
+
+## CTA: mağazayı tarayıcıda açar ve kartı kapatır.
+##
+## OS.shell_open() doğrudan çağrılıyor, UITheme.confirm_external_link() DEĞİL:
+## o onay diyaloğu kullanıcıyı habersiz uygulamadan çıkarmamak için var —
+## buradaysa kartın kendisi zaten o onay, oyuncu "Open NimShop"a basarak dışarı
+## çıkacağını biliyor. Üstüne ikinci bir "emin misin?" gereksiz sürtünme olurdu.
+func _open_nimshop() -> void:
+	OS.shell_open(ApiConfig.shop_url())
+	_dismiss_shop_popup()
+
+
+func _dismiss_shop_popup() -> void:
+	if not SHOP_POPUP_EVERY_LAUNCH and OS.has_feature("web"):
+		JavaScriptBridge.eval("localStorage.setItem('nj_shop_popup_seen', '1')", true)
+	if is_instance_valid(_shop_overlay):
+		var ov := _shop_overlay
+		var ovl := _shop_layer
+		var tw := create_tween()
+		if tw:
+			tw.tween_property(ov, "modulate:a", 0.0, 0.18).set_trans(Tween.TRANS_QUAD).set_ease(Tween.EASE_IN)
+			tw.tween_callback(func(): if is_instance_valid(ovl): ovl.queue_free())  # ovl'yi silmek ov'u da siler
+		else:
+			if is_instance_valid(ovl): ovl.queue_free()
+	_shop_overlay = null
+	_shop_layer   = null
+	_shop_panel   = null
+
+
 
 
 func _close_settings() -> void:

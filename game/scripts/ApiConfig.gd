@@ -55,8 +55,9 @@ const CONFIG_FILE_NAME := "config.cfg"
 #  robots.txt / sitemap.xml read urls.ini instead, so editing only here
 #  silently leaves the rest pointing elsewhere.
 # ════════════════════════════════════════════════════════════════════════
-const PROD_BASE     := "https://backbone.zetashare.com"   # backend API URL (urls.ini: api_base)
-const PROD_GAME_URL := "https://nimjump.zetashare.com"    # public game URL (urls.ini: game_url)
+const PROD_BASE     := "https://backbone.zetashare.com"    # backend API URL (urls.ini: api_base)
+const PROD_GAME_URL := "https://nimjump.zetashare.com"     # public game URL (urls.ini: game_url)
+const PROD_SHOP_URL := "https://shop.nimiqbase.com"        # NimShop storefront (urls.ini: shop_url)
 
 # Local-dev-only last-resort values. These are intentionally NOT "the"
 # production backend — real deployments must set NIMJUMP_API_BASE / --api=
@@ -81,6 +82,22 @@ func game_url() -> String:
 		return _game_cached
 	_game_cached = _resolve_game_url()
 	return _game_cached
+
+## NimShop storefront URL — where the "spend your NIM" launch popup sends
+## players (see Main.gd's _maybe_show_shop_popup()).
+##
+## Deliberately NOT runtime-resolved like game_url()/base_url(): this is a
+## single marketing destination that must never follow the page's own origin
+## (a dev tunnel or a staging host has no storefront) and must never be
+## overridden by a server response. It comes straight from setup/urls.ini via
+## apply_urls.py, exactly like PROD_GAME_URL — one place to change it, one
+## re-export to ship it. An override hook exists only for local testing.
+func shop_url() -> String:
+	if OS.has_feature("web"):
+		var override = JavaScriptBridge.eval("localStorage.getItem('nj_shop_url') || ''", true)
+		if override != null and str(override).strip_edges() != "":
+			return str(override).strip_edges()
+	return PROD_SHOP_URL
 
 ## Called when backend returns game_url (stats, config, etc).
 ##
