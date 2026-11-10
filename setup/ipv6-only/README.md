@@ -263,6 +263,42 @@ Tek servis için env iki satır yeterken sistemi kurcalamaya değmez.
 
 ---
 
+## 4b. Zero-env build — binary kendi kendine yeter (repoda varsayılan)
+
+`backend/builddefaults.go` içindeki değerler **repoda tanımlı varsayılanlardır**;
+`applyBuildDefaults()` bunları `loadEnv()`'den SONRA, sadece boş olan env
+değişkenleri için uygular (yani gerçek `.env` her zaman kazanır):
+
+| Ayar | Repo varsayılanı |
+|---|---|
+| `BIND_HOST` | `::` |
+| `IPV6_ONLY` | `true` → listener `tcp6`, IPv4 imkânsız |
+| `GAME_URL` / `BACKEND_URL` | `https://nimjump.zetashare.com` / `https://backbone.zetashare.com` |
+| `NIMIQ_RPC_URL` / `NIMIQ_RPC_HMAC_SECRET` | **kaynakta boş** — release build'de `-ldflags` ile gömülür |
+
+RPC secret'ı **repoya yazılmıyor**: bu repo public, secret commit'lenirse WAF+HMAC
+korunması anlamsızlaşır (herkes imza basabilir). Bunun yerine release build'e
+gömülüyor:
+
+```bash
+cd backend
+./build-release.sh          # ../release/cloudflare-worker.env dosyasından okur
+# veya NIMJUMP_RPC_URL=… NIMJUMP_RPC_HMAC_SECRET=… ./build-release.sh
+```
+
+Çıktı: `release/nimjump-backend-linux-{amd64,arm64}` — **hiç `.env` olmadan**
+çalışır, açılışta şunu basar:
+
+```
+[BUILTIN] defaults from the binary (override with .env): … NIMIQ_RPC_URL=https://rpc.nimiqbase.com/<secret>,
+          NIMIQ_RPC_HMAC_SECRET=<baked, hidden>, BIND_HOST=::, IPV6_ONLY=true
+```
+
+Zero-env modda bile **cüzdan anahtarı** `.env`'den gelmek zorundadır
+(`NIMIQ_PRIVATE_KEY` / `NIMIQ_MNEMONIC`) — binary'ye asla gömülmez.
+
+---
+
 ## 5. Kodda ne değişti? (`backend/game/rpc_client.go`, `socks5.go`, `main.go`)
 
 Eski hâli her RPC çağrısında **yeni bir `http.Client`** yaratıp `client.Post(...)`

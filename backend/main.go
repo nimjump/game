@@ -188,6 +188,11 @@ func main() {
 	loadEnv(".env")
 	loadEnv("../.env")
 
+	// Zero-env builds: fill anything still empty from the values baked into
+	// the binary (see builddefaults.go). Runs after loadEnv so a real .env
+	// always wins, and before InitURLs() so the required-URL check passes.
+	applyBuildDefaults()
+
 	// Resolve GAME_URL / BACKEND_URL and build the CORS allowlist from them.
 	// Has to be here — after loadEnv, before anything serves a request — since
 	// handlers' package-level vars are initialised long before .env is read.
@@ -360,19 +365,19 @@ func main() {
 	}()
 
 	server := &fasthttp.Server{
-		Handler:            corsMiddleware(r.Handler),
-		Name:               "nimjump",
-		Concurrency:        64 * 1024,          // max concurrent connections
-		ReadBufferSize:     8 * 1024,           // 8KB — sufficient for small JSON requests
-		WriteBufferSize:    8 * 1024,
-		ReadTimeout:        10e9,               // 10s
-		WriteTimeout:       30e9,               // 30s (replay submit can be large)
+		Handler:         corsMiddleware(r.Handler),
+		Name:            "nimjump",
+		Concurrency:     64 * 1024, // max concurrent connections
+		ReadBufferSize:  8 * 1024,  // 8KB — sufficient for small JSON requests
+		WriteBufferSize: 8 * 1024,
+		ReadTimeout:     10e9, // 10s
+		WriteTimeout:    30e9, // 30s (replay submit can be large)
 		// 250MB — big enough for admin replay-binary uploads (Godot .exe export
 		// can be 100MB+). Public routes (submit etc.) validate their own much
 		// smaller size limits after parsing, so this only raises the hard
 		// connection-level ceiling, not what any given route actually accepts.
 		MaxRequestBodySize: 250 * 1024 * 1024,
-		ReduceMemoryUsage:  true,               // reduce GC pressure under high concurrency
+		ReduceMemoryUsage:  true, // reduce GC pressure under high concurrency
 		TCPKeepalive:       true,
 		Logger:             log.Default(),
 	}
