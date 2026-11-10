@@ -1,0 +1,52 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Caddy alternative to the Go relay (option 2 in ../README.md).
+#
+# Use this if the dual-stack box already runs Caddy. Caddy is a real
+# reverse proxy: it keeps upstream connections alive, retries on
+# connection-level failures, and — because the upstream is written as a full
+# https:// URL — it sends the CORRECT SNI (rpc.nimiqwatch.com) and Host header
+# even though the box it runs on is reached by a different name. That detail is
+# the whole trick; a plain `reverse_proxy 49.13.63.161:443` would break TLS.
+#
+# DNS: point rpc-relay.example.com at the DUAL-STACK box, with BOTH an A and a
+#      AAAA record (the AAAA is what your IPv6-only game server uses).
+# Then on the game server:
+#      NIMIQ_RPC_URL=https://rpc-relay.example.com
+#
+# The path prefix is a shared secret: only /<SECRET> is proxied, everything
+# else 404s, so the relay isn't an open door to the RPC.
+# ─────────────────────────────────────────────────────────────────────────────
+
+rpc-relay.example.com {
+	encode zstd gzip
+
+	# Only this exact path reaches the upstream.
+	handle /REPLACE_WITH_LONG_RANDOM_SECRET {
+		reverse_proxy https://rpc.nimiqwatch.com {
+			header_up Host rpc.nimiqwatch.com
+			# Keep the RPC body untouched, pass the status through honestly.
+			transport http {
+				tls
+				tls_server_name rpc.nimiqwatch.com
+				keepalive 90s
+				dial_timeout 10s
+				response_header_timeout 20s
+			}
+		}
+	}
+
+	handle /healthz {
+		respond `{"relay":"ok"}` 200 {
+			close
+		}
+	}
+
+	handle {
+		respond 404
+	}
+
+	log {
+		output file /var/log/caddy/rpc-relay.log
+		format json
+	}
+}

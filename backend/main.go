@@ -100,6 +100,15 @@ func loadEnv(path string) {
 	}
 }
 
+// getEnvDefault is a tiny helper so the banner can show the effective value
+// of an optional env var without pulling in the game package's private one.
+func getEnvDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
 // printStartupBanner logs Nimiq config and wallet balance at startup.
 func printStartupBanner(store *game.Store) {
 	cfg := store.GetNimiqConfig()
@@ -124,7 +133,17 @@ func printStartupBanner(store *game.Store) {
 	}
 
 	fmt.Printf("  [NIMIQ] RPC URL     : %s\n", cfg.RPCURL)
+	fmt.Printf("  [NIMIQ] RPC network : %s (NIMIQ_RPC_NETWORK; nat64 prefix %s)\n",
+		getEnvDefault("NIMIQ_RPC_NETWORK", "auto"), getEnvDefault("NIMIQ_NAT64_PREFIX", "64:ff9b::/96"))
+	if px := os.Getenv("NIMIQ_RPC_PROXY"); px != "" {
+		fmt.Printf("  [NIMIQ] RPC proxy   : %s\n", px)
+	}
 	fmt.Printf("  [NIMIQ] Wallet addr : %s\n", cfg.WalletAddress)
+
+	// Probe the RPC path once, with a clear message when this host is
+	// IPv6-only and the endpoint is IPv4-only (rpc.nimiqwatch.com has no
+	// AAAA record). Never fatal: the reward loop retries regardless.
+	game.NimiqRPCStartupCheck(cfg.RPCURL)
 
 	// Fetch balance
 	if cfg.WalletAddress != "" && pk != "" {
@@ -194,8 +213,19 @@ func main() {
 	if bindHost == "" {
 		bindHost = "127.0.0.1"
 	}
-	addr := bindHost + ":" + port
-	if probe, probeErr := net.Listen("tcp", addr); probeErr != nil {
+	// IPv6-only hosting: BIND_HOST=:: (or any literal v6 address) or
+	// IPV6_ONLY=true switches the listener to the "tcp6" network, so the
+	// port cannot be reached over IPv4 at all — not even via a v4-mapped
+	// address on a dual-stack kernel. net.JoinHostPort does the bracketing
+	// ("[::]:8080") for us.
+	bindNetwork := "tcp"
+	if v := strings.TrimSpace(os.Getenv("IPV6_ONLY")); v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes") {
+		bindNetwork = "tcp6"
+	} else if strings.Count(bindHost, ":") >= 2 { // bare IPv6 literal: :: or 2001:db8::5
+		bindNetwork = "tcp6"
+	}
+	addr := net.JoinHostPort(bindHost, port)
+	if probe, probeErr := net.Listen(bindNetwork, addr); probeErr != nil {
 		log.Fatalf("[FATAL] cannot bind %s: %v — another instance of this backend is very likely already running here (the systemd/service-managed one?). Stop it first (e.g. `sudo systemctl stop <service>` on Linux, or stop the Windows service/scheduled task), then try again. Refusing to start a second instance.", addr, probeErr)
 	} else {
 		probe.Close() // just a fast pre-flight check — the real listener binds this same addr again below
@@ -316,7 +346,7 @@ func main() {
 	// raw Go process itself to also be reachable directly from the network
 	// on 0.0.0.0. Override with BIND_HOST=0.0.0.0 if this ever needs to run
 	// without a tunnel/reverse proxy in front of it.
-	log.Printf("[STARTUP] listening on http://%s", addr)
+	log.Printf("[STARTUP] listening on http://%s (network=%s)", addr, bindNetwork)
 
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
@@ -345,6 +375,19 @@ func main() {
 		ReduceMemoryUsage:  true,               // reduce GC pressure under high concurrency
 		TCPKeepalive:       true,
 		Logger:             log.Default(),
+	}
+	if bindNetwork == "tcp6" {
+		// fasthttp has no ListenAndServe6, but Serve() on our own IPv6-only
+		// listener is equivalent and keeps the family guarantee explicit.
+		ln, err := net.Listen("tcp6", addr)
+		if err != nil {
+			log.Fatalf("[FATAL] listen (tcp6): %v", err)
+		}
+		log.Printf("[STARTUP] IPv6-only listener active on %s — IPv4 connections are impossible", addr)
+		if err := server.Serve(ln); err != nil {
+			log.Fatalf("[FATAL] serve: %v", err)
+		}
+		return
 	}
 	if err := server.ListenAndServe(addr); err != nil {
 		log.Fatalf("[FATAL] listen: %v", err)

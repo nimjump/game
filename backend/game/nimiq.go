@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,12 +25,12 @@ import (
 )
 
 const (
-	keyPlayerWalletPrefix = "wallet:"   // + playerID
-	keyPendingRewardPfx   = "reward:"   // + rewardID
+	keyPlayerWalletPrefix = "wallet:" // + playerID
+	keyPendingRewardPfx   = "reward:" // + rewardID
 	keyNimiqConfig        = "nimcfg"
-	NimLunaMultiplier     = 100_000     // 1 NIM = 100,000 luna
+	NimLunaMultiplier     = 100_000 // 1 NIM = 100,000 luna
 
-	MaxRetryAttempts = 10               // informational only — not enforced; rewards retry forever (see attemptSend)
+	MaxRetryAttempts = 10 // informational only — not enforced; rewards retry forever (see attemptSend)
 
 	// RetryInterval — how often the background loop WAKES UP to scan for due
 	// rewards (cheap: just a DB list, no RPC calls unless something is
@@ -194,6 +195,79 @@ func (s *Store) GetPlayerWallet(playerID string) (*models.PlayerWallet, error) {
 
 // ── Pending Reward CRUD ───────────────────────────────────────────────────────
 
+// ErrZeroRewardAmount — the reward rounds to 0 luna, i.e. there is literally
+// nothing to send. Nimiq has no "0 NIM transfer": the node rejects it, and
+// before this guard existed such a record was saved with Status=pending,
+// attemptSend kept calling nimiqSendTransaction (one getBlockNumber + one
+// failed push per retry, forever), the record never left the pending queue,
+// and every retry tick logged a failure. That is the "0 NIM payments stuck in
+// the RPC" bug: they are not stuck *in* the RPC, they are stuck *in front of*
+// it, being retried against it forever.
+//
+// Rule from now on: a reward with AmountLuna <= 0 is never created, never
+// queued, never signed and never pushed. Existing ones are DELETED
+// (see PurgeZeroAmountRewards).
+var ErrZeroRewardAmount = errors.New("zero_amount: reward would send 0 luna — refusing to create or send it")
+
+// rewardLuna is the single place that converts "what the game promised" into
+// "what will actually move on-chain", so every guard below agrees on the
+// rounding. Nimiq's smallest unit is 1 luna (0.00001 NIM); anything smaller
+// rounds to 0 and is unsendable.
+func rewardLuna(amountNIM float64) int64 {
+	if amountNIM <= 0 {
+		return 0
+	}
+	return int64(math.Round(amountNIM * NimLunaMultiplier))
+}
+
+// deleteReward removes a reward record entirely (hard delete). Used for
+// records that can never be sent — see PurgeZeroAmountRewards.
+func (s *Store) deleteReward(id string) error {
+	return s.db.Update(func(txn *badger.Txn) error {
+		return txn.Delete([]byte(keyPendingRewardPfx + id))
+	})
+}
+
+// PurgeZeroAmountRewards hard-deletes every stored reward whose on-chain
+// amount is 0 luna, whatever its status (pending / failed / no_wallet).
+// Called on startup and at the top of every retry pass, so a database that
+// already accumulated such records cleans itself up on the first tick after
+// deploying this — no manual SQL/Badger surgery needed.
+func (s *Store) PurgeZeroAmountRewards() (int, error) {
+	all, err := s.ListRewards("")
+	if err != nil {
+		return 0, err
+	}
+	purged := 0
+	for i := range all {
+		r := &all[i]
+		luna := r.AmountLuna
+		if luna <= 0 {
+			luna = rewardLuna(r.AmountNIM)
+		}
+		if luna > 0 {
+			continue // a real payout — untouched
+		}
+		// Only terminal states are safe to delete silently: a completed send
+		// must stay in the ledger/history. (AmountLuna<=0 can never be
+		// "sent" anyway, but be explicit about it.)
+		if r.Status == models.RewardSent {
+			continue
+		}
+		if derr := s.deleteReward(r.ID); derr != nil {
+			log.Printf("[REWARD] purge failed id=%s err=%v", r.ID, derr)
+			continue
+		}
+		purged++
+		log.Printf("[REWARD] PURGED zero-amount id=%s player=%s amount=%.8f NIM (0 luna) status=%s reason=%s attempts=%d",
+			r.ID, r.PlayerID, r.AmountNIM, r.Status, r.Reason, r.Attempts)
+	}
+	if purged > 0 {
+		log.Printf("[REWARD] purge complete — removed %d zero-amount reward(s) that could never be sent", purged)
+	}
+	return purged, nil
+}
+
 func newRewardID() string {
 	b := make([]byte, 6)
 	_, _ = rand.Read(b)
@@ -325,15 +399,22 @@ func (s *Store) QueueRewardRaw(playerID string, amountNIM float64, reason string
 // writes the known destination address straight onto the reward record, so
 // the send queue has everything it needs from the start.
 func (s *Store) QueueRewardToAddress(address string, amountNIM float64, reason string) (*models.PendingReward, error) {
-	if address == "" || amountNIM <= 0 {
-		return nil, fmt.Errorf("invalid address or amount")
+	if address == "" {
+		return nil, fmt.Errorf("invalid address")
+	}
+	// amountNIM > 0 is not enough: 0.000004 NIM is "positive" but rounds to
+	// 0 luna, which is unsendable. Guard on the actual on-chain amount.
+	luna := rewardLuna(amountNIM)
+	if luna <= 0 {
+		log.Printf("[REWARD] REJECTED (direct-address) to=%s amount=%.8f NIM → 0 luna reason=%s", address, amountNIM, reason)
+		return nil, ErrZeroRewardAmount
 	}
 	reward := &models.PendingReward{
 		ID:           newRewardID(),
 		PlayerID:     address, // no internal player ID known — address doubles as the trace key
 		NimiqAddress: address,
 		AmountNIM:    amountNIM,
-		AmountLuna:   int64(math.Round(amountNIM * NimLunaMultiplier)),
+		AmountLuna:   luna,
 		Reason:       reason,
 		CreatedAt:    time.Now().Unix(),
 		Status:       models.RewardPending,
@@ -359,18 +440,31 @@ func (s *Store) queueReward(playerID string, amountNIM float64, reason string, a
 		reason = reason + ":web_half"
 	}
 
+	// ZERO-AMOUNT GUARD (see ErrZeroRewardAmount). Checked AFTER the web
+	// multiplier and BEFORE saveReward, so a 0.00002 NIM prize that the
+	// multiplier halves into 0 luna never becomes a database row and never
+	// reaches attemptSend/nimiqSendTransaction. This is the write-side half of
+	// the fix; PurgeZeroAmountRewards is the cleanup half for records that
+	// already exist.
+	amountLuna := rewardLuna(amountNIM)
+	if amountLuna <= 0 {
+		log.Printf("[REWARD] REJECTED zero-amount player=%s amount=%.8f NIM → 0 luna (nothing to send) reason=%s",
+			playerID[:min8s(playerID)], amountNIM, reason)
+		return nil, ErrZeroRewardAmount
+	}
+
 	reward := &models.PendingReward{
 		ID:         newRewardID(),
 		PlayerID:   playerID,
 		AmountNIM:  amountNIM,
-		AmountLuna: int64(math.Round(amountNIM * NimLunaMultiplier)),
+		AmountLuna: amountLuna,
 		Reason:     reason,
 		CreatedAt:  time.Now().Unix(),
 	}
 
 	if walletInfo == nil || walletInfo.NimiqAddress == "" {
 		// Wallet not registered — save but don't send
-		reward.Status   = models.RewardNoWallet
+		reward.Status = models.RewardNoWallet
 		reward.ErrorMsg = "wallet_not_registered"
 		_ = s.saveReward(reward)
 		log.Printf("[REWARD] queued (no_wallet) player=%s reason=%s", playerID[:min8s(playerID)], reason)
@@ -378,7 +472,7 @@ func (s *Store) queueReward(playerID string, amountNIM float64, reason string, a
 	}
 
 	reward.NimiqAddress = walletInfo.NimiqAddress
-	reward.Status       = models.RewardPending
+	reward.Status = models.RewardPending
 
 	// SAVE FIRST
 	if err := s.saveReward(reward); err != nil {
@@ -466,14 +560,15 @@ func (s *Store) rewardSendWorker() {
 // buildMemo constructs a human-readable tx memo (max 64 bytes) from a reward reason string.
 //
 // reason formats → memo examples:
-//   "quest_claim:q_daily_score"                    → "NimJump: Quest reward +5.00 NIM"
-//   "leaderboard:weekly:2026-06-24:rank1"          → "NimJump: Weekly leaderboard #1 +18.00 NIM"
-//   "leaderboard:daily:2026-06-24:rank3"           → "NimJump: Daily leaderboard #3 +3.00 NIM"
-//   "vsroom:<id>:win"                              → "NimJump: VS win +9.50 NIM"
-//   "vsroom:<id>:split"                            → "NimJump: VS tie split +4.75 NIM"
-//   "vsroom:<id>:forfeit"                          → "NimJump: VS forfeit win +9.50 NIM"
-//   "vsroom:<id>:refund"                           → "NimJump: VS refund +5.00 NIM"
-//   anything else                                  → "NimJump: Reward +X.XX NIM"
+//
+//	"quest_claim:q_daily_score"                    → "NimJump: Quest reward +5.00 NIM"
+//	"leaderboard:weekly:2026-06-24:rank1"          → "NimJump: Weekly leaderboard #1 +18.00 NIM"
+//	"leaderboard:daily:2026-06-24:rank3"           → "NimJump: Daily leaderboard #3 +3.00 NIM"
+//	"vsroom:<id>:win"                              → "NimJump: VS win +9.50 NIM"
+//	"vsroom:<id>:split"                            → "NimJump: VS tie split +4.75 NIM"
+//	"vsroom:<id>:forfeit"                          → "NimJump: VS forfeit win +9.50 NIM"
+//	"vsroom:<id>:refund"                           → "NimJump: VS refund +5.00 NIM"
+//	anything else                                  → "NimJump: Reward +X.XX NIM"
 func buildMemo(amountNIM float64, reason string) string {
 	nim := fmt.Sprintf("+%.2f NIM", amountNIM)
 	parts := strings.SplitN(reason, ":", 4)
@@ -562,6 +657,24 @@ func (s *Store) attemptSend(reward *models.PendingReward) {
 
 	cfg := s.GetNimiqConfig()
 
+	// ZERO-AMOUNT GUARD (legacy records). A reward that somehow got saved
+	// with 0 luna before the guard in queueReward existed is un-sendable by
+	// definition: delete it instead of retrying it against the RPC forever.
+	if reward.AmountLuna <= 0 {
+		luna := rewardLuna(reward.AmountNIM)
+		if luna <= 0 {
+			if derr := s.deleteReward(reward.ID); derr != nil {
+				log.Printf("[REWARD] purge failed id=%s err=%v", reward.ID, derr)
+			} else {
+				log.Printf("[REWARD] PURGED zero-amount id=%s player=%s amount=%.8f NIM (0 luna) reason=%s — deleted, never sent",
+					reward.ID, reward.PlayerID, reward.AmountNIM, reward.Reason)
+			}
+			return
+		}
+		// Amount was stored wrong but the NIM value is real — repair it.
+		reward.AmountLuna = luna
+	}
+
 	// Permanent guard: a tx whose recipient equals our own payout wallet
 	// (sender == recipient) is rejected by the Nimiq mempool every single time
 	// ("Sender same as recipient"), so retrying it forever just spams the log
@@ -570,7 +683,7 @@ func (s *Store) attemptSend(reward *models.PendingReward) {
 	// the app pays out from — most often the near-zero VS "match started"
 	// notification ping to that same address.
 	if nimiqAddressesEqual(reward.NimiqAddress, cfg.WalletAddress) {
-		reward.Status   = models.RewardSkipped
+		reward.Status = models.RewardSkipped
 		reward.ErrorMsg = "recipient_equals_sender_wallet"
 		log.Printf("[REWARD] SKIPPED id=%s reason=%s — recipient equals app wallet (sender==recipient, un-sendable)", reward.ID, reward.Reason)
 		_ = s.saveReward(reward)
@@ -615,6 +728,15 @@ func (s *Store) ForceRetryPendingRewards() {
 func (s *Store) retryPendingRewards(force bool) {
 	retryMu.Lock()
 	defer retryMu.Unlock()
+
+	// Clean up zero-amount records BEFORE anything is dispatched: these are
+	// the ones that used to sit in the queue forever, one pointless RPC call
+	// per retry tick each.
+	if n, perr := s.PurgeZeroAmountRewards(); perr != nil {
+		log.Printf("[RETRY] zero-amount purge error: %v", perr)
+	} else if n > 0 {
+		log.Printf("[RETRY] purged %d zero-amount reward(s)", n)
+	}
 
 	pending, err1 := s.ListRewards("pending")
 	if err1 != nil {
@@ -669,6 +791,14 @@ func (s *Store) retryPendingRewards(force bool) {
 		if !force && r.LastAttempt > 0 && time.Now().Unix()-r.LastAttempt < int64(cooldown.Seconds()) {
 			continue
 		}
+		// Defence in depth: never dispatch a reward with nothing to send,
+		// whatever state the record was read back in.
+		if r.AmountLuna <= 0 && rewardLuna(r.AmountNIM) <= 0 {
+			if derr := s.deleteReward(r.ID); derr == nil {
+				log.Printf("[RETRY] purged zero-amount id=%s (skipped dispatch)", r.ID)
+			}
+			continue
+		}
 		// For no_wallet rewards, re-check wallet
 		if r.Status == models.RewardNoWallet || r.NimiqAddress == "" {
 			walletInfo, werr := s.GetPlayerWallet(r.PlayerID)
@@ -676,7 +806,7 @@ func (s *Store) retryPendingRewards(force bool) {
 				continue // still not registered
 			}
 			r.NimiqAddress = walletInfo.NimiqAddress
-			r.Status       = models.RewardPending
+			r.Status = models.RewardPending
 		}
 		rr := r
 		s.enqueueRewardSend(rr)
@@ -686,6 +816,15 @@ func (s *Store) retryPendingRewards(force bool) {
 // StartRetryLoop — called on application startup, retries every 15 seconds
 func (s *Store) StartRetryLoop() {
 	go func() {
+		// Purge legacy zero-amount rewards immediately on boot, so an
+		// existing database stops retrying them within seconds of upgrading
+		// (the periodic pass below would catch them too — this just makes it
+		// happen before the first retry tick).
+		if n, err := s.PurgeZeroAmountRewards(); err != nil {
+			log.Printf("[REWARD] startup purge error: %v", err)
+		} else if n > 0 {
+			log.Printf("[REWARD] startup purge removed %d zero-amount reward(s)", n)
+		}
 		// Wait 5 seconds on startup (let DB fully open)
 		time.Sleep(5 * time.Second)
 		for {
@@ -697,52 +836,16 @@ func (s *Store) StartRetryLoop() {
 
 // ── Nimiq RPC ─────────────────────────────────────────────────────────────────
 
-type nimRPCReq struct {
-	JSONRPC string `json:"jsonrpc"`
-	Method  string `json:"method"`
-	Params  []any  `json:"params"`
-	ID      int    `json:"id"`
-}
-
-type nimRPCResp struct {
-	Result json.RawMessage `json:"result"`
-	Error  json.RawMessage `json:"error"` // can be null, string, or object
-}
-
+// nimiqRPCCall is the single entry point every caller in this package uses.
+// The transport (connection pooling, address family / NAT64, proxy, retries,
+// failover, rate-limit backoff) lives in rpc_client.go; this keeps the
+// original signature so call sites don't change.
 func nimiqRPCCall(rpcURL, method string, params []any) (any, error) {
-	body, _ := json.Marshal(nimRPCReq{JSONRPC: "2.0", Method: method, Params: params, ID: 1})
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Post(rpcURL, "application/json", bytes.NewReader(body))
+	client, err := getRPCClient(rpcURL)
 	if err != nil {
-		return nil, fmt.Errorf("rpc_connect: %w", err)
+		return nil, fmt.Errorf("rpc_config: %w", err)
 	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("rpc_read: %w", err)
-	}
-	var r nimRPCResp
-	if err := json.Unmarshal(raw, &r); err != nil {
-		return nil, fmt.Errorf("rpc_parse: %w", err)
-	}
-	// error field: check if it's non-null and non-empty
-	if len(r.Error) > 0 && string(r.Error) != "null" {
-		var rpcErr struct {
-			Code    int             `json:"code"`
-			Message string          `json:"message"`
-			Data    json.RawMessage `json:"data"`
-		}
-		if json.Unmarshal(r.Error, &rpcErr) == nil && rpcErr.Message != "" {
-			return nil, fmt.Errorf("rpc_err %d: %s | data=%s", rpcErr.Code, rpcErr.Message, string(rpcErr.Data))
-		}
-		return nil, fmt.Errorf("rpc_err: %s", string(r.Error))
-	}
-	// parse result as generic any
-	var result any
-	if err := json.Unmarshal(r.Result, &result); err != nil {
-		return nil, fmt.Errorf("rpc_result_parse: %w", err)
-	}
-	return result, nil
+	return client.call(method, params)
 }
 
 // ── Nimiq address helpers ─────────────────────────────────────────────────────
@@ -846,8 +949,9 @@ func nimiqULEB128(n int) []byte {
 // and returns the hex-encoded serialized transaction ready for pushTransaction RPC.
 //
 // If memo is empty: Basic tx format (139 bytes)
-//   variant(1=0x00) | proof_type(1) | pubkey(32) | recipient(20) | value(8be) |
-//   fee(8be) | validity_start_height(4be) | network_id(1) | signature(64)
+//
+//	variant(1=0x00) | proof_type(1) | pubkey(32) | recipient(20) | value(8be) |
+//	fee(8be) | validity_start_height(4be) | network_id(1) | signature(64)
 //
 // If memo is non-empty: Extended tx format with recipient_data = UTF-8 memo (max 64 bytes)
 //
@@ -881,27 +985,27 @@ func nimiqBuildAndSignTx(privateKeyHex string, fromAddrBytes []byte, toAddrBytes
 	// sender_data ULEB128(0)  ← Albatross-only, postcard Vec<u8>
 	var content bytes.Buffer
 	binary.Write(&content, binary.BigEndian, uint16(len(memoBytes))) // recipient_data_len 2be
-	content.Write(memoBytes)                                          // recipient_data (0 or memo bytes)
-	content.Write(fromAddrBytes)                                      // sender 20 bytes
-	content.WriteByte(0)                                              // sender_type = Basic
-	content.Write(toAddrBytes)                                        // recipient 20 bytes
-	content.WriteByte(0)                                              // recipient_type = Basic
+	content.Write(memoBytes)                                         // recipient_data (0 or memo bytes)
+	content.Write(fromAddrBytes)                                     // sender 20 bytes
+	content.WriteByte(0)                                             // sender_type = Basic
+	content.Write(toAddrBytes)                                       // recipient 20 bytes
+	content.WriteByte(0)                                             // recipient_type = Basic
 	binary.Write(&content, binary.BigEndian, amountLuna)             // value 8 bytes BE
 	binary.Write(&content, binary.BigEndian, fee)                    // fee 8 bytes BE
 	binary.Write(&content, binary.BigEndian, validityStartHeight)    // validity 4 bytes BE
-	content.WriteByte(networkID)                                      // network_id
-	content.WriteByte(0)                                              // flags = 0
-	content.WriteByte(0x00)                                           // sender_data = ULEB128(0)
+	content.WriteByte(networkID)                                     // network_id
+	content.WriteByte(0)                                             // flags = 0
+	content.WriteByte(0x00)                                          // sender_data = ULEB128(0)
 
 	sig := ed25519.Sign(privKey, content.Bytes())
 
 	var tx bytes.Buffer
 	if len(memoBytes) == 0 {
 		// Basic tx — compact format (139 bytes)
-		tx.WriteByte(0x00)                                        // enum variant = Basic
-		tx.WriteByte(0x00)                                        // proof_type_and_flags = Ed25519
-		tx.Write(pubKey)                                          // pubkey 32 bytes
-		tx.Write(toAddrBytes)                                     // recipient 20 bytes
+		tx.WriteByte(0x00)                                       // enum variant = Basic
+		tx.WriteByte(0x00)                                       // proof_type_and_flags = Ed25519
+		tx.Write(pubKey)                                         // pubkey 32 bytes
+		tx.Write(toAddrBytes)                                    // recipient 20 bytes
 		binary.Write(&tx, binary.BigEndian, amountLuna)          // value 8 bytes
 		binary.Write(&tx, binary.BigEndian, fee)                 // fee 8 bytes
 		binary.Write(&tx, binary.BigEndian, validityStartHeight) // validity 4 bytes
@@ -915,19 +1019,19 @@ func nimiqBuildAndSignTx(privateKeyHex string, fromAddrBytes []byte, toAddrBytes
 		proof = append(proof, 0x00) // merkle_path_len ULEB128(0)
 		proof = append(proof, sig...)
 
-		tx.WriteByte(0x01)                                        // enum variant = Extended
-		tx.Write(fromAddrBytes)                                   // sender 20 bytes
-		tx.WriteByte(0x00)                                        // sender_type = Basic
-		tx.Write(nimiqULEB128(0))                                 // sender_data_len = 0
-		tx.Write(toAddrBytes)                                     // recipient 20 bytes
-		tx.WriteByte(0x00)                                        // recipient_type = Basic
-		tx.Write(nimiqULEB128(len(memoBytes)))                    // recipient_data_len
-		tx.Write(memoBytes)                                       // recipient_data = memo
+		tx.WriteByte(0x01)                                       // enum variant = Extended
+		tx.Write(fromAddrBytes)                                  // sender 20 bytes
+		tx.WriteByte(0x00)                                       // sender_type = Basic
+		tx.Write(nimiqULEB128(0))                                // sender_data_len = 0
+		tx.Write(toAddrBytes)                                    // recipient 20 bytes
+		tx.WriteByte(0x00)                                       // recipient_type = Basic
+		tx.Write(nimiqULEB128(len(memoBytes)))                   // recipient_data_len
+		tx.Write(memoBytes)                                      // recipient_data = memo
 		binary.Write(&tx, binary.BigEndian, amountLuna)          // value 8 bytes
 		binary.Write(&tx, binary.BigEndian, fee)                 // fee 8 bytes
 		binary.Write(&tx, binary.BigEndian, validityStartHeight) // validity 4 bytes
 		tx.WriteByte(networkID)
-		tx.WriteByte(0x00)               // flags = 0
+		tx.WriteByte(0x00)                 // flags = 0
 		tx.Write(nimiqULEB128(len(proof))) // proof_len
 		tx.Write(proof)
 	}
@@ -939,6 +1043,14 @@ func nimiqBuildAndSignTx(privateKeyHex string, fromAddrBytes []byte, toAddrBytes
 // Private key (hex) is read from NIMIQ_PRIVATE_KEY env var.
 // memo is included as recipient_data (max 64 bytes UTF-8). Empty string = Basic tx (no data).
 func nimiqSendTransaction(cfg models.NimiqConfig, toAddress string, amountLuna int64, memo string) (string, error) {
+	// First check, before dev-mode short-circuits and before any RPC: a
+	// 0-luna transfer does not exist on Nimiq. (In NIMIQ_DEV_MODE this used
+	// to return a fake success hash for a 0-amount tx, which hid the bug in
+	// development while production retried it forever.)
+	if amountLuna <= 0 {
+		return "", ErrZeroRewardAmount
+	}
+
 	privateKey := os.Getenv("NIMIQ_PRIVATE_KEY")
 	if privateKey == "" {
 		if os.Getenv("NIMIQ_DEV_MODE") == "1" {
@@ -951,10 +1063,6 @@ func nimiqSendTransaction(cfg models.NimiqConfig, toAddress string, amountLuna i
 	if cfg.WalletAddress == "" {
 		return "", fmt.Errorf("NIMIQ_WALLET_ADDRESS not configured")
 	}
-	if amountLuna <= 0 {
-		return "", fmt.Errorf("amount must be positive")
-	}
-
 	// Decode addresses
 	fromBytes, err := nimiqUserFriendlyToBytes(cfg.WalletAddress)
 	if err != nil {
@@ -1014,7 +1122,6 @@ func nimiqSendTransaction(cfg models.NimiqConfig, toAddress string, amountLuna i
 	return txHash, nil
 }
 
-
 // GetNimiqBalance — returns the application wallet balance in luna
 func GetNimiqBalance(cfg models.NimiqConfig) (float64, error) {
 	if cfg.WalletAddress == "" {
@@ -1038,7 +1145,7 @@ func GetNimiqBalance(cfg models.NimiqConfig) (float64, error) {
 // ── Balance monitoring ────────────────────────────────────────────────────────
 
 var lastLowBalanceAlert int64 // last alert time (epoch)
-const alertCooldown = 3600   // send the same alert at most once per hour
+const alertCooldown = 3600    // send the same alert at most once per hour
 
 func (s *Store) checkBalanceAndNotify(cfg models.NimiqConfig) {
 	balance, err := GetNimiqBalance(cfg)
@@ -1086,11 +1193,11 @@ func (s *Store) StartBalanceMonitor() {
 // ── Telegram ──────────────────────────────────────────────────────────────────
 
 func (s *Store) sendTelegram(cfg models.NimiqConfig, message string) {
-	token  := cfg.TelegramToken
+	token := cfg.TelegramToken
 	chatID := cfg.TelegramChatID
 	if token == "" || chatID == "" {
 		// fall back to env vars
-		token  = os.Getenv("TELEGRAM_BOT_TOKEN")
+		token = os.Getenv("TELEGRAM_BOT_TOKEN")
 		chatID = os.Getenv("TELEGRAM_CHAT_ID")
 	}
 	if token == "" || chatID == "" {

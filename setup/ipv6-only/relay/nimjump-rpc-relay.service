@@ -1,0 +1,25 @@
+[Unit]
+Description=NimJump Nimiq RPC relay (IPv6 -> IPv4 bridge)
+Documentation=file:///opt/nimjump-rpc-relay/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Bind on IPv6 only — that is the whole point of this box.
+ExecStart=/usr/local/bin/rpc-relay -listen [::]:8848 -target https://rpc.nimiqwatch.com -secret CHANGE_ME_TO_A_LONG_RANDOM_STRING -rate 120
+Restart=always
+RestartSec=3
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+# Only the family we actually need.
+RestrictAddressFamilies=AF_INET AF_INET6
+AmbientCapabilities=
+CapabilityBoundingSet=
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

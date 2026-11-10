@@ -1,0 +1,20 @@
+# NimJump RPC Worker (hardened) — deploy with: wrangler deploy
+name = "nimjump-rpc"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[vars]
+UPSTREAM = "https://rpc.nimiqwatch.com"
+# Only the methods this backend actually calls get through.
+ALLOWED_METHODS = "getBlockNumber,getAccountByAddress,pushTransaction,getTransactionByHash,getTransactionsByAddress"
+# Rate limits (per isolate, best effort). Tune against the upstream's real limit.
+MAX_REQ_PER_MIN_IP = "240"
+MAX_REQ_PER_MIN_ALL = "3000"
+# OPTIONAL, strongly recommended: pin the relay to your game server's IPv6.
+# Comma list, plain prefix match (e.g. "2a01:4f8:c0c:1234::" or "2a01:4f8:c0c:1234::/64").
+# Leave unset for a prefix-match on nothing = no IP restriction.
+# ALLOWED_IP_PREFIXES = "2a01:4f8:c0c:1234::"
+
+# Secrets are NOT stored here — set them with:
+#   wrangler secret put RELAY_SECRET     # secret path segment
+#   wrangler secret put HMAC_SECRET      # request signing key
