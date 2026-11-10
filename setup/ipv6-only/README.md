@@ -47,14 +47,51 @@ Bu yüzden "kodu iyileştir" tek başına yetmez. **İki iş var:**
 
 ## 2. Seçenek ① — Cloudflare Worker (SEÇİLEN YOL — kuruldu ve canlıda test edildi)
 
-> ✅ **Durum:** worker `nimjump-rpc` hesabına deploy edildi ve çalışıyor:
-> `https://nimjump-rpc.hasan1altinok.workers.dev/<RELAY_SECRET>`
-> HMAC imzalı istek → `{"data":66534848}` ✓ · imzasız → `401` · yanlış path → `404`
-> · izinsiz metod (`getPeers`) → `403`.
+> ✅ **Durum:** worker `nimjump-rpc` deploy edildi, **WAF ön kapısı** kuruldu ve
+> canlıda test edildi. Tek giriş noktası: **`https://rpc.nimiqbase.com/<RELAY_SECRET>`**
+> (`workers.dev` kapısı **kapatıldı** — yoksa WAF bypass edilirdi).
+>
+> | Test | Sonuç |
+> |---|---|
+> | İmza başlıkları yok | **403 — Cloudflare WAF**, Worker hiç çalışmadı |
+> | Sadece `X-NJ-Ts` var, imza yok | **403 WAF** |
+> | `GET` (POST değil) | **403 WAF** |
+> | Başlıklar var, imza yanlış | `401` (Worker'ın kendi HMAC kontrolü) |
+> | Doğru imza | `{"data":66535111}` ✓ |
+> | Eski `workers.dev` URL'i | `404` (kapalı) |
+>
 > Kimlik bilgileri: `release/cloudflare-worker.env` (repoda değil).
-> Backend `.env`'ine yazılacak iki satır orada hazır.
 
-### Sertleştirme (dışarıdan kullanmak pratikte imkânsız)
+### Katman 0 — WAF ön kapısı (Worker'a ulaşmadan engel)
+
+`Page Rules` başlık kontrolü **yapamaz** (sadece URL pattern). Bunun için doğru
+araç **WAF Custom Rules**. Kurulum scripti: `cloudflare-worker/setup-waf.py`
+(idempotent: DNS + worker route + WAF kuralı + workers.dev kapatma).
+
+Kural (Free plan, mevcut 3 kuralın yanına eklendi, toplam 4/5):
+
+```
+(http.host eq "rpc.nimiqbase.com" and
+ (http.request.method ne "POST"
+  or not any(http.request.headers["x-nj-sig"][*] ne "")
+  or not any(http.request.headers["x-nj-ts"][*] ne "")))
+   → action: BLOCK
+```
+
+Yani: **imza başlıkları yoksa istek Worker'a hiç ulaşmıyor**, Cloudflare
+"Attention Required!" 403'ü ile kesiliyor. Worker'ın kendi HMAC kontrolü de
+duruyor (WAF sadece "başlık var mı" der, imzanın doğruluğunu Worker kontrol
+eder) → iki katman.
+
+```bash
+export CF_API_TOKEN=...            # Workers Scripts:Edit + Zone WAF + DNS:Edit
+export CF_ACCOUNT_ID=<account-id>
+export CF_ZONE_ID=<zone-id>        # nimiqbase.com zone id
+export RPC_HOST=rpc.nimiqbase.com
+python3 setup/ipv6-only/cloudflare-worker/setup-waf.py
+```
+
+### Katman 1-6 — Worker'ın kendi sertleştirmesi (dışarıdan kullanmak imkânsız)
 
 `workers.dev` adresleri numaralandırılabilir — bu yüzden URL'yi **sır olarak
 görmüyoruz**, 6 katman var:
@@ -85,14 +122,14 @@ curl -X PUT "https://api.cloudflare.com/client/v4/accounts/$A/workers/scripts/ni
         {\"type\":\"plain_text\",\"name\":\"UPSTREAM\",\"text\":\"https://rpc.nimiqwatch.com\"}]};type=application/json" \
   -F "worker.js=@setup/ipv6-only/cloudflare-worker/worker.js;type=application/javascript+module"
 
-curl -X POST "https://api.cloudflare.com/client/v4/accounts/$A/workers/scripts/nimjump-rpc/subdomain" \
-  -H "Authorization: Bearer $CF" -H 'content-type: application/json' -d '{"enabled":true}'
+# workers.dev'i AÇMA — WAF'ı atlayan bir kapı olur. Bunun yerine
+# setup-waf.py çalıştır (zone route + WAF kuralı kurar, workers.dev'i kapatır).
 ```
 
 ### Backend `.env`
 
 ```ini
-NIMIQ_RPC_URL=https://nimjump-rpc.hasan1altinok.workers.dev/<RELAY_SECRET>
+NIMIQ_RPC_URL=https://rpc.nimiqbase.com/<RELAY_SECRET>
 NIMIQ_RPC_HMAC_SECRET=<HMAC_SECRET>
 NIMIQ_RPC_NETWORK=auto
 ```
