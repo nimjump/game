@@ -111,9 +111,9 @@ func getEnvDefault(key, fallback string) string {
 
 // printStartupBanner logs Nimiq config and wallet balance at startup.
 func printStartupBanner(store *game.Store) {
-	cfg := store.GetNimiqConfig()
+	cfg, rpcSource := store.GetNimiqConfigEx()
 
-	fmt.Println("╔══════════════════════════════════════════════════════╗")
+	fmt.Println("╔═════════════════════════════════════════════════════╗")
 	fmt.Println("║               NimJump Backend Startup                ║")
 	fmt.Println("╚══════════════════════════════════════════════════════╝")
 
@@ -133,6 +133,11 @@ func printStartupBanner(store *game.Store) {
 	}
 
 	fmt.Printf("  [NIMIQ] RPC URL     : %s\n", cfg.RPCURL)
+	fmt.Printf("  [NIMIQ] RPC source  : %s\n", rpcSource)
+	if rpcSource != game.RPCSourceEnv && strings.Contains(cfg.RPCURL, "rpc.nimiqwatch.com") {
+		fmt.Println("  [NIMIQ] !!  this is the IPv4-only public endpoint — an IPv6-only host CANNOT reach it.")
+		fmt.Println("  [NIMIQ] !!  run:  ./<binary> -rpc-reset   (clears the admin-panel value)")
+	}
 	fmt.Printf("  [NIMIQ] RPC network : %s (NIMIQ_RPC_NETWORK; nat64 prefix %s)\n",
 		getEnvDefault("NIMIQ_RPC_NETWORK", "auto"), getEnvDefault("NIMIQ_NAT64_PREFIX", "64:ff9b::/96"))
 	if px := os.Getenv("NIMIQ_RPC_PROXY"); px != "" {
@@ -274,6 +279,34 @@ func main() {
 	defer db.Close()
 
 	store := game.NewStore(db)
+
+	// Maintenance flags — handled before anything starts serving.
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "-rpc-reset", "--rpc-reset":
+			removed, err := store.ClearStoredRPCURL()
+			if err != nil {
+				log.Fatalf("[RPC-RESET] failed: %v", err)
+			}
+			cfg, src := store.GetNimiqConfigEx()
+			if removed == "" {
+				fmt.Println("[RPC-RESET] nothing was stored in the DB — the effective URL already comes from .env/binary.")
+			} else {
+				fmt.Printf("[RPC-RESET] removed stored RPC URL: %s\n", removed)
+			}
+			fmt.Printf("[RPC-RESET] effective RPC URL now: %s  (source: %s)\n", cfg.RPCURL, src)
+			os.Exit(0)
+		case "-rpc-info", "--rpc-info":
+			cfg, src := store.GetNimiqConfigEx()
+			fmt.Printf("[RPC-INFO] effective: %s\nsource: %s\nnetwork mode: %s\n",
+				cfg.RPCURL, src, getEnvDefault("NIMIQ_RPC_NETWORK", "auto"))
+			if n := os.Getenv("NIMIQ_RPC_URL_LOCK"); n != "" {
+				fmt.Printf("lock: %s\n", n)
+			}
+			os.Exit(0)
+		}
+	}
+
 	printStartupBanner(store)
 	// Persistent Godot worker pool — önceden başlat, ilk submit beklemeden hazır olsun
 	game.GetWorkerPool()

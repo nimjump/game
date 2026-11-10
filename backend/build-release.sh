@@ -41,6 +41,7 @@ fi
 LDF="-s -w"
 LDF="$LDF -X main.bdRPCURL=$NIMJUMP_RPC_URL"
 LDF="$LDF -X main.bdRPCHMAC=$NIMJUMP_RPC_HMAC_SECRET"
+LDF="$LDF -X main.bdRPCLock=true"   # stale admin-panel RPC URL can never win
 [ -n "${NIMJUMP_GAME_URL:-}" ]    && LDF="$LDF -X main.bdGameURL=$NIMJUMP_GAME_URL"
 [ -n "${NIMJUMP_BACKEND_URL:-}" ] && LDF="$LDF -X main.bdBackendURL=$NIMJUMP_BACKEND_URL"
 

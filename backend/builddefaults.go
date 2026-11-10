@@ -41,6 +41,7 @@ var (
 	bdRPCHMAC    string                             // NIMIQ_RPC_HMAC_SECRET (injected at release build)
 	bdBindHost   = "::"                             // BIND_HOST — IPv6 wildcard
 	bdIPv6Only   = "true"                           // IPV6_ONLY — listener network = tcp6
+	bdRPCLock    = ""                               // NIMIQ_RPC_URL_LOCK — "true" in release builds
 )
 
 // applyBuildDefaults fills missing env vars from the values above. Must run
@@ -56,6 +57,7 @@ func applyBuildDefaults() {
 		{"NIMIQ_RPC_HMAC_SECRET", bdRPCHMAC},
 		{"BIND_HOST", bdBindHost},
 		{"IPV6_ONLY", bdIPv6Only},
+		{"NIMIQ_RPC_URL_LOCK", bdRPCLock},
 	}
 
 	var applied []string

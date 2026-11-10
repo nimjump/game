@@ -82,7 +82,39 @@ var sendingRewards sync.Map // rewardID (string) → struct{}{} while in flight
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+// RPC URL sources — reported at startup so "why is it still using
+// rpc.nimiqwatch.com?" never has to be guessed again.
+const (
+	RPCSourceEnv     = "env/.env (or baked into the binary)"
+	RPCSourceDB      = "DB — saved from the admin panel's System tab"
+	RPCSourceDefault = "built-in fallback (nothing configured)"
+)
+
+// GetNimiqConfig returns the effective config (same as GetNimiqConfigEx, the
+// source is just dropped).
 func (s *Store) GetNimiqConfig() models.NimiqConfig {
+	cfg, _ := s.GetNimiqConfigEx()
+	return cfg
+}
+
+// GetNimiqConfigEx is GetNimiqConfig plus WHERE the RPC URL came from.
+//
+// Precedence (fixed here): env/.env (which includes values baked into the
+// binary by builddefaults.go) > DB (admin panel) > built-in fallback.
+//
+// It used to be the other way round for the RPC URL: whatever was last saved
+// from the admin panel's System tab lived in Badger under "nimcfg" and silently
+// overrode NIMIQ_RPC_URL forever — so a server with the correct URL in .env
+// (or compiled in) still dialled the OLD endpoint, producing
+// "dial tcp 49.13.63.161:443: connect: network is unreachable" on IPv6-only
+// hosts no matter how many times the config was fixed on disk.
+//
+// NIMIQ_RPC_URL_LOCK=true makes the DB value IGNORED entirely for the URL
+// (other fields — telegram, thresholds — still come from the DB). Release
+// builds bake this to true so the Cloudflare Worker endpoint can't be
+// hijacked by a stale admin-panel setting.
+func (s *Store) GetNimiqConfigEx() (models.NimiqConfig, string) {
+	envRPC := strings.TrimSpace(os.Getenv("NIMIQ_RPC_URL"))
 	cfg := models.NimiqConfig{
 		RPCURL:              getEnv("NIMIQ_RPC_URL", "https://rpc.nimiqwatch.com"),
 		WalletAddress:       getEnv("NIMIQ_WALLET_ADDRESS", ""),
@@ -100,9 +132,30 @@ func (s *Store) GetNimiqConfig() models.NimiqConfig {
 			return json.Unmarshal(v, &dbCfg)
 		})
 	})
+	source := RPCSourceDefault
+	if envRPC != "" {
+		source = RPCSourceEnv
+	}
+	lockRPC := isTruthyEnv("NIMIQ_RPC_URL_LOCK")
+
 	if err == nil {
 		if dbCfg.RPCURL != "" {
-			cfg.RPCURL = dbCfg.RPCURL
+			switch {
+			case lockRPC && envRPC != "":
+				if strings.TrimRight(dbCfg.RPCURL, "/") != strings.TrimRight(envRPC, "/") {
+					log.Printf("[NIMIQ] ignoring DB RPC URL %q — NIMIQ_RPC_URL_LOCK is on, using %q", dbCfg.RPCURL, envRPC)
+				}
+				source = RPCSourceEnv
+			case envRPC != "":
+				// env/.env wins over a stale admin-panel value, but say so.
+				if strings.TrimRight(dbCfg.RPCURL, "/") != strings.TrimRight(envRPC, "/") {
+					log.Printf("[NIMIQ] DB has RPC URL %q but .env/baked value %q wins (set NIMIQ_RPC_URL_LOCK=true to silence, or run the binary with -rpc-reset to clear the stored value)", dbCfg.RPCURL, envRPC)
+				}
+				source = RPCSourceEnv
+			default:
+				cfg.RPCURL = dbCfg.RPCURL
+				source = RPCSourceDB
+			}
 		}
 		if dbCfg.WalletAddress != "" {
 			cfg.WalletAddress = dbCfg.WalletAddress
@@ -117,7 +170,49 @@ func (s *Store) GetNimiqConfig() models.NimiqConfig {
 			cfg.LowBalanceThreshold = dbCfg.LowBalanceThreshold
 		}
 	}
-	return cfg
+	return cfg, source
+}
+
+// isTruthyEnv is the shared "1/true/yes/on" parser.
+func isTruthyEnv(key string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(key))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// ClearStoredRPCURL blanks the admin-panel-stored RPC URL (Badger key "nimcfg")
+// so the effective endpoint falls back to NIMIQ_RPC_URL (.env or the value
+// baked into the binary). Returns the URL that was removed.
+func (s *Store) ClearStoredRPCURL() (string, error) {
+	var dbCfg models.NimiqConfig
+	err := s.db.View(func(txn *badger.Txn) error {
+		item, gerr := txn.Get([]byte(keyNimiqConfig))
+		if gerr != nil {
+			return gerr
+		}
+		return item.Value(func(v []byte) error { return json.Unmarshal(v, &dbCfg) })
+	})
+	if err == badger.ErrKeyNotFound {
+		return "", nil // nothing stored — nothing to clear
+	}
+	if err != nil {
+		return "", err
+	}
+	removed := dbCfg.RPCURL
+	if removed == "" {
+		return "", nil
+	}
+	dbCfg.RPCURL = ""
+	data, merr := json.Marshal(dbCfg)
+	if merr != nil {
+		return "", merr
+	}
+	err = s.db.Update(func(txn *badger.Txn) error {
+		return txn.Set([]byte(keyNimiqConfig), data)
+	})
+	return removed, err
 }
 
 func (s *Store) SaveNimiqConfig(cfg models.NimiqConfig) error {

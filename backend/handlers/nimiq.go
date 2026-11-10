@@ -3,6 +3,8 @@ package handlers
 import (
 	"encoding/json"
 	"log"
+	"os"
+	"strings"
 
 	"github.com/valyala/fasthttp"
 
@@ -19,7 +21,7 @@ func (s *Server) handleWalletRegister(ctx *fasthttp.RequestCtx) {
 		return
 	}
 	var req struct {
-		PlayerID     string `json:"player_id"`     // ignored — enforced by token
+		PlayerID     string `json:"player_id"` // ignored — enforced by token
 		NimiqAddress string `json:"nimiq_address"`
 	}
 	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
@@ -80,6 +82,16 @@ func (s *Server) handleAdminNimiqConfig(ctx *fasthttp.RequestCtx) {
 	if err := json.Unmarshal(ctx.PostBody(), &cfg); err != nil {
 		writeErr(ctx, 400, "bad_json")
 		return
+	}
+	// When the RPC URL is locked (NIMIQ_RPC_URL_LOCK=true — baked into release
+	// builds), refuse to write a different one: saving it would be silently
+	// ignored anyway, and a stale value here is exactly what made an IPv6-only
+	// host keep dialling the IPv4-only public endpoint.
+	if os.Getenv("NIMIQ_RPC_URL_LOCK") == "true" || os.Getenv("NIMIQ_RPC_URL_LOCK") == "1" {
+		if cur := os.Getenv("NIMIQ_RPC_URL"); cfg.RPCURL != "" && strings.TrimRight(cfg.RPCURL, "/") != strings.TrimRight(cur, "/") {
+			writeErr(ctx, 409, "rpc_url_locked_by_env")
+			return
+		}
 	}
 	if err := s.Store.SaveNimiqConfig(cfg); err != nil {
 		writeErr(ctx, 500, "save_error")
